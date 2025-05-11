@@ -5,6 +5,7 @@ plugins {
 }
 
 configurations.all {
+
     resolutionStrategy.eachDependency {
         if (requested.group == "org.bouncycastle") {
             if (requested.name.endsWith("jdk15on")) {
@@ -15,9 +16,25 @@ configurations.all {
     }
 }
 
+//  keytool -genkey -v -keystore SilentPassVPN.jks -keyalg RSA -keysize 2048 -validity 10000 -alias SilentPassVPN
 android {
+    signingConfigs {
+        create("release") {
+            storeFile = file("SilentPassVPN.jks")
+            storePassword = "111111"
+            keyAlias = "SilentPassVPN"
+            keyPassword = "111111"
+        }
+    }
+    buildTypes {
+        getByName("release") {
+            signingConfig = signingConfigs.getByName("release")
+            isMinifyEnabled = false
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
+    }
     namespace = "com.silentPass.vpn"
-    compileSdk = 34
+    compileSdk = 26
 
     defaultConfig {
         applicationId = "com.silentPass.vpn"
@@ -32,6 +49,7 @@ android {
 
     buildTypes {
         release {
+
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -53,6 +71,7 @@ android {
 }
 
 dependencies {
+    implementation(files("libs/tun2socks.aar"))
     implementation("org.web3j:core:4.10.0") {
         exclude(group = "org.bouncycastle", module = "bcprov-jdk15on")
     }

@@ -1,21 +1,25 @@
 package com.silentPass.vpn
 
 import android.R
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.net.VpnService
 import android.util.Log
 import android.webkit.JavascriptInterface
 import android.widget.Toast
 import com.google.gson.Gson
 import android.util.Base64
 import androidx.core.content.ContextCompat.startForegroundService
+import com.silentPass.vpn.MainActivity.Companion.VPN_REQUEST_CODE
+import engine.Engine
 
 data class CmdPayload(
     val cmd: String,
     val data: String
 )
 
-class WebAppInterface (private val context: Context)  {
+class WebAppInterface (private val context: Context, private val vpnStarter: VpnStarter)  {
     @JavascriptInterface
     fun receiveMessageFromJS(base64Message: String) {
 
@@ -38,32 +42,35 @@ class WebAppInterface (private val context: Context)  {
                         putExtra("VPN_DATA_B64", cmdObj.data)
                     }
                     context.startService(intent)
-                    System.setProperty("http.proxyHost", "127.0.0.1")
-                    System.setProperty("http.proxyPort", "8888")
-                    System.setProperty("https.proxyHost", "127.0.0.1")
-                    System.setProperty("https.proxyPort", "8888")
-                    System.setProperty("socksProxyHost", "127.0.0.1")
-                    System.setProperty("socksProxyPort", "8888")
+                    vpnStarter.onVpnStartRequested()
+
+//                    System.setProperty("http.proxyHost", "127.0.0.1")
+//                    System.setProperty("http.proxyPort", "8888")
+//                    System.setProperty("https.proxyHost", "127.0.0.1")
+//                    System.setProperty("https.proxyPort", "8888")
+//                    System.setProperty("socksProxyHost", "127.0.0.1")
+//                    System.setProperty("socksProxyPort", "8888")
+
                 }
 
                 "stopVPN" -> {
 
                     var intent = Intent(context, SocketServerService::class.java)
                     val stopped = context.stopService(intent)
-                    // For SOCKS proxy
-                    System.clearProperty("socksProxyHost")
-                    System.clearProperty("socksProxyPort")
-
-                    // For HTTP proxy
-                    System.clearProperty("http.proxyHost")
-                    System.clearProperty("http.proxyPort")
-
-                    // For HTTPS proxy
-                    System.clearProperty("https.proxyHost")
-                    System.clearProperty("https.proxyPort")
-
-
-                    Log.d("WebAppInterface", "Stopping VPN")
+                    vpnStarter.onVpnStopRequested()
+//                    // For SOCKS proxy
+//                    System.clearProperty("socksProxyHost")
+//                    System.clearProperty("socksProxyPort")
+//
+//                    // For HTTP proxy
+//                    System.clearProperty("http.proxyHost")
+//                    System.clearProperty("http.proxyPort")
+//                    // For HTTPS proxy
+//                    System.clearProperty("https.proxyHost")
+//                    System.clearProperty("https.proxyPort")
+//
+//
+//                    Log.d("WebAppInterface", "Stopping VPN")
 
                     // TODO: Stop VPN logic here
                 }

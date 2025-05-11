@@ -27,6 +27,14 @@
             android:name=".SocketServerService"
             android:foregroundServiceType="dataSync"
             android:exported="false" />
+        <service
+            android:name=".SilentPassVPNService"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
     </application>
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
