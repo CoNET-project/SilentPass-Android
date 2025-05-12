@@ -156,15 +156,15 @@ class LayerMinus(startVPNData: StartVPNData) {
     fun connectToLayerMinus(host: String, _port: String, buffer: ByteArray?): Socket? {
 
         val randomEntryNode = if (this.entryNodes.isNotEmpty()) {
-            this.entryNodes[0]
-//            this.entryNodes.random()
+//            this.entryNodes[0]
+            this.entryNodes.random()
         } else {
             return null // or throw Exception("No entry nodes available")
         }
 
         val randomExitNode = if (this.exitNode.isNotEmpty()) {
-            this.exitNode[0]
-//            this.exitNode.random()
+//            this.exitNode[0]
+            this.exitNode.random()
         } else {
             return null // or throw Exception("No entry nodes available")
         }

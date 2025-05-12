@@ -25,6 +25,9 @@ import android.util.Base64
 import com.google.gson.Gson
 import java.io.ByteArrayOutputStream
 import kotlin.ByteArray
+import java.net.DatagramSocket
+import java.net.DatagramPacket
+import java.net.InetSocketAddress
 
 class SocketServerService : Service() {
 
@@ -51,7 +54,9 @@ class SocketServerService : Service() {
             }
         }.start()
     }
-
+    //      curl local proxy test command
+    //      curl -v -x socks5://127.0.0.1:8888 --resolve "www.google.com:53:8.8.8.8" www.google.com
+    //      curl -v -x socks5://127.0.0.1:8888 https://www.google.com
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val base64 = intent?.getStringExtra("VPN_DATA_B64")
         if (base64 != null) {
@@ -330,97 +335,218 @@ class SocketServerService : Service() {
 
     }
 
-    private fun handleSocks5(client: Socket, input: InputStream, output: OutputStream) {
-        Thread {
-            input.read() // version
-            val nMethods = input.read()
-            val methods = ByteArray(nMethods)
-            input.read(methods)
+    private fun parseUdpHeader(data: ByteArray): Triple<String, Int, Int> {
+        var offset = 3 // skip RSV and FRAG
+        val atyp = data[offset++].toInt()
+        val destHost = when (atyp) {
+            0x01 -> { // IPv4
+                val ip = data.copyOfRange(offset, offset + 4).joinToString(".") { (it.toInt() and 0xFF).toString() }
+                offset += 4
+                ip
+            }
+            0x03 -> { // Domain
+                val len = data[offset++].toInt()
+                val domain = String(data.copyOfRange(offset, offset + len))
+                offset += len
+                domain
+            }
+//            0x04 -> { // IPv6 not support
+//                val ip = InetAddress.getByAddress(data.copyOfRange(offset, offset + 16)).hostAddress
+//                offset += 16
+//                ip
+//            }
+            else -> "0.0.0.0"
+        }
+        val port = (data[offset++].toInt() shl 8) or (data[offset++].toInt() and 0xFF)
+        return Triple(destHost, port, offset)
+    }
 
-            // Respond with no auth
-            output.write(byteArrayOf(0x05, 0x00))
+    private fun wrapSocks5Udp(packet: DatagramPacket): ByteArray {
+        val addr = packet.address.address
+        val port = packet.port
+        val header = ByteArray(3 + 1 + addr.size + 2)
+        header[0] = 0x00 // RSV
+        header[1] = 0x00
+        header[2] = 0x00 // FRAG
+        header[3] = when (addr.size) {
+            4 -> 0x01.toByte() // IPv4
+            16 -> 0x04.toByte() // IPv6
+            else -> 0x01.toByte()
+        }
+        System.arraycopy(addr, 0, header, 4, addr.size)
+        header[4 + addr.size] = (port shr 8).toByte()
+        header[5 + addr.size] = (port and 0xFF).toByte()
+
+        return header + packet.data.copyOfRange(0, packet.length)
+    }
+
+    private fun handleSocks5UdpAssociate(client: Socket, output: OutputStream) {
+        try {
+            val udpSocket = DatagramSocket(0)
+            val udpPort = udpSocket.localPort
+
+            // Respond to client with UDP bind info (0.0.0.0:udpPort)
+            val response = byteArrayOf(
+                0x05, 0x00, 0x00, 0x01, // VER, REP=OK, RSV, ATYP=IPv4
+                0x00, 0x00, 0x00, 0x00, // BND.ADDR = 0.0.0.0
+                (udpPort shr 8).toByte(), (udpPort and 0xFF).toByte()
+            )
+            output.write(response)
             output.flush()
 
-            val version = input.read()
-            val cmd = input.read()
-            input.read() // RSV
-            val atyp = input.read()
+            Thread {
+                val buffer = ByteArray(65507)
+                while (true) {
+                    try {
+                        val packet = DatagramPacket(buffer, buffer.size)
+                        udpSocket.receive(packet)
 
-            val destHost = when (atyp) {
-                0x01 -> { // IPv4
-                    val ip = ByteArray(4)
-                    input.read(ip)
-                    ip.joinToString(".") { (it.toInt() and 0xFF).toString() }
+                        val data = packet.data
+                        val frag = data[2].toInt()
+                        if (frag != 0) continue // we don't support fragmentation
+
+                        val atyp = data[3].toInt()
+                        val (targetHost, targetPort, payloadOffset) = parseUdpHeader(data)
+
+                        val payload = data.copyOfRange(payloadOffset, packet.length)
+
+                        val targetAddr = InetSocketAddress(targetHost, targetPort)
+                        val forwardPacket = DatagramPacket(payload, payload.size, targetAddr)
+                        udpSocket.send(forwardPacket)
+
+                        // Optional: Read response from target and send back to client (with SOCKS5 header)
+                        val responseBuf = ByteArray(65507)
+                        val responsePacket = DatagramPacket(responseBuf, responseBuf.size)
+                        udpSocket.receive(responsePacket)
+
+                        val responseData = wrapSocks5Udp(responsePacket)
+                        val clientResponse = DatagramPacket(
+                            responseData, responseData.size, packet.socketAddress
+                        )
+                        udpSocket.send(clientResponse)
+                    } catch (_: Exception) {}
                 }
+            }.start()
+        } catch (e: Exception) {
+            Log.e("SOCKS5", "UDP associate failed", e)
+            client.close()
+        }
+    }
 
-                0x03 -> { // Domain name
-                    val len = input.read()
-                    val domain = ByteArray(len)
-                    input.read(domain)
-                    String(domain)
-                }
+    private fun handleSocks5(client: Socket, input: InputStream, output: OutputStream) {
+        Thread {
+            try {
+                input.read() // version
+                val nMethods = input.read()
+                val methods = ByteArray(nMethods)
+                input.read(methods)
 
-                0x04 -> { // IPv6
-                    val ip = ByteArray(16)
-                    input.read(ip)
-                    InetAddress.getByAddress(ip).hostAddress
-                }
-
-                else -> {
-                    client.close()
-                    return@Thread
-                }
-            }
-
-            val port = (input.read() shl 8) or input.read()
-            val response = byteArrayOf(
-                0x05, 0x00, 0x00, 0x01, // VER, REP=success, RSV, ATYP=IPv4
-                0x00, 0x00, 0x00, 0x00, // BND.ADDR (dummy)
-                0x00, 0x00              // BND.PORT (dummy)
-            )
-            if (layerMinus != null) {
-                output.write(response)
+                // Respond with no auth
+                output.write(byteArrayOf(0x05, 0x00))
                 output.flush()
-                val inputStream: InputStream = client.getInputStream()
-                val buffer = ByteArray(4096)
-                val output = ByteArrayOutputStream()
-                var bytesRead: Int
-                inputStream.read(buffer).also { bytesRead = it }
-                output.write(buffer, 0, bytesRead)
 
-                val rawBytes = output.toByteArray()
+                val version = input.read()
+                val cmd = input.read()
+                input.read() // RSV
+                val atyp = input.read()
 
-                Log.d("handleHttpsConnect", "rawBytes length = ${bytesRead}")
-                var serverSocket =
-                    layerMinus?.connectToLayerMinus(destHost, port.toString(), rawBytes)
-                if (serverSocket == null) {
-                    client.close()
-                    return@Thread
+                val destHost = when (atyp) {
+                    0x01 -> { // IPv4
+                        val ip = ByteArray(4)
+                        input.read(ip)
+                        ip.joinToString(".") { (it.toInt() and 0xFF).toString() }
+                    }
+
+                    0x03 -> { // Domain name
+                        val len = input.read()
+                        val domain = ByteArray(len)
+                        input.read(domain)
+                        String(domain)
+                    }
+//
+//                0x04 -> { // IPv6 not support
+//                    val ip = ByteArray(16)
+//                    input.read(ip)
+//                    InetAddress.getByAddress(ip).hostAddress
+//                }
+
+                    else -> {
+                        client.close()
+                        return@Thread
+                    }
                 }
 
-                val serverInput = BufferedInputStream(serverSocket.getInputStream())
-                val clientOutput = client.getOutputStream()
-                forwardTraffic(serverInput, clientOutput)
-                forwardTraffic(client.getInputStream(), serverSocket.getOutputStream())
+                val port = (input.read() shl 8) or input.read()
 
-            } else {
-                try {
-                    val target = Socket(destHost, port)
+                val response = byteArrayOf(
+                    0x05, 0x00, 0x00, 0x01, // VER, REP=success, RSV, ATYP=IPv4
+                    0x00, 0x00, 0x00, 0x00, // BND.ADDR (dummy)
+                    0x00, 0x00              // BND.PORT (dummy)
+                )
 
-                    output.write(response)
-                    output.flush()
+                when (cmd) {
+                    0x01 -> { // CONNECT (handled before)
 
-                    forwardTraffic(input, target.getOutputStream())
-                    forwardTraffic(target.getInputStream(), output)
-                } catch (e: Exception) {
-                    Log.e("SOCKS5", "Connection error", e)
-                    output.write(byteArrayOf(0x05, 0x01)) // general failure
-                    output.flush()
-                    client.close()
-                    return@Thread
+
+                        if (layerMinus != null) {
+
+                            output.write(response)
+                            output.flush()
+
+                            val inputStream: InputStream = client.getInputStream()
+                            val buffer = ByteArray(4096)
+                            val output = ByteArrayOutputStream()
+                            var bytesRead: Int
+                            inputStream.read(buffer).also { bytesRead = it }
+                            output.write(buffer, 0, bytesRead)
+
+                            val rawBytes = output.toByteArray()
+
+                            Log.d("handleHttpsConnect", "rawBytes length = ${bytesRead}")
+                            var serverSocket =
+                                layerMinus?.connectToLayerMinus(destHost, port.toString(), rawBytes)
+                            if (serverSocket == null) {
+                                client.close()
+                                return@Thread
+                            }
+
+                            val serverInput = BufferedInputStream(serverSocket.getInputStream())
+                            val clientOutput = client.getOutputStream()
+                            forwardTraffic(serverInput, clientOutput)
+                            forwardTraffic(client.getInputStream(), serverSocket.getOutputStream())
+
+                        } else {
+
+                            val target = Socket(destHost, port)
+
+                            output.write(response)
+                            output.flush()
+
+                            forwardTraffic(input, target.getOutputStream())
+                            forwardTraffic(target.getInputStream(), output)
+
+                        }
+
+
+
+                    }
+
+                    0x03 -> { // UDP ASSOCIATE
+                        handleSocks5UdpAssociate(client, output)
+                    }
+
+                    else -> {
+                        output.write(byteArrayOf(0x05, 0x07)) // Command not supported
+                        output.flush()
+                        client.close()
+                    }
                 }
+
+
+            } catch (e: Exception) {
+                Log.e("SOCKS5", "Error", e)
+                client.close()
             }
-
         }.start()
     }
 

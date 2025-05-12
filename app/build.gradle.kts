@@ -34,7 +34,7 @@ android {
         }
     }
     namespace = "com.silentPass.vpn"
-    compileSdk = 26
+    compileSdk = 34
 
     defaultConfig {
         applicationId = "com.silentPass.vpn"

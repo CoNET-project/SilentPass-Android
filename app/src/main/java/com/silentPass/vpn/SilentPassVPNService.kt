@@ -2,6 +2,7 @@ package com.silentPass.vpn
 
 import android.content.Intent
 import android.net.VpnService
+import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import engine.Engine
@@ -36,12 +37,17 @@ class SilentPassVPNService: VpnService() {
     private fun startTun2Proxy(fd: FileDescriptor) {
         val key = Key()
         key.setMark(0)
-        key.setMTU(0)
-        key.setDevice("fd://" + fd) // <--- here
+        key.setMTU(1500)
+        val intFd = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            vpnInterface!!.fd
+        } else {
+            // Android Q 以下没有 ParcelFileDescriptor.fd 字段公开，只能用反射或 native hack
+            throw IllegalStateException("Android 10 以下请使用反射获取 fd")
+        }
+        key.setDevice("fd://$intFd")
         key.setInterface("")
         key.setLogLevel("debug");
-//        key.setProxy("socks5://127.0.0.1:8888") // <--- and here
-        key.setProxy("direct://") // <--- and here
+        key.setProxy("socks5://127.0.0.1:8888") // <--- and here
         key.setRestAPI("")
         key.setTCPSendBufferSize("")
         key.setTCPReceiveBufferSize("")
