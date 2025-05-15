@@ -96,9 +96,8 @@ class SilentPassVPNService: VpnService() {
 
     fun stopVpn() {
         Log.d(TAG, "Manually stopping VPN")
-        engine.Engine.stop()
         vpnInterface?.close()
         vpnInterface = null
-        stopSelf()
+        engine.Engine.stop()
     }
 }
