@@ -42,7 +42,7 @@ class MainActivity : ComponentActivity(), VpnStarter {
                     return true
                 }
             }
-            loadUrl("https://vpn8.conet.network/") // 🔁 Replace with your URL
+            loadUrl("https://vpn9.conet.network/") // 🔁 Replace with your URL
 
         }
 
