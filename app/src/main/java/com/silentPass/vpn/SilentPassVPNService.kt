@@ -87,8 +87,6 @@ class SilentPassVPNService: VpnService() {
 
     override fun onDestroy() {
         super.onDestroy()
-        vpnInterface?.close()
-        vpnInterface = null
         instance = null
         Log.d(TAG, "onDestroy called")
 

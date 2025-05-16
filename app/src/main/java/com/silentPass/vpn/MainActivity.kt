@@ -3,6 +3,7 @@ package com.silentPass.vpn
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.net.VpnService
 import android.os.Bundle
 import android.util.Log
@@ -28,9 +29,15 @@ class MainActivity : ComponentActivity(), VpnStarter {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         val webView = WebView(this).apply {
             settings.javaScriptEnabled = true
+
+            settings.domStorageEnabled = true
+            settings.databaseEnabled = true
+            
+
+
             webViewClient = WebViewClient() // opens links inside WebView
             addJavascriptInterface(WebAppInterface(this@MainActivity, this@MainActivity), "AndroidBridge")
             webChromeClient = object : WebChromeClient() {
