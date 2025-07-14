@@ -102,7 +102,7 @@ class LocalWebServer(
 
 
     private fun getAppVersion(context: Context): String {
-        val currentVersion = "1.0.7"
+        val currentVersion = "1.1.0"
         return try {
             val pInfo = context.packageManager.getPackageInfo(context.packageName, 0)
             return currentVersion
