@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "454018765142",
+    "project_id": "silentpassio",
+    "storage_bucket": "silentpassio.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:454018765142:android:ed9f8c1c79de4793c9c6f7",
+        "android_client_info": {
+          "package_name": "com.silentPass.vpn"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDS0NGnFWI4atnabq1-8AChsEZp42Njq0o"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <style name="Theme.SilentPassVPN" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <!-- 设置状态栏为透明 -->
+        <item name="android:statusBarColor">@android:color/transparent</item>
+
+        <!-- 设置状态栏图标为白色（适用于深色背景）-->
+        <item name="android:windowLightStatusBar">false</item>
+
+        <!-- 设置导航栏颜色为黑色 -->
+        <item name="android:navigationBarColor">@android:color/black</item>
+
+        <!-- 设置整个 app 背景为黑色 -->
+        <item name="android:colorBackground">@android:color/black</item>
+
+        <!-- 设置文字颜色为白色 -->
+        <item name="android:textColorPrimary">@android:color/white</item>
+
+
+        <!-- 设置启动页背景为 splash_screen -->
+<!--        <item name="android:windowBackground">@drawable/splash_screen</item>-->
+<!--        <item name="android:windowNoTitle">true</item>-->
+<!--        <item name="android:windowFullscreen">true</item>-->
+
+    </style>
+
+</resources>
