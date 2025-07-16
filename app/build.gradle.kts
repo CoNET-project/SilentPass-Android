@@ -3,6 +3,7 @@ plugins {
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.google.services) // ✅ 添加 Firebase 插件（引用 toml 别名）
+	id("org.jetbrains.kotlin.plugin.serialization") version "1.9.23"
 
 }
 
@@ -103,6 +104,18 @@ dependencies {
     implementation("androidx.multidex:multidex:2.0.1")
 
     implementation("com.google.android.material:material:1.11.0")
+
+	    // ... 其他依赖
+
+    // OkHttp 用于网络请求
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // Kotlinx Serialization 用于 JSON 解析
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
+    
+    // Kotlin Coroutines 协程核心库
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.0")
 
 
     implementation(libs.androidx.core.ktx)

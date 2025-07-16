@@ -22,43 +22,6 @@ import java.security.SecureRandom
 import java.util.UUID
 
 
-data class Node (
-    val country: String,
-    val ip_addr: String,
-    val region: String,
-    val armoredPublicKey: String,
-    val nftNumber: String
-)
-
-data class StartVPNData(
-    val entryNodes: List<Node>,
-    val exitNode: List<Node>,
-    val privateKey: String
-)
-
-data class VE_IPptpStream (
-    val host: String,
-    val port: String,
-    val buffer: String,
-    val uuid: String
-)
-
-data class SICommandObj (
-    val command: String,
-    val algorithm: String,
-    val Securitykey: String,
-    val requestData: List<VE_IPptpStream>,
-    val walletAddress: String
-)
-
-data class requestData (
-    val message: String,
-    val signMessage: String
-)
-
-data class postHttp (
-    val data: String
-)
 
 class LayerMinus(startVPNData: StartVPNData) {
     private val credentials: Credentials = Credentials.create(

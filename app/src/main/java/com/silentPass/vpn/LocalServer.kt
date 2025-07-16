@@ -75,7 +75,6 @@ class SocketServerService : Service() {
         if (serverThread == null || !serverThread!!.isAlive) {
             startSocketServer()
         }
-
         return START_STICKY
     }
 

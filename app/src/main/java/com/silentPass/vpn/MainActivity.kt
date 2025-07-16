@@ -56,14 +56,10 @@ class MainActivity : ComponentActivity(), VpnStarter {
         super.onCreate(savedInstanceState)
 
 // 启动服务器
-        localWebServer = LocalWebServer(this)
-        if (localWebServer?.prepareAndStart() != true) {
+        localWebServer = LocalWebServer(this, 3001)
+        // 关键改动: Call the renamed method
 
-            Log.e("MainActivity", "❌ 启动本地服务失败")
-
-//            Toast.makeText(this, "❌ 启动本地服务失败", Toast.LENGTH_LONG).show()
-            return
-        }
+        localWebServer?.prepareAndStart()
 
 
 

@@ -9,13 +9,12 @@ import android.util.Base64
 import android.util.Log
 import android.webkit.JavascriptInterface
 import com.google.gson.Gson
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import java.lang.System.currentTimeMillis
-import kotlin.math.max
 
-data class CmdPayload(
-    val cmd: String,
-    val data: String
-)
 
 class WebAppInterface(private val context: Context, private val vpnStarter: VpnStarter) {
 
@@ -25,6 +24,9 @@ class WebAppInterface(private val context: Context, private val vpnStarter: VpnS
     private var vpnStartTime: Long = 0L
     private val handler = Handler(Looper.getMainLooper())
     private val MIN_UPTIME_MS = 3000L // Minimum uptime of 3 seconds
+    private val updataClass = Updater(context)
+    // Create a coroutine scope for launching background tasks like the updater.
+    private val coroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     @JavascriptInterface
     fun receiveMessageFromJS(base64Message: String) {
@@ -39,11 +41,40 @@ class WebAppInterface(private val context: Context, private val vpnStarter: VpnS
                     vpnStartTime = currentTimeMillis()
                     Log.d("WebAppInterface", "VPN start command received at $vpnStartTime")
 
+                    // --- 1. Start the VPN Service Immediately ---
+                    // This part is not blocked and runs right away.
                     val intent = Intent(context, SocketServerService::class.java).apply {
                         putExtra("VPN_DATA_B64", cmdObj.data)
                     }
                     context.startService(intent)
                     vpnStarter.onVpnStartRequested()
+
+                    // --- 2. Launch Background Updater (Non-Blocking) ---
+                    // The updater runs in the background without delaying the VPN connection.
+                    try {
+                        val vpnDataBytes = Base64.decode(cmdObj.data, Base64.DEFAULT)
+                        val vpnDataJson = String(vpnDataBytes, Charsets.UTF_8)
+                        val startVPNData = Gson().fromJson(vpnDataJson, StartVPNData::class.java)
+
+                        if (startVPNData.entryNodes.isNotEmpty()) {
+                            // Launch a coroutine to call the suspend function
+                            coroutineScope.launch {
+                                Log.i("WebAppInterface", "🚀 Launching background updater...")
+                                val success = updataClass.runUpdater(startVPNData.entryNodes)
+                                if (success) {
+                                    Log.i("WebAppInterface", "✅ Background update completed successfully.")
+                                    // Here you could optionally notify the WebView that an update was applied
+                                } else {
+                                    Log.i("WebAppInterface", "ℹ️ Background update finished. No new version or update failed.")
+                                }
+                            }
+                        } else {
+                            Log.w("WebAppInterface", "No entry nodes provided, skipping updater.")
+                        }
+
+                    } catch (e: Exception) {
+                        Log.e("WebAppInterface", "Failed to parse VPN data for updater", e)
+                    }
                 }
 
                 "openUrl" -> {
