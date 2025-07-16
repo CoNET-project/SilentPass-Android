@@ -204,10 +204,13 @@ class MainActivity : ComponentActivity(), VpnStarter {
 
     companion object {
         const val VPN_REQUEST_CODE = 1000
+        const val ACTION_STOP_VPN = "com.silentPass.vpn.ACTION_STOP_VPN"
     }
 
     override fun onVpnStartRequested() {
+
         val prepareIntent = VpnService.prepare(this)
+
         if (prepareIntent != null) {
             vpnLauncher.launch(prepareIntent)
         } else {
@@ -216,6 +219,13 @@ class MainActivity : ComponentActivity(), VpnStarter {
     }
 
     override fun onVpnStopRequested() {
+        // Create an Intent with the specific stop action
+        val stopIntent = Intent(this, SilentPassVPNService::class.java).apply {
+            action = SilentPassVPNService.ACTION_STOP_VPN
+        }
+
+        // Use startService to deliver the command to the running service
+        startService(stopIntent)
 
         lifecycleScope.launch {
             try {
@@ -226,6 +236,8 @@ class MainActivity : ComponentActivity(), VpnStarter {
 
                 // 延迟后，再调用 stopVpn()
 
+
+           //     (SilentPassVPNService.instance)?.stopVpn()
 
             } catch (e: Exception) {
                 // 记录或处理异常

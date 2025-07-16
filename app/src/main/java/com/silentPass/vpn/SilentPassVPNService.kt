@@ -14,11 +14,18 @@ val TAG = "SilentPassVPNService"
 class SilentPassVPNService: VpnService() {
     companion object {
         var instance: SilentPassVPNService? = null
+        const val ACTION_STOP_VPN = "com.silentPass.vpn.ACTION_STOP_VPN"
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP_VPN) {
+            Log.i("VpnService", "Received STOP command.")
+            stopVpnV2() // Call your internal shutdown method
+            return START_NOT_STICKY // The service will not be recreated
+        }
+
         val builder = Builder()
         builder.setSession("Silent Pass VPN")
             .addAddress("10.0.0.2", 32)
@@ -86,14 +93,8 @@ class SilentPassVPNService: VpnService() {
         Log.d(TAG, "onDestroy called")
     }
 
-    fun stopVpn() {
+    fun stopVpnV2() {
         Log.d(TAG, "Manually stopping VPN")
-        try {
-            Engine.stop()
-            Log.d(TAG, "Engine stopped.")
-        } catch (e: Exception) {
-            Log.e(TAG, "Stopping engine failed", e)
-        }
 
         try {
             vpnInterface?.close()
@@ -103,5 +104,13 @@ class SilentPassVPNService: VpnService() {
         }
         vpnInterface = null
         stopSelf()
+
+        try {
+            Engine.stop()
+            Log.d(TAG, "Engine stopped.")
+        } catch (e: Exception) {
+            Log.e(TAG, "Stopping engine failed", e)
+        }
+
     }
 }
