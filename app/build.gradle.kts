@@ -91,6 +91,8 @@ dependencies {
         exclude(group = "org.bouncycastle", module = "bcpkix-jdk15on")
     }
     implementation("org.nanohttpd:nanohttpd:2.3.1")
+    implementation ("com.jakewharton:process-phoenix:2.1.2")
+    implementation("com.github.li-xiaojun:XPopup:2.9.19")
 
 
     implementation("androidx.core:core-splashscreen:1.0.1")

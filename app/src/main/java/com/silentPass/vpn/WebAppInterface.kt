@@ -1,5 +1,6 @@
 package com.silentPass.vpn
 
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -9,6 +10,8 @@ import android.util.Base64
 import android.util.Log
 import android.webkit.JavascriptInterface
 import com.google.gson.Gson
+import com.jakewharton.processphoenix.ProcessPhoenix
+import com.lxj.xpopup.XPopup
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -88,6 +91,41 @@ class WebAppInterface(private val context: Context, private val vpnStarter: VpnS
                     }
                 }
 
+                "updateVPNUI" -> {
+                    // If VPN was never started, stop immediately.
+                    if (vpnStartTime == 0L) {
+                        Log.w("WebAppInterface", "Stop command received but VPN was not started. Stopping anyway.")
+                        executeStop()
+                        return
+                    }
+
+                    val elapsedTime = currentTimeMillis() - vpnStartTime
+
+                    // If elapsed time is less than the minimum required uptime
+                    if (elapsedTime < MIN_UPTIME_MS) {
+                        val delayNeeded = MIN_UPTIME_MS - elapsedTime
+                        Log.d("WebAppInterface", "Delaying stop command by $delayNeeded ms")
+                        handler.postDelayed({
+                            executeStop()
+                        }, delayNeeded)
+                    } else {
+                        // If enough time has passed, stop immediately
+                        Log.d("WebAppInterface", "Sufficient uptime. Stopping VPN immediately.")
+                        executeStop()
+                    }
+
+                    XPopup.Builder(context)
+                        .asConfirm(
+                            "升级成功",
+                            "请退出 app 后重新打开"
+                        ) {
+                            restartApp(context)
+                        }
+                        .show()
+
+
+                }
+
                 "stopVPN" -> {
                     // If VPN was never started, stop immediately.
                     if (vpnStartTime == 0L) {
@@ -132,5 +170,11 @@ class WebAppInterface(private val context: Context, private val vpnStarter: VpnS
 
         // Reset the start time to indicate the VPN is stopped.
         vpnStartTime = 0L
+    }
+
+
+    fun restartApp(context: Context) {
+        ProcessPhoenix.triggerRebirth(context)
+
     }
 }

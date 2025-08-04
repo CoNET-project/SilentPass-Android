@@ -17,6 +17,9 @@ dependencyResolutionManagement {
         gradlePluginPortal()
         google()
         mavenCentral()
+        maven(url = "https://jitpack.io") // ✅ Kotlin DSL 正确写法
+
+
     }
 }
 
