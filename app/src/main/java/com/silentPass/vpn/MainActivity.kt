@@ -120,7 +120,7 @@ class MainActivity : ComponentActivity(), VpnStarter {
             }
 
 //            loadUrl("https://vpn9.conet.network/")
-            loadUrl("http://127.0.0.1:3001/")
+            loadUrl("http://localhost:3001/")
 //            loadUrl("http://localhost:3001/loader.html")
 //            loadUrl("https://vpn4.silentpass.io/loader.html")
 //              loadUrl("https://ios-test.silentpass.io/loader.html")
