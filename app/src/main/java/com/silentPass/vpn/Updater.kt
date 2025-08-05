@@ -169,7 +169,11 @@ class Updater(private val context: Context) {
      */
     private fun downloadSingleFile(url: String, destinationFile: File) {
         Log.d("Updater", "下载中: $url -> ${destinationFile.name}")
-        val request = Request.Builder().url(url).build()
+        // --- 修改点: 添加 Referer 头 ---
+        val request = Request.Builder()
+            .url(url)
+            .addHeader("Referer", "SP-test")
+            .build()
         val response = client.newCall(request).execute()
 
         if (!response.isSuccessful) {
@@ -184,7 +188,11 @@ class Updater(private val context: Context) {
         }
     }
     private suspend fun fetchUpdateInfo(url: String): UpdateInfo {
-        val request = Request.Builder().url(url).build()
+        // --- 修改点: 添加 Referer 头 ---
+        val request = Request.Builder()
+            .url(url)
+            .addHeader("Referer", "SP-test")
+            .build()
         val response = withContext(Dispatchers.IO) {
             client.newCall(request).execute()
         }
@@ -193,7 +201,11 @@ class Updater(private val context: Context) {
         return json.decodeFromString(responseBody)
     }
     private fun downloadAndUnzip(url: String, destDir: File) {
-        val request = Request.Builder().url(url).build()
+        // --- 修改点: 添加 Referer 头 ---
+        val request = Request.Builder()
+            .url(url)
+            .addHeader("Referer", "SP-test")
+            .build()
         val response = client.newCall(request).execute()
         if (!response.isSuccessful) throw IOException("下载失败: ${response.code}")
 
