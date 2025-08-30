@@ -35,17 +35,27 @@ class SocketServerService : Service() {
     private var isRunning = true
     private var layerMinus: LayerMinus? = null
     private var serverSocket: ServerSocket? = null
-
+    private val LOG_TAG = "SocketServerService"
     private fun forwardTraffic(input: InputStream, output: OutputStream) {
         Thread {
             try {
                 val buffer = ByteArray(4096)
                 var bytes: Int
-                while (input.read(buffer).also { bytes = it } != -1) {
+                while (true) {
+                    bytes = input.read(buffer)
+                    if (bytes == -1) {
+                        // 正常的 EOF，不是错误
+                        Log.d(LOG_TAG, "forwardTraffic: EOF reached, closing gracefully")
+                        break
+                    }
                     output.write(buffer, 0, bytes)
                     output.flush()
                 }
-            } catch (_: Exception) {
+            } catch (e: java.net.SocketException) {
+                // Socket 关闭是正常的，不需要记录为错误
+                Log.d(LOG_TAG, "forwardTraffic: Socket closed (normal)")
+            } catch (e: Exception) {
+                Log.e(LOG_TAG, "forwardTraffic: Unexpected error", e)
             } finally {
                 try {
                     input.close()
@@ -100,19 +110,19 @@ class SocketServerService : Service() {
         super.onCreate()
         createNotificationChannel()
         startForeground(1, createNotification()) // REQUIRED WITHIN 5s
-        Log.d("SocketServerService", "Service created")
+        Log.d(LOG_TAG, "Service created")
     }
 
     private fun handleHttpProxy(client: Socket, requestLine: String?, reader: BufferedReader) {
         Thread {
             if (requestLine == null) {
-                Log.e("HTTP Proxy", "Null request line")
+                Log.e(LOG_TAG, "Null request line")
                 client.close()
                 return@Thread
             }
 
             try {
-                Log.d("HTTP Proxy", "Request Line: $requestLine")
+                Log.d(LOG_TAG, "Request Line: $requestLine")
 
                 val headers = mutableListOf<String>()
                 var line: String?
@@ -123,7 +133,7 @@ class SocketServerService : Service() {
                 val parts = requestLine.split(" ")
 
                 if (parts.size < 3) {
-                    Log.e("HTTP Proxy", "Invalid request line")
+                    Log.e(LOG_TAG, "Invalid request line")
                     client.close()
                     return@Thread
                 }
@@ -138,7 +148,7 @@ class SocketServerService : Service() {
                 val port = if (url.port != -1) url.port else 80
                 val path = url.file.ifEmpty { "/" }
 
-                Log.d("HTTP Proxy", "Target: $host:$port$path")
+                Log.d(LOG_TAG, "Target: $host:$port$path")
 
                 var body: CharArray? = null
                 val contentLength = headers
@@ -151,17 +161,22 @@ class SocketServerService : Service() {
                 }
 
                 var requestBody = "$method $path $httpVersion\r\n"
+
                 for (header in headers) {
                     if (!header.startsWith("Proxy-", ignoreCase = true)) {
                         requestBody += "$header\r\n"
                     }
                 }
-                requestBody += "\r\n" + body
+
+                requestBody += "\r\n"
+
+                if (body != null) {
+                    requestBody += String(body!!)
+                }
 
                 val serverSocket: Socket?
                 if (layerMinus != null) {
 
-                                ""
                     serverSocket = layerMinus?.connectToLayerMinus(host, port.toString(), requestBody.toByteArray(Charsets.UTF_8))
                     if (serverSocket != null) {
                         val serverInput = BufferedInputStream(serverSocket.getInputStream())
@@ -191,15 +206,23 @@ class SocketServerService : Service() {
                     forwardTraffic(serverInput, clientOutput)
                 }
 
-
-
             } catch (e: Exception) {
-                Log.e("HTTP Proxy", "Error: ${e.message}", e)
+                Log.e(LOG_TAG, "Error: ${e.message}", e)
                 try {
                     client.close()
                 } catch (_: Exception) {}
             }
         }.start()
+    }
+
+    private fun readFirstChunkOrNull(ins: InputStream): ByteArray? {
+        val buf = ByteArray(4096)
+        val n = try { ins.read(buf) } catch (e: Exception) { return null }
+        return when {
+            n > 0  -> buf.copyOf(n)     // 首包
+            n == 0 -> ByteArray(0)      // 极少见，但允许空首包
+            else   -> null              // -1，立刻返回 null（不传首包）
+        }
     }
 
     private fun handleHttpsConnect(client: Socket, requestLine: String) {
@@ -217,23 +240,22 @@ class SocketServerService : Service() {
 
                 if (layerMinus != null) {
                     val inputStream: InputStream = client.getInputStream()
-                    val buffer = ByteArray(4096)
-                    val output = ByteArrayOutputStream()
-                    var bytesRead: Int
-                    inputStream.read(buffer).also { bytesRead = it }
-                    output.write(buffer, 0, bytesRead)
+                    val firstData: ByteArray? = readFirstChunkOrNull(inputStream)
+                    Log.d(LOG_TAG, "rawBytes length = ${firstData?.size ?: 0}")
+                    val serverSocket = layerMinus?.connectToLayerMinus(host, port.toString(), firstData)
 
-                    val rawBytes = output.toByteArray()
 
-                    Log.d("handleHttpsConnect", "rawBytes length = ${bytesRead}")
-                    var serverSocket =
-                        layerMinus?.connectToLayerMinus(host, port.toString(), rawBytes)
+
+
+
                     if (serverSocket == null) {
                         client.close()
                         return@Thread
                     }
 
                     val serverInput = BufferedInputStream(serverSocket.getInputStream())
+
+
                     val clientOutput = client.getOutputStream()
                     forwardTraffic(serverInput, clientOutput)
                     forwardTraffic(client.getInputStream(), serverSocket.getOutputStream())
@@ -249,13 +271,13 @@ class SocketServerService : Service() {
                 forwardTraffic(client.getInputStream(), targetSocket.getOutputStream())
                 forwardTraffic(targetSocket.getInputStream(), client.getOutputStream())
                 Log.d(
-                    "ProxyServer",
-                    "try lauer minus data ${this.layerMinus?.entryNodes[0]?.country}"
+                    LOG_TAG,
+                    "Forwarding ${host}:${port} via Local CONNECTING"
                 )
                     }
 
             } catch (e: Exception) {
-                Log.e("ProxyServer", "HTTPS CONNECT failed", e)
+                Log.e(LOG_TAG, "HTTPS CONNECT failed", e)
                 client.close()
                 return@Thread
             }
@@ -290,20 +312,16 @@ class SocketServerService : Service() {
 
             val response = byteArrayOf(0x00, 0x5a, 0, 0, 0, 0, 0, 0) // request granted
             if (layerMinus != null) {
-                output.write(response)
-                output.flush()
                 val inputStream: InputStream = client.getInputStream()
-                val buffer = ByteArray(4096)
-                val output = ByteArrayOutputStream()
-                var bytesRead: Int
-                inputStream.read(buffer).also { bytesRead = it }
-                output.write(buffer, 0, bytesRead)
+                val firstData: ByteArray? = readFirstChunkOrNull(inputStream)
+                Log.d("handleHttpsConnect", "rawBytes length = ${firstData?.size ?: 0}")
+                val serverSocket =
+                    layerMinus?.connectToLayerMinus(destHost, port.toString(), firstData)
 
-                val rawBytes = output.toByteArray()
 
-                Log.d("handleHttpsConnect", "rawBytes length = ${bytesRead}")
-                var serverSocket =
-                    layerMinus?.connectToLayerMinus(destHost, port.toString(), rawBytes)
+
+
+
                 if (serverSocket == null) {
                     client.close()
                     return@Thread
@@ -323,7 +341,7 @@ class SocketServerService : Service() {
                     forwardTraffic(input, target.getOutputStream())
                     forwardTraffic(target.getInputStream(), output)
                 } catch (e: Exception) {
-                    Log.e("SOCKS4", "Connection error", e)
+                    Log.e(LOG_TAG, "Connection error", e)
                     output.write(byteArrayOf(0x00, 0x5b)) // request rejected
                     output.flush()
                     client.close()
@@ -427,7 +445,7 @@ class SocketServerService : Service() {
                 }
             }.start()
         } catch (e: Exception) {
-            Log.e("SOCKS5", "UDP associate failed", e)
+            Log.e(LOG_TAG, "UDP associate failed", e)
             client.close()
         }
     }
@@ -484,50 +502,87 @@ class SocketServerService : Service() {
                 )
 
                 when (cmd) {
-                    0x01 -> { // CONNECT (handled before)
-
-
+                    0x01 -> { // CONNECT
                         if (layerMinus != null) {
-
                             output.write(response)
                             output.flush()
 
-                            val inputStream: InputStream = client.getInputStream()
-                            val buffer = ByteArray(4096)
-                            val output = ByteArrayOutputStream()
-                            var bytesRead: Int
-                            inputStream.read(buffer).also { bytesRead = it }
-                            output.write(buffer, 0, bytesRead)
+                            Thread {
+                                var remoteSocket: Socket? = null  // 改名为 remoteSocket 避免混淆
+                                try {
+                                    val buffer = ByteArray(4096)
+                                    var firstPacketSent = false
 
-                            val rawBytes = output.toByteArray()
+                                    while (true) {
+                                        val bytesRead = try {
+                                            input.read(buffer)
+                                        } catch (e: java.net.SocketException) {
+                                            if (e.message?.contains("closed") == true) {
+                                                Log.d(LOG_TAG, "Client socket closed (normal)")
+                                                break
+                                            } else {
+                                                throw e
+                                            }
+                                        }
 
-                            Log.d("handleHttpsConnect", "rawBytes length = ${bytesRead}")
-                            var serverSocket =
-                                layerMinus?.connectToLayerMinus(destHost, port.toString(), rawBytes)
-                            if (serverSocket == null) {
-                                client.close()
-                                return@Thread
-                            }
+                                        if (bytesRead == -1) break
 
-                            val serverInput = BufferedInputStream(serverSocket.getInputStream())
-                            val clientOutput = client.getOutputStream()
-                            forwardTraffic(serverInput, clientOutput)
-                            forwardTraffic(client.getInputStream(), serverSocket.getOutputStream())
+                                        if (!firstPacketSent) {
+                                            firstPacketSent = true
+                                            val firstData = if (bytesRead > 0) {
+                                                buffer.copyOfRange(0, bytesRead)
+                                            } else {
+                                                ByteArray(0)
+                                            }
 
+                                            Log.d(LOG_TAG, "First packet for $destHost:$port - ${bytesRead} bytes")
+
+                                            remoteSocket = layerMinus?.connectToLayerMinus(
+                                                destHost,
+                                                port.toString(),
+                                                firstData
+                                            )
+
+                                            if (remoteSocket == null) {
+                                                Log.e(LOG_TAG, "LayerMinus connection failed")
+                                                client.close()
+                                                break
+                                            }
+
+                                            // 启动反向转发
+
+                                            // 先把所有需要的流拿到手，避免参数求值时触发 Socket 已关闭
+                                            val rs = remoteSocket!!
+                                            val remoteIn  = BufferedInputStream(rs.getInputStream())
+                                            val remoteOut = rs.getOutputStream()
+                                            val clientOut = client.getOutputStream()
+
+                                            // 启动 远端->客户端
+                                            Thread {
+                                                forwardTraffic(remoteIn, clientOut)
+                                            }.start()
+
+
+                                        } else {
+                                            remoteSocket?.getOutputStream()?.write(buffer, 0, bytesRead)
+                                            remoteSocket?.getOutputStream()?.flush()
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    Log.e(LOG_TAG, "Client to server forward error", e)
+                                } finally {
+                                    remoteSocket?.close()
+                                    client.close()
+                                }
+                            }.start()
                         } else {
-
+                            // 直连模式
                             val target = Socket(destHost, port)
-
                             output.write(response)
                             output.flush()
-
                             forwardTraffic(input, target.getOutputStream())
                             forwardTraffic(target.getInputStream(), output)
-
                         }
-
-
-
                     }
 
                     0x03 -> { // UDP ASSOCIATE
@@ -540,13 +595,46 @@ class SocketServerService : Service() {
                         client.close()
                     }
                 }
-
-
             } catch (e: Exception) {
-                Log.e("SOCKS5", "Error", e)
+                Log.e(LOG_TAG, "Error in handleSocks5", e)
                 client.close()
             }
         }.start()
+
+    }
+
+    private enum class ProtocolType {
+        TLS, HTTP, UNKNOWN
+    }
+    private data class ProtocolInfo(val type: ProtocolType, val details: String = "")
+    private fun detectProtocol(data: ByteArray, port: Int): ProtocolInfo {
+        // TLS 检测
+        if (data.size >= 3 && data[0] == 0x16.toByte() && data[1] == 0x03.toByte()) {
+            return ProtocolInfo(ProtocolType.TLS, "TLS ClientHello")
+        }
+
+        // HTTP 检测
+        val httpMethods = listOf("GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "CONNECT ", "PATCH ", "TRACE ")
+        if (data.size >= 4) {
+            val header = String(data.take(16).toByteArray(), Charsets.UTF_8)
+            for (method in httpMethods) {
+                if (header.startsWith(method)) {
+                    return ProtocolInfo(ProtocolType.HTTP, method.trim())
+                }
+            }
+        }
+
+        // 根据端口推断
+        return when (port) {
+            443, 8443 -> ProtocolInfo(ProtocolType.TLS, "Assumed by port")
+            80, 8080 -> ProtocolInfo(ProtocolType.HTTP, "Assumed by port")
+            else -> ProtocolInfo(ProtocolType.UNKNOWN)
+        }
+    }
+    private fun rewriteHttpRequest(data: ByteArray, host: String, port: Int): ByteArray {
+        // 如果 LayerMinus 需要特殊的 HTTP 请求格式，在这里重写
+        // 目前看起来 LayerMinus 接受原始请求，所以可能不需要重写
+        return data
     }
 
     private fun handleClient(client: Socket) {
@@ -564,7 +652,7 @@ class SocketServerService : Service() {
                     else -> {
                         val reader = BufferedReader(InputStreamReader(input))
                         var requestLine = reader.readLine()
-                        Log.d("ProxyServer", "HTTP/s forwarding ${requestLine}")
+                        Log.d(LOG_TAG, "HTTP/s forwarding ${requestLine}")
                         if (requestLine?.startsWith("CONNECT") == true) {
                             handleHttpsConnect(client, requestLine)
                         } else {
@@ -573,7 +661,7 @@ class SocketServerService : Service() {
                     }
                 }
             } catch (e: Exception) {
-                Log.e("Proxy", "Error handling client", e)
+                Log.e(LOG_TAG, "Error handling client", e)
                 try {
                     client.close()
                 } catch (_: Exception) {}
@@ -581,12 +669,14 @@ class SocketServerService : Service() {
         }.start()
     }
 
+
+
     override fun onDestroy() {
         isRunning = false
         serverThread?.interrupt()
         super.onDestroy()
         serverSocket?.close()
-        Log.d("WebAppInterface", "onDestroy called")
+        Log.d(LOG_TAG, "onDestroy called")
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

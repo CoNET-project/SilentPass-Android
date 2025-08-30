@@ -43,7 +43,7 @@
             android:foregroundServiceType="dataSync"
             android:exported="false" />
         <service
-            android:name=".SilentPassVPNService"
+            android:name=".vpn2socks.Vpn2SocksService"
             android:permission="android.permission.BIND_VPN_SERVICE"
             android:exported="false">
             <intent-filter>
