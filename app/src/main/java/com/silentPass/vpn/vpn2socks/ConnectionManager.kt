@@ -117,6 +117,36 @@ class ConnectionManager(
         }
     }
 
+    private fun getOrCreateConnection(
+        key: String,
+        ip: IPv4Packet,
+        tcp: TCPSegment,
+        bypassDirect: Boolean  // 添加参数
+    ): TCPConnection? {
+        // 检查是否有可复用的连接
+        val existing = tcpConns[key]
+        if (existing != null && !existing.isClosed()) {
+            // 检查是否是重传的SYN
+            if (tcp.isSYN && !tcp.isACK) {
+                Log.d(LOG_TAG, "Duplicate SYN for existing connection: $key")
+                return existing
+            }
+            return existing
+        }
+
+        // 创建新连接
+        return TCPConnection(
+            key = key,
+            mtu = mtu,
+            packetWriter = packetWriter,
+            dns = dns,
+            socksEndpoint = socksEndpoint,
+            bypassDirect = bypassDirect
+        ).also {
+            tcpConns[key] = it
+        }
+    }
+
     init {
         scope.launch {
             while (isActive) {
@@ -192,7 +222,7 @@ class ConnectionManager(
             Log.d(LOG_TAG, "SYN ${ip.src}:${tcp.srcPort} -> ${ip.dst}:${tcp.dstPort}")
         }
 
-        // 阻断 DoT (port 853) —— 直接 RST
+        // 阻断 DoT (port 853) — 直接 RST
         if (tcp.isSYN && !tcp.isACK && tcp.dstPort == 853) {
             val rst = IpBuilders.tcpPayloadFromServer(
                 src = ip.dst, dst = ip.src,
@@ -207,7 +237,7 @@ class ConnectionManager(
             return
         }
 
-        // 是否为“假段”范围的 IP（198.18.0.0/15）
+        // 是否为"假段"范围的 IP（198.18.0.0/15）
         val v = ip.dst.raw
         val firstOctet = (v ushr 24) and 0xff
         val secondOctet = (v ushr 16) and 0xff
@@ -237,6 +267,7 @@ class ConnectionManager(
                 )
             }
 
+            // 使用getOrCreateConnection方法或直接在这里创建
             val conn = tcpConns.getOrPut(key) {
                 TCPConnection(
                     key = key,

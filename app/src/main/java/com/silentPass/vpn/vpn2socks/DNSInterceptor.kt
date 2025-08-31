@@ -1,6 +1,7 @@
 package com.silentPass.vpn.vpn2socks
 
 import android.util.Log
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.*
@@ -297,7 +298,74 @@ class DNSInterceptor private constructor() {
         "dns.weixin.qq.com",
         "short.weixin.qq.com",
         "long.weixin.qq.com",
+
+        "doubleclick.net",
+        "pubmatic.com",
+        "adnxs.com",
+        "rubiconproject.com",
+
+        "adsrvr.org",
+        "criteo.com",
+
+        "taboola.com",
+        "yahoo.com",
+        "publicsuffix.org"
     )
+
+    private val bypassPatterns = listOf(
+        Regex(""".*\.doubleclick\.net$"""),
+        Regex(""".*\.pubmatic\.com$"""),
+        Regex(""".*\.criteo\.com$"""),
+        Regex(""".*\.yahoo\.com$"""),
+        Regex(""".*\.adsrvr\.org$""")
+    )
+
+    // 增加预取和批处理
+    private suspend fun prefetchDNS(domains: List<String>) {
+        kotlinx.coroutines.coroutineScope {
+            domains.chunked(5).forEach { batch ->
+                launch {
+                    batch.forEach { domain ->
+                        val cacheKey = generateCacheKeyForDomain(domain)
+                        dnsCacheMutex.withLock {
+                            if (!dnsCache.containsKey(cacheKey)) {
+                                // 创建A记录查询
+                                val query = createDnsQuery(domain)
+                                queryViaDoH(query)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun generateCacheKeyForDomain(domain: String): String {
+        // 为域名生成固定的缓存键
+        return "A:$domain"
+    }
+
+    private fun createDnsQuery(domain: String): ByteArray {
+        val out = ByteArrayOutputStream()
+        // Transaction ID
+        out.write(byteArrayOf(0x12, 0x34))
+        // Flags: Standard query
+        out.write(byteArrayOf(0x01, 0x00))
+        // Questions: 1, Answers: 0, Authority: 0, Additional: 0
+        out.write(byteArrayOf(0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00))
+
+        // Write domain name
+        domain.split('.').forEach { label ->
+            out.write(label.length.toByte().toInt())
+            out.write(label.toByteArray())
+        }
+        out.write(0) // End of name
+
+        // Type A (1), Class IN (1)
+        out.write(byteArrayOf(0x00, 0x01, 0x00, 0x01))
+
+        return out.toByteArray()
+    }
 
     // 预处理一份"规范化后的"绕行域名集合（保持原 bypassDomains 不动）
     private val bypassNorm: Set<String> = bypassDomains.map { normalizeDomain(it) }.toSet()
@@ -622,12 +690,23 @@ class DNSInterceptor private constructor() {
 
     fun shouldBypass(domain: String): Boolean {
         val d = normalizeDomain(domain)
+
+        // 缓存检查
         bypassCache[d]?.let { return it }
 
-        // 直接命中或任一后缀命中
-        val hit = bypassNorm.contains(d) || bypassNorm.any { base -> isSubdomainOf(d, base) }
-        bypassCache[d] = hit
-        return hit
+        // 精确匹配
+        if (bypassNorm.contains(d)) {
+            bypassCache[d] = true
+            return true
+        }
+
+        // 模式匹配
+        val matched = bypassPatterns.any { pattern ->
+            pattern.matches(d)
+        }
+
+        bypassCache[d] = matched
+        return matched
     }
 
     suspend fun isDirect(ip: IPv4Address): Boolean =

@@ -70,6 +70,8 @@ class TCPConnection(
     }
 
     private val stats = ConnectionStats()
+
+    private val pendingSize = AtomicInteger(0)  // 新增：缓存pending的总大小
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     // SACK support flag (set during handshake)
@@ -107,17 +109,15 @@ class TCPConnection(
             flightSize = max(0, flightSize - ackedBytes)
             duplicateAckCount.set(0)
 
-            // Only grow window for NEW data ACKs, not duplicate ACKs
             if (ackedBytes > 0) {
+                // 增加慢启动阈值
                 if (cwnd < ssthresh) {
-                    // Slow start - grow by full segment for each ACK
-                    cwnd = min(cwnd + ackedBytes, ssthresh)
+                    cwnd = min(cwnd + min(ackedBytes, MSS * 2), ssthresh) // 更激进的增长
                 } else {
-                    // Congestion avoidance - grow slowly
-                    cwnd += (MSS * ackedBytes) / cwnd
+                    // 拥塞避免阶段也可以更激进
+                    cwnd += (MSS * ackedBytes * 2) / cwnd  // 2倍增长因子
                 }
             }
-            stats.ackedPackets++
         }
 
         fun onDuplicateAck() {
@@ -249,41 +249,15 @@ class TCPConnection(
         }
     }
 
+
+
     // =============== Adaptive Write Coalescer ===============
     private inner class AdaptiveWriteCoalescer {
         private val buffer = ByteArrayOutputStream()
+        private val pendingWrites = mutableListOf<ByteArray>()
         private var lastWriteTime = 0L
         private var consecutiveSmallWrites = 0
         private val lock = Object()
-
-        // 动态Nagle延迟
-        private val getNagleDelay: Long
-            get() = when {
-                consecutiveSmallWrites > 5 -> 5L   // 检测到大量小包，减少延迟
-                congestionControl.getRto() < 200 -> 10L
-                else -> 20L
-            }
-
-        fun offer(data: ByteArray, writer: (ByteArray) -> Boolean): Boolean {
-            synchronized(lock) {
-                buffer.write(data)
-
-                // Flush immediately if:
-                // 1. Buffer is near MTU
-                // 2. PSH flag would be set (interactive data)
-                // 3. Buffer has been waiting > 10ms
-                val shouldFlush = buffer.size() >= mtu - 100 ||
-                        data.size < 100 ||
-                        (System.currentTimeMillis() - lastWriteTime) > 10
-
-                return if (shouldFlush) {
-                    flush(writer)
-                } else {
-                    lastWriteTime = System.currentTimeMillis()
-                    true
-                }
-            }
-        }
 
         fun flush(writer: (ByteArray) -> Boolean): Boolean {
             synchronized(lock) {
@@ -291,13 +265,47 @@ class TCPConnection(
 
                 val data = buffer.toByteArray()
                 buffer.reset()
+                pendingWrites.clear()
                 lastWriteTime = System.currentTimeMillis()
 
                 return writer(data)
             }
         }
 
-        fun hasData(): Boolean = synchronized(lock) { buffer.size() > 0 }
+
+        fun offer(data: ByteArray, writer: (ByteArray) -> Boolean): Boolean {
+            synchronized(lock) {
+                pendingWrites.add(data)
+                buffer.write(data)
+
+                val now = System.currentTimeMillis()
+                val timeSinceLastWrite = now - lastWriteTime
+
+                // 动态决定是否flush
+                val shouldFlush = when {
+                    buffer.size() >= mtu - 100 -> true // 接近MTU
+                    pendingWrites.size >= 3 -> true // 累积了多个小包
+                    timeSinceLastWrite > 10 && buffer.size() > 0 -> true // 超时
+                    data.size > 1000 -> true // 大包立即发送
+                    else -> false
+                }
+
+                return if (shouldFlush) {
+                    val merged = buffer.toByteArray()
+                    buffer.reset()
+                    pendingWrites.clear()
+                    lastWriteTime = now
+
+                    if (merged.size < 100) consecutiveSmallWrites++
+                    else consecutiveSmallWrites = 0
+
+                    writer(merged)
+                } else {
+                    lastWriteTime = now
+                    true
+                }
+            }
+        }
     }
 
     // =============== State Management ===============
@@ -367,6 +375,36 @@ class TCPConnection(
             processPacket(ip, tcp)
         }
     }
+
+    init {
+        // 启动健康监测
+        scope.launch {
+            monitorConnectionHealth()
+        }
+    }
+
+    private suspend fun monitorConnectionHealth() {
+        while (!isClosed) {
+            delay(1000)
+
+            val packetLoss = if (stats.totalPackets > 0) {
+                stats.droppedPackets.toFloat() / stats.totalPackets
+            } else 0f
+
+            val rtt = congestionControl.getRto()
+
+            // 动态调整策略
+            if (packetLoss > 0.05) { // 5% 丢包率
+                Log.w(LOG_TAG, "High packet loss detected: ${packetLoss * 100}% for ${getDisplayKey()}")
+                // 可以在这里调整拥塞控制参数
+            }
+
+            if (rtt > 2000) { // RTT > 2秒
+                Log.w(LOG_TAG, "High RTT detected: ${rtt}ms for ${getDisplayKey()}")
+            }
+        }
+    }
+
 
     private suspend fun processPacket(ip: IPv4Packet, tcp: TCPSegment) {
         if (isClosed) {
@@ -512,21 +550,17 @@ class TCPConnection(
         Log.d(LOG_TAG, "Client->Server (in-order): ${tcp.payload.size} bytes for ${getDisplayKey()}")
 
         clientNextSeq = segEnd
-        // Keep using onAck to throttle upstream write pacing heuristically.
         congestionControl.onAck(tcp.payload.size)
 
         // Queue data for upstream
+        val payloadCopy = tcp.payload.copyOf()
         pendingLock.withLock {
-            pending.addLast(tcp.payload.copyOf())
+            pending.addLast(payloadCopy)
+            pendingSize.addAndGet(payloadCopy.size)  // 更新大小
         }
 
-        // Try to deliver buffered out-of-order segments
         deliverBufferedSegments()
-
-        // Flush to upstream
         tryFlushUpstream()
-
-        // Send ACK (with delayed-ACK policy)
         sendAckWithSack(ip, tcp)
     }
 
@@ -537,12 +571,10 @@ class TCPConnection(
         stats.retransmittedPackets++
 
         if (isSeqBefore(segEnd, expect)) {
-            // Complete duplicate
             Log.d(LOG_TAG, "Duplicate segment seq=$segSeq expect=$expect for ${getDisplayKey()}")
             congestionControl.onDuplicateAck()
             sendAckWithSack(ip, tcp, immediate = true)
         } else {
-            // Partial retransmission with new data
             val overlap = (expect - segSeq).toInt()
             val newData = tcp.payload.copyOfRange(overlap, tcp.payload.size)
             Log.d(LOG_TAG, "Partial retrans: ${newData.size} new bytes for ${getDisplayKey()}")
@@ -550,6 +582,7 @@ class TCPConnection(
             clientNextSeq = (expect + newData.size) and 0xFFFFFFFFL
             pendingLock.withLock {
                 pending.addLast(newData)
+                pendingSize.addAndGet(newData.size)  // 更新大小
             }
             tryFlushUpstream()
             sendAckWithSack(ip, tcp)
@@ -560,6 +593,17 @@ class TCPConnection(
 
     private suspend fun handleOutOfOrderPacket(ip: IPv4Packet, tcp: TCPSegment, segSeq: Long) {
         val gap = segSeq - clientNextSeq
+        val segEnd = (segSeq + tcp.payload.size) and 0xFFFFFFFFL // 添加这行
+
+        // 小间隙直接等待
+        if (gap <= MSS) {
+            delay(5)
+            // 重新检查是否已经收到
+            if (segSeq == clientNextSeq) {
+                handleInOrderPacket(ip, tcp, segEnd)
+                return
+            }
+        }
 
         if (gap < 3 * MSS) {
             // Thread-safe put-if-absent
@@ -625,11 +669,9 @@ class TCPConnection(
 
         while (outOfOrderSegments.isNotEmpty()) {
             val entry = outOfOrderSegments.firstEntry()
-
             if (entry == null) break
 
             if (entry.key == clientNextSeq) {
-                // Remove and process
                 if (outOfOrderSegments.remove(entry.key, entry.value)) {
                     oooBufferSize.addAndGet(-entry.value.data.size)
 
@@ -638,13 +680,13 @@ class TCPConnection(
 
                     pendingLock.withLock {
                         pending.addLast(entry.value.data)
+                        pendingSize.addAndGet(entry.value.data.size)  // 更新大小
                     }
 
                     delivered++
                     Log.d(LOG_TAG, "Delivered buffered segment seq=${entry.key}, ${entry.value.data.size} bytes")
                 }
             } else if (isSeqBefore(entry.key, clientNextSeq)) {
-                // Handle overlap
                 val overlap = (clientNextSeq - entry.key).toInt()
                 if (overlap < entry.value.data.size) {
                     val newData = entry.value.data.copyOfRange(overlap, entry.value.data.size)
@@ -652,6 +694,7 @@ class TCPConnection(
 
                     pendingLock.withLock {
                         pending.addLast(newData)
+                        pendingSize.addAndGet(newData.size)  // 更新大小
                     }
                     delivered++
                 }
@@ -738,15 +781,12 @@ class TCPConnection(
     }
 
     private fun calcAdvertisedWindow(): Int {
-        // Use regular synchronization for pending, not runBlocking in synchronized
-        val pendingBytes = synchronized(pending) {
-            pending.sumOf { it.size }
-        }
+        // 直接使用缓存的大小，避免遍历
+        val pendingBytes = pendingSize.get()
         val oooBytes = oooBufferSize.get()
         val used = min(MAX_PENDING_BYTES, pendingBytes + oooBytes)
         val free = (MAX_PENDING_BYTES - used).coerceAtLeast(0)
-        val win = free.coerceIn(MIN_ADV_WINDOW, MAX_ADV_WINDOW)
-        return win
+        return free.coerceIn(MIN_ADV_WINDOW, MAX_ADV_WINDOW)
     }
 
     private suspend fun bufferPreHandshakeData(data: ByteArray) {
@@ -765,6 +805,7 @@ class TCPConnection(
                 preHandshakeBuf.reset()
                 pendingLock.withLock {
                     pending.addLast(data)
+                    pendingSize.addAndGet(data.size)  // 更新大小
                 }
                 clientNextSeq = (clientNextSeq + data.size) and 0xFFFFFFFFL
                 Log.d(LOG_TAG, "Flushed pre-handshake ${data.size}B for ${getDisplayKey()}")
@@ -949,19 +990,24 @@ class TCPConnection(
 
         while (true) {
             val chunk = pendingLock.withLock {
-                if (pending.isEmpty()) null else pending.removeFirst()
+                if (pending.isEmpty()) {
+                    null
+                } else {
+                    val data = pending.removeFirst()
+                    pendingSize.addAndGet(-data.size)  // 更新大小
+                    data
+                }
             } ?: break
 
-            // 检查连接状态
             if (isClosed || upstream?.isClosed == true) {
                 Log.w(LOG_TAG, "Connection closed, stopping flush")
                 break
             }
 
-            // 检查拥塞窗口
             if (!congestionControl.canSend(chunk.size)) {
                 pendingLock.withLock {
                     pending.addFirst(chunk)
+                    pendingSize.addAndGet(chunk.size)  // 恢复大小
                 }
                 delay(congestionControl.getRto() / 10)
                 continue
@@ -1000,7 +1046,6 @@ class TCPConnection(
             }
         }
 
-        // 清理剩余数据
         cleanupPendingData()
     }
 
@@ -1008,6 +1053,7 @@ class TCPConnection(
         try {
             writeLock.withLock {
                 if (!isClosed && upstreamWriter != null) {
+                    // 正确调用flush，传入writer lambda
                     writeCoalescer.flush { data ->
                         try {
                             upstreamWriter?.write(data)
@@ -1051,21 +1097,17 @@ class TCPConnection(
         isClosed = true
         scope.cancel("Connection closed")
 
-        // 使用协程清理资源
         GlobalScope.launch(Dispatchers.IO) {
             try {
-                // 取消ACK定时器
                 ackFlushJob?.cancel()
 
-                // 安全关闭流
                 kotlin.runCatching { upstreamReader?.close() }
                 kotlin.runCatching { upstreamWriter?.close() }
 
-                // 处理socket
                 upstream?.let { socket ->
                     kotlin.runCatching {
                         if (!socket.isClosed) {
-                            socket.soTimeout = 100  // 快速超时
+                            socket.soTimeout = 100
                             if (bypassDirect) {
                                 SocketPool.release(socket)
                             } else {
@@ -1079,6 +1121,7 @@ class TCPConnection(
                 sentTimeMap.clear()
                 outOfOrderSegments.clear()
                 pending.clear()
+                pendingSize.set(0)  // 重置大小计数器
 
             } catch (e: Exception) {
                 Log.e(LOG_TAG, "Error during cleanup: ${e.message}")
