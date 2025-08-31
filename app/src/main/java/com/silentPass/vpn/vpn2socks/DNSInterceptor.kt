@@ -10,9 +10,13 @@ import java.io.ByteArrayOutputStream
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import javax.net.SocketFactory
 
 class DNSInterceptor {
+
+    @Volatile
+    private var initialized = false
     private val LOG_TAG = "DNSInterceptor"
     private val bypassCache = HashMap<String, Boolean>()
 
@@ -30,6 +34,37 @@ class DNSInterceptor {
     private val dnsCache = HashMap<String, DNSCacheEntry>()
     private val dnsCacheMutex = Mutex()
     private val MAX_CACHE_SIZE = 1000 // 最大缓存条目数
+
+    init {
+        // 等待 VPN 服务就绪
+        Thread {
+            var attempts = 0
+            while (!initialized && attempts < 20) {
+                try {
+                    // 测试创建一个 socket 看是否能保护
+                    val testSocket = Socket()
+                    val protected = Vpn2SocksService.protectSocket(testSocket)
+                    testSocket.close()
+
+                    if (protected) {
+                        initialized = true
+                        Log.d(LOG_TAG, "DNSInterceptor initialized successfully")
+                    } else {
+                        Thread.sleep(100)
+                        attempts++
+                    }
+                } catch (e: Exception) {
+                    Thread.sleep(100)
+                    attempts++
+                }
+            }
+
+            if (!initialized) {
+                Log.e(LOG_TAG, "DNSInterceptor initialization timeout")
+            }
+        }.start()
+    }
+
 
     // 生成缓存键：基于查询内容（跳过 ID 字段）
     private fun generateCacheKey(query: ByteArray): String {
@@ -254,9 +289,38 @@ class DNSInterceptor {
     inner class ProtectedSocketFactory : SocketFactory() {
         override fun createSocket(): Socket {
             val socket = Socket()
-            if (!Vpn2SocksService.protectSocket(socket)) {
-                Log.w(LOG_TAG, "Failed to protect socket in factory")
+
+            // 设置 socket 选项以便更好地保护
+            try {
+                socket.tcpNoDelay = true
+                socket.keepAlive = false
+                socket.reuseAddress = false
+            } catch (e: Exception) {
+                Log.w(LOG_TAG, "Failed to set socket options: ${e.message}")
             }
+
+            // 尝试保护 socket，带重试机制
+            var protected = false
+            var attempts = 0
+            val maxAttempts = 5
+
+            while (!protected && attempts < maxAttempts) {
+                protected = Vpn2SocksService.protectSocket(socket)
+                if (!protected) {
+                    attempts++
+                    if (attempts < maxAttempts) {
+                        Log.w(LOG_TAG, "Socket protection attempt $attempts failed, retrying...")
+                        Thread.sleep(100L * attempts) // 递增延迟
+                    }
+                }
+            }
+
+            if (!protected) {
+                Log.e(LOG_TAG, "Failed to protect DNS socket after $maxAttempts attempts")
+                // 可选：抛出异常阻止未保护的连接
+                // throw IOException("Cannot create protected socket for DNS")
+            }
+
             return socket
         }
 
@@ -286,6 +350,12 @@ class DNSInterceptor {
             }
         }
     }
+
+    // 在 DNSInterceptor 类中添加
+    private val unprotectedQueries = AtomicInteger(0)
+    private val protectedQueries = AtomicInteger(0)
+
+
 
     // 主查询方法：优先使用 DoH（带缓存）
     private suspend fun queryOverUpstreams(query: ByteArray): ByteArray? {
@@ -359,6 +429,7 @@ class DNSInterceptor {
 
                 val response = httpClient.newCall(request).execute()
                 if (response.isSuccessful) {
+                    protectedQueries.incrementAndGet()
                     val responseBytes = response.body?.bytes()
                     response.close()
                     if (responseBytes != null) {
@@ -378,6 +449,7 @@ class DNSInterceptor {
                         return responseBytes
                     }
                 } else {
+                    unprotectedQueries.incrementAndGet()
                     Log.w(LOG_TAG, "DoH POST failed with code ${response.code} from $provider")
                     response.close()
                 }
@@ -435,6 +507,8 @@ class DNSInterceptor {
 
         return null
     }
+
+
 
     // 备用：传统 TCP DNS
     private fun queryViaTraditionalTCP(query: ByteArray): ByteArray? {
@@ -536,6 +610,16 @@ class DNSInterceptor {
     fun lookupDomain(ip: IPv4Address): String? = ipToDomain[ip.raw]
 
     suspend fun handleQuery(query: ByteArray): Pair<ByteArray, IPv4Address?>? {
+
+        if (!initialized) {
+            Log.w(LOG_TAG, "DNSInterceptor not yet initialized, waiting...")
+            // 等待初始化
+            for (i in 1..10) {
+                if (initialized) break
+                kotlinx.coroutines.delay(100)
+            }
+        }
+
         if (query.size < 12) return null
         Log.d(LOG_TAG, "DNS Query received for parsing")
 

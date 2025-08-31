@@ -26,25 +26,33 @@ class Vpn2SocksService : VpnService() {
         @JvmStatic
         fun protectSocket(sock: Socket): Boolean {
             return try {
+                var attempts = 0
+                val maxAttempts = 10
+
+                // 等待 instance 初始化（最多等待 1 秒）
+                while (instance == null && attempts < maxAttempts) {
+                    Thread.sleep(100)
+                    attempts++
+                }
+
                 val inst = instance
                 if (inst == null) {
-                    Log.e("Vpn2SocksService", "Instance is null!")
-                    false
-                } else {
-                    // For unconnected sockets, we still need to protect them
-                    val addr = sock.inetAddress
-
-                    // Check if it's already connected to loopback
-                    if (addr != null && addr.isLoopbackAddress) {
-                        Log.d("Vpn2SocksService", "Skipping protection for loopback: $addr")
-                        true
-                    } else {
-                        // Protect the socket (works for both connected and unconnected)
-                        val result = inst.protect(sock)
-                        Log.d("Vpn2SocksService", "Socket protection result: $result (addr: $addr)")
-                        result
-                    }
+                    Log.e("Vpn2SocksService", "Instance is null after waiting!")
+                    return false
                 }
+
+                // 对于未连接的 socket，我们仍然需要保护
+                val result = inst.protect(sock)
+
+                // 获取更多调试信息
+                val localAddr = try { sock.localAddress } catch (e: Exception) { null }
+                val remoteAddr = try { sock.inetAddress } catch (e: Exception) { null }
+                val isConnected = sock.isConnected
+
+                Log.d("Vpn2SocksService",
+                    "Socket protection result: $result (connected: $isConnected, local: $localAddr, remote: $remoteAddr)")
+
+                result
             } catch (e: Throwable) {
                 Log.e("Vpn2SocksService", "protectSocket exception: ${e.message}", e)
                 false
@@ -85,7 +93,6 @@ class Vpn2SocksService : VpnService() {
     override fun onCreate() {
         super.onCreate()
         instance = this
-        dns = DNSInterceptor()
     }
 
     override fun onDestroy() {
@@ -154,7 +161,12 @@ class Vpn2SocksService : VpnService() {
         tunFd = builder.establish()
         requireNotNull(tunFd) { "Failed to establish VPN" }
 
+        // 在 VPN 建立后再初始化 DNS
+        dns = DNSInterceptor()
+
         packetIO = TunPacketIO(tunFd!!)
+
+
 
         connMgr = ConnectionManager(
             mtu = 1500,
@@ -163,6 +175,9 @@ class Vpn2SocksService : VpnService() {
             dns = dns,
             socksEndpoint = SocksEndpoint(socksHost, socksPort)
         )
+
+
+
 
         scope.launch { packetPump() }
     }

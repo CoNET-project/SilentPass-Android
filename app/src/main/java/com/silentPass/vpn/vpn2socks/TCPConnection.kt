@@ -92,14 +92,16 @@ class TCPConnection(
             flightSize = max(0, flightSize - ackedBytes)
             duplicateAckCount.set(0)
 
-            if (cwnd < ssthresh) {
-                // Slow start
-                cwnd = min(cwnd + MSS, ssthresh)
-            } else {
-                // Congestion avoidance
-                cwnd += (MSS * MSS) / cwnd
+            // Only grow window for NEW data ACKs, not duplicate ACKs
+            if (ackedBytes > 0) {
+                if (cwnd < ssthresh) {
+                    // Slow start - grow by full segment for each ACK
+                    cwnd = min(cwnd + ackedBytes, ssthresh)
+                } else {
+                    // Congestion avoidance - grow slowly
+                    cwnd += (MSS * ackedBytes) / cwnd
+                }
             }
-
             stats.ackedPackets++
         }
 
