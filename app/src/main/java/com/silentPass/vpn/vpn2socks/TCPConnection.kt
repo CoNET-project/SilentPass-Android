@@ -7,6 +7,10 @@ import kotlinx.coroutines.sync.withLock
 import java.net.Socket
 import kotlin.random.Random
 
+
+///         adb shell
+///         echo -e "GET / HTTP/1.0\r\nHost: neverssl.com\r\n\r\n" | nc neverssl.com 80
+
 class TCPConnection(
     private val key: String,
     private val mtu: Int,
@@ -68,16 +72,14 @@ class TCPConnection(
             return
         }
 
-        // SYN (client -> us): Record initial seq, async establish upstream, send SYN-ACK
+        // SYN (client -> us)
         if (tcp.isSYN && !tcp.isACK) {
             val domain = dns.lookupDomain(ip.dst)
-            clientSeq0 = tcp.seq.toLong() and 0xFFFFFFFFL  // Convert to unsigned long
+            clientSeq0 = tcp.seq.toLong() and 0xFFFFFFFFL
             clientNextSeq = (clientSeq0!! + 1L) and 0xFFFFFFFFL
 
-            // Async establish upstream (don't block client handshake)
             scope.launch { establishUpstream(ip, tcp, domain) }
 
-            // Send SYN-ACK
             val synAck = IpBuilders.tcpPayloadFromServer(
                 src = ip.dst, dst = ip.src,
                 srcPort = tcp.dstPort, dstPort = tcp.srcPort,
@@ -88,101 +90,75 @@ class TCPConnection(
                 window = 65535
             )
             packetWriter(listOf(synAck), listOf(ConnectionManager.PROTO_IPV4))
-            serverSeq = (serverSeq + 1L) and 0xFFFFFFFFL  // SYN consumes 1 seq number
+            serverSeq = (serverSeq + 1L) and 0xFFFFFFFFL
             return
         }
 
-        // Pure ACK for our SYN-ACK (completes 3-way handshake)
-        if (!established && tcp.isACK && !tcp.isSYN && tcp.payload.isEmpty()) {
+        // Handle ACK that completes handshake
+        if (!established && tcp.isACK && !tcp.isSYN) {
             val ackNum = tcp.ack.toLong() and 0xFFFFFFFFL
             if (ackNum == serverSeq) {
-                stateLock.withLock {
-                    established = true
-                }
+                stateLock.withLock { established = true }
                 Log.d(LOG_TAG, "3-way handshake established for $key")
-
-                // Start downstream if upstream is ready
                 tryStartDownstream(ip, tcp)
+
+                if (tcp.payload.isNotEmpty()) {
+                    Log.d(LOG_TAG, "Processing ${tcp.payload.size} bytes of early data with handshake ACK")
+                    handleEstablishedData(ip, tcp)
+                }
+
+                // Check if FIN flag is also set (combined ACK+FIN)
+                if (tcp.isFIN) {
+                    handleFIN(ip, tcp)
+                }
+                return
             }
-            return
         }
 
-        // FIN: Enter teardown
-        if (tcp.isFIN) {
-            Log.d(LOG_TAG, "FIN received for $key")
-            clientNextSeq = (clientNextSeq + 1L) and 0xFFFFFFFFL  // FIN consumes 1 seq
-
-            // ACK the FIN
-            sendPureAck(ip, tcp, ackOverride = clientNextSeq.toInt())
-
-            // Send our FIN
-            val finAck = IpBuilders.tcpPayloadFromServer(
-                src = ip.dst, dst = ip.src,
-                srcPort = tcp.dstPort, dstPort = tcp.srcPort,
-                payload = ByteArray(0),
-                seq = serverSeq.toInt(),
-                ack = clientNextSeq.toInt(),
-                flags = 0x11, // FIN | ACK
-                window = 65535
-            )
-            packetWriter(listOf(finAck), listOf(ConnectionManager.PROTO_IPV4))
-            closeConnection()
-            return
-        }
-
-        // Established: Handle upstream data (including with FIN)
+        // Handle established connection
         if (established) {
-            // Process any payload data first
             if (tcp.payload.isNotEmpty()) {
                 handleEstablishedData(ip, tcp)
             }
 
-            // Then check for FIN
             if (tcp.isFIN) {
-                Log.d(LOG_TAG, "FIN received for $key (after processing ${tcp.payload.size} bytes)")
-
-                // Flush any remaining data
-                scope.launch {
-                    tryFlushUpstream()
-                    // Wait for any response
-                    delay(100)
-
-                    clientNextSeq = (clientNextSeq + 1L) and 0xFFFFFFFFL  // FIN consumes 1 seq
-
-                    // ACK the FIN
-                    sendPureAck(ip, tcp, ackOverride = clientNextSeq.toInt())
-
-                    // Send our FIN
-                    val finAck = IpBuilders.tcpPayloadFromServer(
-                        src = ip.dst, dst = ip.src,
-                        srcPort = tcp.dstPort, dstPort = tcp.srcPort,
-                        payload = ByteArray(0),
-                        seq = serverSeq.toInt(),
-                        ack = clientNextSeq.toInt(),
-                        flags = 0x11, // FIN | ACK
-                        window = 65535
-                    )
-                    packetWriter(listOf(finAck), listOf(ConnectionManager.PROTO_IPV4))
-
-                    // Don't close immediately - let downstream read any response
-                    delay(500)
-                    closeConnection()
-                }
-                return
+                handleFIN(ip, tcp)
             }
             return
         }
 
-        // Not established: check for FIN during handshake
+        // Handle FIN before establishment (connection abort)
         if (tcp.isFIN) {
-            Log.d(LOG_TAG, "FIN received during handshake for $key")
-            // Handle early FIN...
+            Log.d(LOG_TAG, "FIN received before establishment for $key")
             clientNextSeq = (clientNextSeq + 1L) and 0xFFFFFFFFL
             sendPureAck(ip, tcp, ackOverride = clientNextSeq.toInt())
             closeConnection()
             return
         }
+
+        // Unexpected data before handshake
+        if (tcp.payload.isNotEmpty()) {
+            Log.w(LOG_TAG, "Data received before handshake complete: ${tcp.payload.size} bytes")
+        }
     }
+
+    // Extract FIN handling to a separate method for clarity
+    private suspend fun handleFIN(ip: IPv4Packet, tcp: TCPSegment) {
+        Log.d(LOG_TAG, "FIN received for $key (client half-close)")
+        clientNextSeq = (clientNextSeq + 1L) and 0xFFFFFFFFL
+        sendPureAck(ip, tcp, ackOverride = clientNextSeq.toInt())
+
+        stateLock.withLock {
+            clientHalfClosed = true
+            pendingShutdown = true
+        }
+
+        tryFlushUpstream()
+        // Don't call tryStartDownstream here - it's already running!
+    }
+
+    private var clientHalfClosed = false
+    private var pendingShutdown = false
 
     // =============== Handle Established Data ===============
     private suspend fun handleEstablishedData(ip: IPv4Packet, tcp: TCPSegment) {
@@ -202,10 +178,9 @@ class TCPConnection(
                 pending.addLast(tcp.payload.copyOf())
             }
 
-            // Try to flush to upstream
-            upstreamWriter?.let {
-                tryFlushUpstream()
-            }
+            // Try to flush regardless of upstream state
+            // If upstream is not ready, data will queue
+            tryFlushUpstream()
 
             // Check if we can now deliver buffered out-of-order segments
             deliverBufferedSegments()
@@ -359,10 +334,19 @@ class TCPConnection(
     }
 
     // Start downstream loop if both handshake and upstream are ready
+    private var downstreamStarted = false
     private fun tryStartDownstream(ip: IPv4Packet, tcp: TCPSegment) {
         scope.launch {
             val canStart = stateLock.withLock {
-                established && upstreamConnected
+                if (downstreamStarted) {
+                    return@withLock false  // Already started
+                }
+                if (established && upstreamConnected) {
+                    downstreamStarted = true  // Mark as started
+                    true
+                } else {
+                    false
+                }
             }
 
             if (canStart) {
@@ -378,7 +362,7 @@ class TCPConnection(
                     Log.d(LOG_TAG, "Prime-downstream sent: ${prime.size} bytes")
                 }
 
-                // Start downstream loop
+                // Start downstream loop - only once!
                 downstreamLoop(ip, tcp)
             }
         }
@@ -413,8 +397,8 @@ class TCPConnection(
         val inp = upstreamReader ?: return@withContext
         val buf = ByteArray(32 * 1024)
 
-        // Make sure we've flushed all pending data first
-        delay(50) // Small delay to ensure initial client data is sent
+        // 给上行一次机会把客户端最后一批数据刷出去
+        delay(50)
 
         try {
             Log.d(LOG_TAG, "Downstream loop started for $key")
@@ -422,14 +406,28 @@ class TCPConnection(
                 val n = try {
                     inp.read(buf)
                 } catch (e: java.net.SocketTimeoutException) {
-                    // Timeout is OK, just retry
                     continue
                 }
 
                 if (n <= 0) {
-                    Log.i(LOG_TAG, "Downstream EOF for $key")
+                    Log.i(LOG_TAG, "Downstream EOF for $key (server done sending)")
+                    // 只有当服务器真的发完了，我们才向客户端发 FIN|ACK
+                    try {
+                        val finAck = IpBuilders.tcpPayloadFromServer(
+                            src = ip.dst, dst = ip.src,
+                            srcPort = tcp.dstPort, dstPort = tcp.srcPort,
+                            payload = ByteArray(0),
+                            seq = serverSeq.toInt(),
+                            ack = clientNextSeq.toInt(),
+                            flags = 0x11, // FIN | ACK
+                            window = 65535
+                        )
+                        packetWriter(listOf(finAck), listOf(ConnectionManager.PROTO_IPV4))
+                        Log.d(LOG_TAG, "Sent FIN|ACK to client for $key after downstream EOF")
+                    } catch (_: Throwable) {}
                     break
                 }
+
                 Log.d(LOG_TAG, "Server->Client: $n bytes for $key")
                 sendDataToClient(ip, tcp, buf.copyOf(n))
             }
@@ -463,6 +461,16 @@ class TCPConnection(
                 Log.e(LOG_TAG, "Upstream write failed: ${e.message}")
                 closeConnection()
                 break
+            }
+        }
+
+        // After all data is flushed, check if we need to shutdown
+        if (pendingShutdown && pending.isEmpty()) {
+            try {
+                upstream?.shutdownOutput()
+                Log.d(LOG_TAG, "Upstream output shutdown after flushing all data")
+            } catch (e: Throwable) {
+                Log.w(LOG_TAG, "Shutdown upstream output failed: ${e.message}")
             }
         }
     }
