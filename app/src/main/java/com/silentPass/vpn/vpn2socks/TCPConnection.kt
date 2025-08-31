@@ -4,7 +4,9 @@ import android.util.Log
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.io.ByteArrayOutputStream
 import java.net.Socket
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.random.Random
 
 class TCPConnection(
@@ -25,33 +27,73 @@ class TCPConnection(
     // === Synchronization & State ===
     private val writeLock = Mutex()
     private val stateLock = Mutex()
-    private var isClosed = false
-    private var upstreamConnected = false
+    @Volatile private var isClosed = false
+    fun isClosed(): Boolean = isClosed
 
+    // 连接阶段状态机：两道“门闩”都好后才切 STREAMING
+    private enum class Phase { SYN, HANDSHAKE_ACKED, SOCKS_PRIMED, STREAMING, HALF_CLOSED_LOCAL, HALF_CLOSED_REMOTE, CLOSED }
+    @Volatile private var phase: Phase = Phase.SYN
+    @Volatile private var handshakeAcked = false
+    @Volatile private var socksPrimed = false
+    private fun canStream(): Boolean = handshakeAcked && socksPrimed && phase != Phase.CLOSED
+
+    // === TCP seq 状态 ===
     private var clientSeq0: Long? = null
     private var clientNextSeq: Long = 0L
     private var serverSeq: Long = Random.nextInt(0, Int.MAX_VALUE).toLong()
+
+    // === 旧的 established 概念由状态机取代，保留变量以兼容原逻辑 ===
+    @Deprecated("Use phase/handshakeAcked/socksPrimed")
     private var established: Boolean = false
 
-    fun isClosed(): Boolean = isClosed
-
     private val LOG_TAG = "TCPConnection"
+
+    // === Client->Server 缓冲 ===
     private val pendingLock = Mutex()
     private val pending = ArrayDeque<ByteArray>()
 
-    // Buffer for early upstream data before handshake completes
+    // 握手前（客户端→服务端）首包/早到数据缓冲（替代“Data received before handshake complete”告警）
+    private val preHandshakeBuf = ByteArrayOutputStream(32 * 1024)
+    private val preHandshakeLock = Mutex()
+    private val PRE_HANDSHAKE_BUF_LIMIT = 32 * 1024
+
+    // Downstream “Prime” 缓冲（服务端→客户端）——保留原有逻辑
     private val downPrimeLock = Mutex()
     private var downPrime: ByteArray? = null
 
-    // Out-of-order buffer for reassembly - ADD MUTEX FOR THREAD SAFETY
+    // === 乱序重组缓冲（加锁 + 尺寸限额） ===
     private data class Segment(val seq: Long, val data: ByteArray)
-    private val outOfOrderLock = Mutex()  // ADD THIS
+    private val outOfOrderLock = Mutex()
     private val outOfOrderSegments = mutableListOf<Segment>()
-    private val maxOutOfOrderSize = 20
+    private val OOO_BUFFER_LIMIT_BYTES = 128 * 1024
 
-    private var clientHalfClosed = false
-    private var pendingShutdown = false
-    private var downstreamStarted = false
+    // === 半关闭/关停 ===
+    @Volatile private var clientHalfClosed = false
+    @Volatile private var pendingShutdown = false
+    @Volatile private var downstreamStarted = false
+    private val closedOnce = AtomicBoolean(false)
+
+    // === 小包写合并，减少 write()/flush() 调用频率 ===
+    private class SmallWriteCoalescer(private val targetBytes: Int = 2048) {
+        private val buf = ByteArrayOutputStream()
+        @Synchronized fun offer(bytes: ByteArray, writer: (ByteArray) -> Boolean) {
+            if (bytes.isEmpty()) return
+            if (buf.size() > 0 && buf.size() + bytes.size >= targetBytes) {
+                flush(writer)
+            }
+            buf.write(bytes)
+            if (buf.size() >= targetBytes) {
+                flush(writer)
+            }
+        }
+        @Synchronized fun flush(writer: (ByteArray) -> Boolean) {
+            if (buf.size() == 0) return
+            val arr = buf.toByteArray()
+            buf.reset()
+            writer(arr)
+        }
+    }
+    private val coalescer = SmallWriteCoalescer(2048)
 
     // =============== Main Entry ===============
     fun onTcp(ip: IPv4Packet, tcp: TCPSegment) {
@@ -96,11 +138,19 @@ class TCPConnection(
         }
 
         // Handle ACK that completes handshake
-        if (!established && tcp.isACK && !tcp.isSYN) {
+        if (!handshakeAcked && tcp.isACK && !tcp.isSYN) {
             val ackNum = tcp.ack.toLong() and 0xFFFFFFFFL
             if (ackNum == serverSeq) {
-                stateLock.withLock { established = true }
+                stateLock.withLock {
+                    handshakeAcked = true
+                    phase = Phase.HANDSHAKE_ACKED
+                    established = true // 兼容旧逻辑
+                }
                 Log.d(LOG_TAG, "3-way handshake established for $key")
+
+                // 刷新握手前缓冲的客户端数据（如果有）
+                flushPreHandshakeBufferToPending()
+
                 tryStartDownstream(ip, tcp)
 
                 if (tcp.payload.isNotEmpty()) {
@@ -108,7 +158,6 @@ class TCPConnection(
                     handleEstablishedData(ip, tcp)
                 }
 
-                // Check if FIN flag is also set (combined ACK+FIN)
                 if (tcp.isFIN) {
                     handleFIN(ip, tcp)
                 }
@@ -116,12 +165,11 @@ class TCPConnection(
             }
         }
 
-        // Handle established connection
-        if (established) {
+        // Handle established/streaming
+        if (handshakeAcked) {
             if (tcp.payload.isNotEmpty()) {
                 handleEstablishedData(ip, tcp)
             }
-
             if (tcp.isFIN) {
                 handleFIN(ip, tcp)
             }
@@ -137,10 +185,35 @@ class TCPConnection(
             return
         }
 
-        // Unexpected data before handshake
+        // 握手未完成：不再告警，改为缓冲
         if (tcp.payload.isNotEmpty()) {
-            Log.w(LOG_TAG, "Data received before handshake complete: ${tcp.payload.size} bytes")
+            bufferPreHandshakeClientData(tcp.payload)
         }
+    }
+
+    // ======== 握手前客户端数据缓冲 / 刷新 ========
+    private suspend fun bufferPreHandshakeClientData(bytes: ByteArray) {
+        preHandshakeLock.withLock {
+            if (preHandshakeBuf.size() + bytes.size <= PRE_HANDSHAKE_BUF_LIMIT) {
+                preHandshakeBuf.write(bytes)
+                Log.d(LOG_TAG, "Buffered pre-handshake ${bytes.size}B (total=${preHandshakeBuf.size()}) for $key")
+            } else {
+                Log.w(LOG_TAG, "Pre-handshake buffer overflow, drop=${bytes.size}B for $key")
+            }
+        }
+    }
+
+    private suspend fun flushPreHandshakeBufferToPending() {
+        val arr = preHandshakeLock.withLock {
+            if (preHandshakeBuf.size() == 0) null
+            else preHandshakeBuf.toByteArray().also { preHandshakeBuf.reset() }
+        } ?: return
+
+        // 将缓冲的握手前数据整体入队并推进 seq
+        pendingLock.withLock { pending.addLast(arr) }
+        clientNextSeq = (clientNextSeq + arr.size.toLong()) and 0xFFFFFFFFL
+        Log.d(LOG_TAG, "Flushed pre-handshake ${arr.size}B into upstream queue for $key")
+        tryFlushUpstream()
     }
 
     // Extract FIN handling to a separate method for clarity
@@ -152,6 +225,7 @@ class TCPConnection(
         stateLock.withLock {
             clientHalfClosed = true
             pendingShutdown = true
+            if (phase != Phase.CLOSED) phase = Phase.HALF_CLOSED_LOCAL
         }
 
         tryFlushUpstream()
@@ -164,104 +238,84 @@ class TCPConnection(
         val segEnd = (segSeq + dataLen) and 0xFFFFFFFFL
         val expect = clientNextSeq
 
-        // Check if this is the expected segment
         if (segSeq == expect) {
-            // Perfect in-order segment
+            // in-order
             Log.d(LOG_TAG, "Client->Server (in-order): $dataLen bytes for $key")
             clientNextSeq = segEnd
 
-            // Queue for upstream
-            pendingLock.withLock {
-                pending.addLast(tcp.payload.copyOf())
-            }
-
+            pendingLock.withLock { pending.addLast(tcp.payload.copyOf()) }
             tryFlushUpstream()
 
-            // Check if we can now deliver buffered out-of-order segments
-            deliverBufferedSegments()
+            // 尝试吐出乱序缓冲
+            deliverBufferedSegments(ip, tcp)
 
-            // Send ACK for all received data
+            // 发送 ACK
             sendPureAck(ip, tcp, ackOverride = clientNextSeq.toInt())
 
         } else if (isSeqBefore(segSeq, expect)) {
-            // Old segment (possible retransmission)
+            // 旧段或部分重传
             if (isSeqBefore(segEnd, expect)) {
-                // Completely old data
-                Log.d(LOG_TAG, "Duplicate segment seq=$segSeq expect=$expect, ACK")
+                Log.d(LOG_TAG, "Duplicate segment seq=$segSeq expect=$expect, ACK for $key")
                 sendPureAck(ip, tcp, ackOverride = clientNextSeq.toInt())
             } else {
-                // Partial overlap - some new data
                 val overlap = (expect - segSeq).toInt()
                 val newData = tcp.payload.copyOfRange(overlap, tcp.payload.size)
-                Log.d(LOG_TAG, "Partial retrans: ${newData.size} new bytes")
+                Log.d(LOG_TAG, "Partial retrans: ${newData.size} new bytes for $key")
 
                 clientNextSeq = segEnd
-                pendingLock.withLock {
-                    pending.addLast(newData)
-                }
-                upstreamWriter?.let { tryFlushUpstream() }
+                pendingLock.withLock { pending.addLast(newData) }
+                tryFlushUpstream()
                 sendPureAck(ip, tcp, ackOverride = clientNextSeq.toInt())
             }
 
         } else {
-            // Future segment (out-of-order) - FIX THE CONCURRENT MODIFICATION HERE
-            Log.d(LOG_TAG, "Out-of-order segment seq=$segSeq expect=$expect, buffering")
-
-            // Buffer it if we have space - WITH LOCK
+            // 乱序：缓冲并限额（按总字节数）
+            Log.d(LOG_TAG, "Out-of-order segment seq=$segSeq expect=$expect, buffering for $key")
             outOfOrderLock.withLock {
-                if (outOfOrderSegments.size < maxOutOfOrderSize) {
+                val currentBytes = outOfOrderSegments.sumOf { it.data.size } + tcp.payload.size
+                if (currentBytes <= OOO_BUFFER_LIMIT_BYTES) {
                     val exists = outOfOrderSegments.any { it.seq == segSeq }
                     if (!exists) {
                         outOfOrderSegments.add(Segment(segSeq, tcp.payload.copyOf()))
-                        outOfOrderSegments.sortBy { it.seq }  // Now safe within lock
-                        Log.d(LOG_TAG, "Buffered out-of-order segment, buffer size: ${outOfOrderSegments.size}")
+                        outOfOrderSegments.sortBy { it.seq }
+                        Log.d(LOG_TAG, "Buffered out-of-order segment, buffer size=${outOfOrderSegments.size} (bytes=$currentBytes) for $key")
                     }
+                } else {
+                    Log.w(LOG_TAG, "OOO buffer limit reached, drop seg seq=$segSeq size=${tcp.payload.size} for $key")
                 }
             }
-
-            // Send duplicate ACK to trigger fast retransmit
+            // 重复 ACK，促使对端快速重传
             sendPureAck(ip, tcp, ackOverride = clientNextSeq.toInt())
         }
     }
 
-    // Deliver any buffered segments that are now in-order - FIX WITH LOCKS
-    private suspend fun deliverBufferedSegments() {
+    // Deliver buffered OOO segments now in-order
+    private suspend fun deliverBufferedSegments(ip: IPv4Packet, tcp: TCPSegment) {
         while (true) {
-            // Get and remove first segment atomically if it exists
             val first = outOfOrderLock.withLock {
                 if (outOfOrderSegments.isNotEmpty()) {
                     val seg = outOfOrderSegments.first()
-                    if (seg.seq == clientNextSeq) {
-                        // Remove and return it
-                        outOfOrderSegments.removeAt(0)
-                        seg
-                    } else if (isSeqBefore(seg.seq, clientNextSeq)) {
-                        // Old data, remove it
-                        outOfOrderSegments.removeAt(0)
-                        null // Signal to continue loop but don't process
-                    } else {
-                        // Gap exists, stop processing
-                        return@withLock null
+                    when {
+                        seg.seq == clientNextSeq -> {
+                            outOfOrderSegments.removeAt(0)
+                            seg
+                        }
+                        isSeqBefore(seg.seq, clientNextSeq) -> {
+                            outOfOrderSegments.removeAt(0)
+                            null // 过期段，丢弃并继续
+                        }
+                        else -> null // 有 gap，先退出
                     }
-                } else {
-                    null // List is empty
-                }
+                } else null
             }
 
-            // Process the segment if we got one
             if (first != null) {
                 val segEnd = (first.seq + first.data.size.toLong()) and 0xFFFFFFFFL
                 clientNextSeq = segEnd
-
-                Log.d(LOG_TAG, "Delivering buffered segment seq=${first.seq}, ${first.data.size} bytes")
-
-                // Queue for upstream
-                pendingLock.withLock {
-                    pending.addLast(first.data)
-                }
-                upstreamWriter?.let { tryFlushUpstream() }
+                Log.d(LOG_TAG, "Delivering buffered segment seq=${first.seq}, ${first.data.size} bytes for $key")
+                pendingLock.withLock { pending.addLast(first.data) }
+                tryFlushUpstream()
             } else {
-                // Either list was empty or we hit a gap
                 break
             }
         }
@@ -306,13 +360,14 @@ class TCPConnection(
             upstreamReader = s.getInputStream()
 
             stateLock.withLock {
-                upstreamConnected = true
+                socksPrimed = true
+                if (phase != Phase.CLOSED) phase = Phase.SOCKS_PRIMED
             }
 
-            // Flush any pending upstream data
+            // Flush any pending upstream data (可能来自握手前缓冲)
             tryFlushUpstream()
 
-            // Check for early upstream data
+            // Prime 下游少量数据
             s.soTimeout = 5
             try {
                 val avail = upstreamReader?.available() ?: 0
@@ -320,9 +375,7 @@ class TCPConnection(
                     val buf = ByteArray(kotlin.math.min(2048, avail))
                     val n = upstreamReader!!.read(buf)
                     if (n > 0) {
-                        downPrimeLock.withLock {
-                            downPrime = buf.copyOf(n)
-                        }
+                        downPrimeLock.withLock { downPrime = buf.copyOf(n) }
                         Log.d(LOG_TAG, "Prime-downstream buffered: $n bytes for $key")
                     }
                 }
@@ -334,7 +387,7 @@ class TCPConnection(
 
             Log.d(LOG_TAG, "SOCKS connected and primed, waiting for client ACK to start downstream pump")
 
-            // Try to start downstream if handshake is done
+            // 尝试启动下游
             tryStartDownstream(ip, syn)
 
         } catch (t: Throwable) {
@@ -347,31 +400,27 @@ class TCPConnection(
     private fun tryStartDownstream(ip: IPv4Packet, tcp: TCPSegment) {
         scope.launch {
             val canStart = stateLock.withLock {
-                if (downstreamStarted) {
-                    return@withLock false
-                }
-                if (established && upstreamConnected) {
+                if (downstreamStarted) return@withLock false
+                val ready = handshakeAcked && socksPrimed && (phase != Phase.CLOSED)
+                if (ready) {
                     downstreamStarted = true
+                    if (phase != Phase.CLOSED) phase = Phase.STREAMING
                     true
-                } else {
-                    false
-                }
+                } else false
             }
 
             if (canStart) {
-                // Send any primed data
+                // 发送 prime 缓冲
                 val prime = downPrimeLock.withLock {
                     val p = downPrime
                     downPrime = null
                     p
                 }
-
                 if (prime != null && prime.isNotEmpty()) {
                     sendDataToClient(ip, tcp, prime)
                     Log.d(LOG_TAG, "Prime-downstream sent: ${prime.size} bytes")
                 }
 
-                // Start downstream loop - only once!
                 downstreamLoop(ip, tcp)
             }
         }
@@ -406,7 +455,7 @@ class TCPConnection(
         val inp = upstreamReader ?: return@withContext
         val buf = ByteArray(32 * 1024)
 
-        delay(50)
+        delay(50) // 与原逻辑保持一致的小延迟
 
         try {
             Log.d(LOG_TAG, "Downstream loop started for $key")
@@ -432,6 +481,7 @@ class TCPConnection(
                         packetWriter(listOf(finAck), listOf(ConnectionManager.PROTO_IPV4))
                         Log.d(LOG_TAG, "Sent FIN|ACK to client for $key after downstream EOF")
                     } catch (_: Throwable) {}
+                    stateLock.withLock { if (phase != Phase.CLOSED) phase = Phase.HALF_CLOSED_REMOTE }
                     break
                 }
 
@@ -452,16 +502,24 @@ class TCPConnection(
         while (true) {
             val chunk = pendingLock.withLock {
                 if (pending.isEmpty()) null else pending.removeFirst()
-            }
-            if (chunk == null) break
+            } ?: break
 
             try {
                 writeLock.withLock {
-                    if (!isClosed) {
-                        Log.d(LOG_TAG, "Writing ${chunk.size} bytes to upstream")
-                        out.write(chunk)
-                        out.flush()
-                        Log.d(LOG_TAG, "Successfully wrote to upstream")
+                    if (isClosed) return@withLock
+                    // 小包合并（尽量减少 write/flush 次数）
+                    coalescer.offer(chunk) { bytes ->
+                        Log.d(LOG_TAG, "Writing ${bytes.size} bytes to upstream")
+                        val ok = try {
+                            out.write(bytes)
+                            out.flush()
+                            true
+                        } catch (e: Exception) {
+                            Log.e(LOG_TAG, "Upstream write failed: ${e.message}")
+                            false
+                        }
+                        if (ok) Log.d(LOG_TAG, "Successfully wrote to upstream")
+                        ok
                     }
                 }
             } catch (e: Exception) {
@@ -471,15 +529,34 @@ class TCPConnection(
             }
         }
 
-        // After all data is flushed, check if we need to shutdown
-        val shouldShutdown = stateLock.withLock {
-            pendingShutdown && pending.isEmpty()
-        }
+        // 将合并器里残余的数据刷出
+        try {
+            writeLock.withLock {
+                coalescer.flush { bytes ->
+                    Log.d(LOG_TAG, "Flushing ${bytes.size} bytes to upstream")
+                    val ok = try {
+                        out.write(bytes)
+                        out.flush()
+                        true
+                    } catch (e: Exception) {
+                        Log.e(LOG_TAG, "Upstream flush failed: ${e.message}")
+                        false
+                    }
+                    if (ok) Log.d(LOG_TAG, "Successfully flushed to upstream")
+                    ok
+                }
+            }
+        } catch (_: Throwable) {}
 
+        // After all data is flushed, check if we need to shutdown (安全守卫避免 ENOTCONN)
+        val shouldShutdown = stateLock.withLock { pendingShutdown && pending.isEmpty() }
         if (shouldShutdown) {
             try {
-                upstream?.shutdownOutput()
-                Log.d(LOG_TAG, "Upstream output shutdown after flushing all data")
+                val s = upstream
+                if (s != null && s.isConnected && !s.isOutputShutdown) {
+                    s.shutdownOutput()
+                    Log.d(LOG_TAG, "Upstream output shutdown after flushing all data")
+                }
             } catch (e: Throwable) {
                 Log.w(LOG_TAG, "Shutdown upstream output failed: ${e.message}")
             }
@@ -500,17 +577,43 @@ class TCPConnection(
         packetWriter(listOf(ackPacket), listOf(ConnectionManager.PROTO_IPV4))
     }
 
+    // =============== Close (idempotent) ===============
     private fun closeConnection() {
-        if (isClosed) return
+        if (!closedOnce.compareAndSet(false, true)) return
         isClosed = true
 
         scope.launch {
+            try {
+                // 强制把合并器残余刷出（即便已关闭也尝试一次）
+                writeLock.withLock {
+                    val out = upstreamWriter
+                    if (out != null) {
+                        coalescer.flush { bytes ->
+                            try {
+                                out.write(bytes)
+                                out.flush()
+                                true
+                            } catch (_: Throwable) { false }
+                        }
+                    }
+                }
+            } catch (_: Throwable) {}
+
             try { upstreamReader?.close() } catch (_: Throwable) {}
+            try {
+                val s = upstream
+                if (s != null && s.isConnected && !s.isOutputShutdown) {
+                    try { s.shutdownOutput() } catch (_: Throwable) {}
+                }
+            } catch (_: Throwable) {}
             try { upstreamWriter?.close() } catch (_: Throwable) {}
             try { upstream?.close() } catch (_: Throwable) {}
+
             upstreamReader = null
             upstreamWriter = null
             upstream = null
+
+            stateLock.withLock { phase = Phase.CLOSED }
         }
         scope.cancel()
     }

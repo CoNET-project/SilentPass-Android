@@ -22,16 +22,78 @@ class DNSInterceptor {
 
     // 需要直连的域名（含 APNs/FCM/自管域等）
     private val bypassDomains = setOf(
-        // Apple / APNs
-        "apple.com", "push.apple.com", "icloud.com", "gsp-ssl.ls.apple.com",
-        "gateway.push.apple.com", "gateway.sandbox.push.apple.com",
-        "mesu.apple.com", "gdmf.apple.com",
-        // 你自管域
-        "conet.network", "silentpass.io", "openpgp.online",
-        // 常见国内 IM/CDN
-        "weixin.qq.com", "wechat.com", "qpic.cn", "qlogo.cn", "wx.gtimg.com",
-        // 测试
-        "google.com","gstatic.com","gvt3.com","comm100vue.com","gvt2.com","googleusercontent.com","fastly-edge.com"
+        "conet.network",
+        "silentpass.io",
+        "openpgp.online",
+        // Apple Push 相关
+        "conet.network",
+        "apple.com",
+        "push.apple.com",
+        "icloud.com",
+        "push-apple.com.akadns.net",
+        "silentpass.io",
+        "courier.push.apple.com",
+        "gateway.push.apple.com",
+        "gateway.sandbox.push.apple.com",
+        "gateway.icloud.com",
+        "bag.itunes.apple.com",
+        "init.itunes.apple.com",
+        "xp.apple.com",
+        "gsa.apple.com",
+        "gsp-ssl.ls.apple.com",
+        "gsp-ssl.ls-apple.com.akadns.net",
+        "mesu.apple.com",
+        "gdmf.apple.com",
+        "deviceenrollment.apple.com",
+        "mdmenrollment.apple.com",
+        "iprofiles.apple.com",
+        "ppq.apple.com",
+
+        // 🔥 微信（WeChat）相关域名
+        "wechat.com",
+        "weixin.qq.com",
+        "weixin110.qq.com",
+        "tenpay.com",
+        "mm.taobao.com",
+        "wx.qq.com",
+        "web.wechat.com",
+        "webpush.weixin.qq.com",
+        "qpic.cn",
+        "qlogo.cn",
+        "wx.gtimg.com",
+        "minorshort.weixin.qq.com",
+        "log.weixin.qq.com",
+        "szshort.weixin.qq.com",
+        "szminorshort.weixin.qq.com",
+        "szextshort.weixin.qq.com",
+        "hkshort.weixin.qq.com",
+        "hkminorshort.weixin.qq.com",
+        "hkextshort.weixin.qq.com",
+        "hklong.weixin.qq.com",
+        "sgshort.wechat.com",
+        "sgminorshort.wechat.com",
+        "sglong.wechat.com",
+        "usshort.wechat.com",
+        "usminorshort.wechat.com",
+        "uslong.wechat.com",
+
+        // 微信支付
+        "pay.weixin.qq.com",
+        "payapp.weixin.qq.com",
+
+        // 微信文件传输
+        "file.wx.qq.com",
+        "support.weixin.qq.com",
+
+        // 微信 CDN
+        "mmbiz.qpic.cn",
+        "mmbiz.qlogo.cn",
+        "mmsns.qpic.cn",
+
+        // 腾讯推送服务
+        "dns.weixin.qq.com",
+        "short.weixin.qq.com",
+        "long.weixin.qq.com",
     )
     // 预处理一份“规范化后的”绕行域名集合（保持原 bypassDomains 不动）
     private val bypassNorm: Set<String> = bypassDomains.map { normalizeDomain(it) }.toSet()
