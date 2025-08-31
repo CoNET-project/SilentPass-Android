@@ -251,30 +251,20 @@ class TCPConnection(
 
         fun offer(data: ByteArray, writer: (ByteArray) -> Boolean): Boolean {
             synchronized(lock) {
-                if (data.isEmpty()) return true
-
-                if (data.size < 100) consecutiveSmallWrites++
-                else consecutiveSmallWrites = 0
-
                 buffer.write(data)
-                val now = System.currentTimeMillis()
 
-                val shouldFlush = when {
-                    // 接近MTU限制
-                    buffer.size() >= mtu - 40 -> true
-                    // 动态Nagle超时
-                    buffer.size() > 0 && (now - lastWriteTime) > getNagleDelay -> true
-                    // PSH标志或交互数据
-                    data.size == 1 || (data.size < 50 && consecutiveSmallWrites > 3) -> true
-                    // 累积足够数据
-                    buffer.size() > 2048 -> true
-                    else -> false
-                }
+                // Flush immediately if:
+                // 1. Buffer is near MTU
+                // 2. PSH flag would be set (interactive data)
+                // 3. Buffer has been waiting > 10ms
+                val shouldFlush = buffer.size() >= mtu - 100 ||
+                        data.size < 100 ||
+                        (System.currentTimeMillis() - lastWriteTime) > 10
 
                 return if (shouldFlush) {
                     flush(writer)
                 } else {
-                    lastWriteTime = now
+                    lastWriteTime = System.currentTimeMillis()
                     true
                 }
             }
@@ -549,17 +539,32 @@ class TCPConnection(
         }
     }
 
+
+
     private suspend fun handleOutOfOrderPacket(ip: IPv4Packet, tcp: TCPSegment, segSeq: Long) {
         val gap = segSeq - clientNextSeq
 
-        // 如果gap很小，可能是轻微乱序，等待一小段时间
+        // Don't wait for small gaps - they'll likely arrive soon
         if (gap < 3 * MSS) {
-            delay(5)
+            // Just buffer it without sending immediate SACK
+            outOfOrderLock.withLock {
+                if (!outOfOrderSegments.containsKey(segSeq)) {
+                    outOfOrderSegments[segSeq] = Segment(
+                        tcp.payload.copyOf(),
+                        timestamp = System.currentTimeMillis()
+                    )
+                    oooBufferSize += tcp.payload.size
+                    stats.outOfOrderPackets++
+                }
+            }
+            // Don't send immediate ACK for small gaps
+            return
         }
+
         val maxGap = when {
-            congestionControl.getRto() < 500 -> 32768  // 低延迟网络
-            congestionControl.getRto() < 1000 -> 65536  // 中等延迟
-            else -> 131072  // 高延迟网络
+            congestionControl.getRto() < 500 -> 32768
+            congestionControl.getRto() < 1000 -> 65536
+            else -> 131072
         }
 
         if (gap > maxGap) {
@@ -582,7 +587,7 @@ class TCPConnection(
                 oooBufferSize += tcp.payload.size
                 stats.outOfOrderPackets++
 
-                // 立即发送带SACK的ACK
+                // Only send immediate SACK for larger gaps
                 sendAckWithSack(ip, tcp, immediate = true)
             }
         }
@@ -650,7 +655,7 @@ class TCPConnection(
 
     // =============== Delayed ACK with SACK support ===============
     private fun scheduleAckFlush(ip: IPv4Packet, tcp: TCPSegment) {
-        if (ackFlushJob?.isActive == true) return
+        ackFlushJob?.cancel() // Cancel previous timer
         ackFlushJob = scope.launch {
             delay(DELAYED_ACK_MS)
             emitAck(ip, tcp)

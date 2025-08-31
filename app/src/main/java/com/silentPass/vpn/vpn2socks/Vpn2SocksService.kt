@@ -23,40 +23,17 @@ class Vpn2SocksService : VpnService() {
 
         @Volatile private var instance: Vpn2SocksService? = null
 
+        @Volatile private var protectionEnabled = false
+
         @JvmStatic
         fun protectSocket(sock: Socket): Boolean {
-            return try {
-                var attempts = 0
-                val maxAttempts = 10
-
-                // 等待 instance 初始化（最多等待 1 秒）
-                while (instance == null && attempts < maxAttempts) {
-                    Thread.sleep(100)
-                    attempts++
-                }
-
-                val inst = instance
-                if (inst == null) {
-                    Log.e("Vpn2SocksService", "Instance is null after waiting!")
-                    return false
-                }
-
-                // 对于未连接的 socket，我们仍然需要保护
-                val result = inst.protect(sock)
-
-                // 获取更多调试信息
-                val localAddr = try { sock.localAddress } catch (e: Exception) { null }
-                val remoteAddr = try { sock.inetAddress } catch (e: Exception) { null }
-                val isConnected = sock.isConnected
-
-                Log.d("Vpn2SocksService",
-                    "Socket protection result: $result (connected: $isConnected, local: $localAddr, remote: $remoteAddr)")
-
-                result
-            } catch (e: Throwable) {
-                Log.e("Vpn2SocksService", "protectSocket exception: ${e.message}", e)
-                false
+            if (!protectionEnabled) {
+                // Try once
+                val result = instance?.protect(sock) ?: false
+                if (result) protectionEnabled = true
+                return result
             }
+            return instance?.protect(sock) ?: false
         }
 
         @JvmStatic
