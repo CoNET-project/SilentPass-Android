@@ -153,7 +153,6 @@ class LayerMinus(startVPNData: StartVPNData) {
         if (base64Cmd.length == 0) {
             return null
         }
-        Log.d("WebAppInterface", "$cmd")
         val requestData = encryptWithArmoredPublicKey(base64Cmd, randomExitNode.armoredPublicKey)
         val jsonbPost = postHttp(
             data = requestData

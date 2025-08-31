@@ -7,10 +7,6 @@ import kotlinx.coroutines.sync.withLock
 import java.net.Socket
 import kotlin.random.Random
 
-
-///         adb shell
-///         echo -e "GET / HTTP/1.0\r\nHost: neverssl.com\r\n\r\n" | nc neverssl.com 80
-
 class TCPConnection(
     private val key: String,
     private val mtu: Int,
@@ -32,25 +28,30 @@ class TCPConnection(
     private var isClosed = false
     private var upstreamConnected = false
 
-    private var clientSeq0: Long? = null            // Client initial SYN seq (as unsigned)
-    private var clientNextSeq: Long = 0L            // Next expected seq from client (as unsigned)
-    private var serverSeq: Long = Random.nextInt(0, Int.MAX_VALUE).toLong() // Our seq (as unsigned)
+    private var clientSeq0: Long? = null
+    private var clientNextSeq: Long = 0L
+    private var serverSeq: Long = Random.nextInt(0, Int.MAX_VALUE).toLong()
     private var established: Boolean = false
 
     fun isClosed(): Boolean = isClosed
 
     private val LOG_TAG = "TCPConnection"
     private val pendingLock = Mutex()
-    private val pending = ArrayDeque<ByteArray>()   // Pending upstream writes (Client->Server)
+    private val pending = ArrayDeque<ByteArray>()
 
     // Buffer for early upstream data before handshake completes
     private val downPrimeLock = Mutex()
     private var downPrime: ByteArray? = null
 
-    // Out-of-order buffer for reassembly
+    // Out-of-order buffer for reassembly - ADD MUTEX FOR THREAD SAFETY
     private data class Segment(val seq: Long, val data: ByteArray)
+    private val outOfOrderLock = Mutex()  // ADD THIS
     private val outOfOrderSegments = mutableListOf<Segment>()
     private val maxOutOfOrderSize = 20
+
+    private var clientHalfClosed = false
+    private var pendingShutdown = false
+    private var downstreamStarted = false
 
     // =============== Main Entry ===============
     fun onTcp(ip: IPv4Packet, tcp: TCPSegment) {
@@ -154,11 +155,7 @@ class TCPConnection(
         }
 
         tryFlushUpstream()
-        // Don't call tryStartDownstream here - it's already running!
     }
-
-    private var clientHalfClosed = false
-    private var pendingShutdown = false
 
     // =============== Handle Established Data ===============
     private suspend fun handleEstablishedData(ip: IPv4Packet, tcp: TCPSegment) {
@@ -178,8 +175,6 @@ class TCPConnection(
                 pending.addLast(tcp.payload.copyOf())
             }
 
-            // Try to flush regardless of upstream state
-            // If upstream is not ready, data will queue
             tryFlushUpstream()
 
             // Check if we can now deliver buffered out-of-order segments
@@ -209,17 +204,18 @@ class TCPConnection(
             }
 
         } else {
-            // Future segment (out-of-order)
+            // Future segment (out-of-order) - FIX THE CONCURRENT MODIFICATION HERE
             Log.d(LOG_TAG, "Out-of-order segment seq=$segSeq expect=$expect, buffering")
 
-            // Buffer it if we have space
-            if (outOfOrderSegments.size < maxOutOfOrderSize) {
-                // Check if we already have this segment
-                val exists = outOfOrderSegments.any { it.seq == segSeq }
-                if (!exists) {
-                    outOfOrderSegments.add(Segment(segSeq, tcp.payload.copyOf()))
-                    outOfOrderSegments.sortBy { it.seq }
-                    Log.d(LOG_TAG, "Buffered out-of-order segment, buffer size: ${outOfOrderSegments.size}")
+            // Buffer it if we have space - WITH LOCK
+            outOfOrderLock.withLock {
+                if (outOfOrderSegments.size < maxOutOfOrderSize) {
+                    val exists = outOfOrderSegments.any { it.seq == segSeq }
+                    if (!exists) {
+                        outOfOrderSegments.add(Segment(segSeq, tcp.payload.copyOf()))
+                        outOfOrderSegments.sortBy { it.seq }  // Now safe within lock
+                        Log.d(LOG_TAG, "Buffered out-of-order segment, buffer size: ${outOfOrderSegments.size}")
+                    }
                 }
             }
 
@@ -228,14 +224,32 @@ class TCPConnection(
         }
     }
 
-    // Deliver any buffered segments that are now in-order
+    // Deliver any buffered segments that are now in-order - FIX WITH LOCKS
     private suspend fun deliverBufferedSegments() {
-        while (outOfOrderSegments.isNotEmpty()) {
-            val first = outOfOrderSegments.first()
+        while (true) {
+            // Get and remove first segment atomically if it exists
+            val first = outOfOrderLock.withLock {
+                if (outOfOrderSegments.isNotEmpty()) {
+                    val seg = outOfOrderSegments.first()
+                    if (seg.seq == clientNextSeq) {
+                        // Remove and return it
+                        outOfOrderSegments.removeAt(0)
+                        seg
+                    } else if (isSeqBefore(seg.seq, clientNextSeq)) {
+                        // Old data, remove it
+                        outOfOrderSegments.removeAt(0)
+                        null // Signal to continue loop but don't process
+                    } else {
+                        // Gap exists, stop processing
+                        return@withLock null
+                    }
+                } else {
+                    null // List is empty
+                }
+            }
 
-            if (first.seq == clientNextSeq) {
-                // This segment is now in order
-                outOfOrderSegments.removeAt(0)
+            // Process the segment if we got one
+            if (first != null) {
                 val segEnd = (first.seq + first.data.size.toLong()) and 0xFFFFFFFFL
                 clientNextSeq = segEnd
 
@@ -246,12 +260,8 @@ class TCPConnection(
                     pending.addLast(first.data)
                 }
                 upstreamWriter?.let { tryFlushUpstream() }
-
-            } else if (isSeqBefore(first.seq, clientNextSeq)) {
-                // This is old data, remove it
-                outOfOrderSegments.removeAt(0)
             } else {
-                // Still have a gap
+                // Either list was empty or we hit a gap
                 break
             }
         }
@@ -260,7 +270,7 @@ class TCPConnection(
     // TCP sequence number comparison (handles wraparound)
     private fun isSeqBefore(seq1: Long, seq2: Long): Boolean {
         val diff = (seq1 - seq2) and 0xFFFFFFFFL
-        return diff > 0x80000000L  // More than half the sequence space
+        return diff > 0x80000000L
     }
 
     // =============== Upstream Establishment ===============
@@ -319,7 +329,7 @@ class TCPConnection(
             } catch (e: Exception) {
                 Log.w(LOG_TAG, "Prime read failed: ${e.message}")
             } finally {
-                s.soTimeout = 0  // Back to blocking
+                s.soTimeout = 0
             }
 
             Log.d(LOG_TAG, "SOCKS connected and primed, waiting for client ACK to start downstream pump")
@@ -334,15 +344,14 @@ class TCPConnection(
     }
 
     // Start downstream loop if both handshake and upstream are ready
-    private var downstreamStarted = false
     private fun tryStartDownstream(ip: IPv4Packet, tcp: TCPSegment) {
         scope.launch {
             val canStart = stateLock.withLock {
                 if (downstreamStarted) {
-                    return@withLock false  // Already started
+                    return@withLock false
                 }
                 if (established && upstreamConnected) {
-                    downstreamStarted = true  // Mark as started
+                    downstreamStarted = true
                     true
                 } else {
                     false
@@ -397,7 +406,6 @@ class TCPConnection(
         val inp = upstreamReader ?: return@withContext
         val buf = ByteArray(32 * 1024)
 
-        // 给上行一次机会把客户端最后一批数据刷出去
         delay(50)
 
         try {
@@ -411,7 +419,6 @@ class TCPConnection(
 
                 if (n <= 0) {
                     Log.i(LOG_TAG, "Downstream EOF for $key (server done sending)")
-                    // 只有当服务器真的发完了，我们才向客户端发 FIN|ACK
                     try {
                         val finAck = IpBuilders.tcpPayloadFromServer(
                             src = ip.dst, dst = ip.src,
@@ -465,7 +472,11 @@ class TCPConnection(
         }
 
         // After all data is flushed, check if we need to shutdown
-        if (pendingShutdown && pending.isEmpty()) {
+        val shouldShutdown = stateLock.withLock {
+            pendingShutdown && pending.isEmpty()
+        }
+
+        if (shouldShutdown) {
             try {
                 upstream?.shutdownOutput()
                 Log.d(LOG_TAG, "Upstream output shutdown after flushing all data")
