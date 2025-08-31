@@ -1,6 +1,7 @@
 package com.silentPass.vpn.vpn2socks
 
 class TCPSegment(data: ByteArray) {
+    val raw: ByteArray = data               // ← 新增：让上层能读到完整原始TCP字节
     val srcPort: Int
     val dstPort: Int
     val seq: Long

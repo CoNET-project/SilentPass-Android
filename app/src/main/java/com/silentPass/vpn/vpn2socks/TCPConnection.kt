@@ -57,6 +57,10 @@ class TCPConnection(
     private val stats = ConnectionStats()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    // SACK support flag (set during handshake)
+    @Volatile private var peerSupportsSack = false
+    @Volatile private var weSupportSack = true  // We always support SACK
+
     // =============== Congestion Control ===============
     private inner class CongestionControl {
         @Volatile private var cwnd = INITIAL_CWND
@@ -185,6 +189,47 @@ class TCPConnection(
         }
 
         return option.toByteArray()
+    }
+
+    // Parse TCP options from SYN to check for SACK-Permitted
+    private fun parseTcpOptions(tcp: TCPSegment) {
+        val dataOffset = (tcp.raw[12].toInt() and 0xF0) shr 4
+        val optionsLength = (dataOffset * 4) - 20
+
+        if (optionsLength <= 0) return
+
+        val optionsStart = 20
+        var i = 0
+
+        while (i < optionsLength && i + optionsStart < tcp.raw.size) {
+            val kind = tcp.raw[optionsStart + i].toInt() and 0xFF
+
+            when (kind) {
+                0 -> break  // End of options
+                1 -> i++    // NOP
+                4 -> {      // SACK-Permitted
+                    if (i + 1 < optionsLength) {
+                        val length = tcp.raw[optionsStart + i + 1].toInt() and 0xFF
+                        if (length == 2) {
+                            peerSupportsSack = true
+                            Log.d(LOG_TAG, "Peer supports SACK for $key")
+                        }
+                        i += length
+                    } else {
+                        i++
+                    }
+                }
+                else -> {
+                    // Other options
+                    if (i + 1 < optionsLength) {
+                        val length = tcp.raw[optionsStart + i + 1].toInt() and 0xFF
+                        i += if (length > 0) length else 1
+                    } else {
+                        i++
+                    }
+                }
+            }
+        }
     }
 
     // =============== Adaptive Write Coalescer ===============
@@ -377,20 +422,28 @@ class TCPConnection(
         clientSeq0 = tcp.seq.toLong() and 0xFFFFFFFFL
         clientNextSeq = (clientSeq0!! + 1L) and 0xFFFFFFFFL
 
+        // Parse client's TCP options to check for SACK support
+        parseTcpOptions(tcp)
+
         scope.launch { establishUpstream(ip, tcp, domain) }
 
-        // 发送标准 SYN-ACK（暂不附带TCP选项，保持与现有IpBuilders兼容）
-        val synAck = IpBuilders.tcpPayloadFromServer(
-            src = ip.dst, dst = ip.src,
-            srcPort = tcp.dstPort, dstPort = tcp.srcPort,
-            payload = ByteArray(0),
+        // Send SYN-ACK with MSS and SACK-Permitted options
+        val synAck = IpBuilders.tcpSynAckWithOptions(
+            src = ip.dst,
+            dst = ip.src,
+            srcPort = tcp.dstPort,
+            dstPort = tcp.srcPort,
             seq = serverSeq.toInt(),
             ack = clientNextSeq.toInt(),
-            flags = 0x12, // SYN | ACK
-            window = calcAdvertisedWindow()
+            window = calcAdvertisedWindow(),
+            mss = MSS,
+            sackPermitted = weSupportSack
         )
+
         packetWriter(listOf(synAck), listOf(ConnectionManager.PROTO_IPV4))
         serverSeq = (serverSeq + 1L) and 0xFFFFFFFFL
+
+        Log.d(LOG_TAG, "Sent SYN-ACK with MSS=$MSS and SACK-Permitted=$weSupportSack for $key")
     }
 
     private suspend fun handleHandshakeAck(ip: IPv4Packet, tcp: TCPSegment) {
@@ -400,7 +453,7 @@ class TCPConnection(
                 handshakeAcked = true
                 phase = Phase.HANDSHAKE_ACKED
             }
-            Log.d(LOG_TAG, "3-way handshake established for $key")
+            Log.d(LOG_TAG, "3-way handshake established for $key (SACK enabled: $peerSupportsSack)")
 
             flushPreHandshakeBuffer()
             tryStartDownstream(ip, tcp)
@@ -527,7 +580,7 @@ class TCPConnection(
                 oooBufferSize += tcp.payload.size
                 stats.outOfOrderPackets++
 
-                // 立即发送带SACK意图的ACK（当前仅记录日志）
+                // 立即发送带SACK的ACK
                 sendAckWithSack(ip, tcp, immediate = true)
             }
         }
@@ -593,7 +646,7 @@ class TCPConnection(
         }
     }
 
-    // =============== Delayed ACK with safety timer ===============
+    // =============== Delayed ACK with SACK support ===============
     private fun scheduleAckFlush(ip: IPv4Packet, tcp: TCPSegment) {
         if (ackFlushJob?.isActive == true) return
         ackFlushJob = scope.launch {
@@ -603,24 +656,33 @@ class TCPConnection(
     }
 
     private fun emitAck(ip: IPv4Packet, tcp: TCPSegment) {
-        val ackPacket = IpBuilders.tcpPayloadFromServer(
-            src = ip.dst, dst = ip.src,
-            srcPort = tcp.dstPort, dstPort = tcp.srcPort,
+        // Build SACK options if we have out-of-order segments and peer supports SACK
+        val tcpOptions = if (peerSupportsSack && outOfOrderSegments.isNotEmpty()) {
+            val sackBlocks = generateSackBlocks()
+            if (sackBlocks.isNotEmpty()) {
+                Log.d(LOG_TAG, "Sending SACK blocks: ${sackBlocks.joinToString()}")
+                buildSackOption(sackBlocks)
+            } else {
+                null
+            }
+        } else {
+            null
+        }
+
+        val ackPacket = IpBuilders.tcpPayloadFromServerWithOptions(
+            src = ip.dst,
+            dst = ip.src,
+            srcPort = tcp.dstPort,
+            dstPort = tcp.srcPort,
             payload = ByteArray(0),
             seq = serverSeq.toInt(),
             ack = clientNextSeq.toInt(),
             flags = 0x10, // ACK
-            window = calcAdvertisedWindow()
+            window = calcAdvertisedWindow(),
+            tcpOptions = tcpOptions
         )
-        packetWriter(listOf(ackPacket), listOf(ConnectionManager.PROTO_IPV4))
 
-        // SACK logging for diagnostics
-        if (outOfOrderSegments.isNotEmpty()) {
-            val sackBlocks = generateSackBlocks()
-            if (sackBlocks.isNotEmpty()) {
-                Log.d(LOG_TAG, "Would send SACK blocks: ${sackBlocks.joinToString()}")
-            }
-        }
+        packetWriter(listOf(ackPacket), listOf(ConnectionManager.PROTO_IPV4))
     }
 
     private suspend fun sendAckWithSack(
@@ -630,7 +692,11 @@ class TCPConnection(
     ) {
         val now = System.currentTimeMillis()
 
-        if (!immediate) {
+        // For out-of-order segments or duplicates, always send immediately with SACK
+        val shouldSendImmediate = immediate ||
+                (peerSupportsSack && outOfOrderSegments.isNotEmpty())
+
+        if (!shouldSendImmediate) {
             if ((now - lastAckTime < DELAYED_ACK_MS) && pendingAckCount < MAX_PENDING_ACKS) {
                 pendingAckCount++
                 scheduleAckFlush(ip, tcp)
@@ -842,7 +908,7 @@ class TCPConnection(
                 writeLock.withLock {
                     if (isClosed) return@withLock
 
-                    val success = writeCoalescer.offer(chunk) { data ->
+                    val success = writeCoalescer.offer(chunk) { data: ByteArray ->
                         try {
                             Log.d(LOG_TAG, "Flushing ${data.size} bytes to upstream")
                             writer.write(data)
@@ -871,7 +937,7 @@ class TCPConnection(
         try {
             writeLock.withLock {
                 if (!isClosed) {
-                    writeCoalescer.flush { data ->
+                    writeCoalescer.flush { data: ByteArray ->
                         try {
                             Log.d(LOG_TAG, "Final flush ${data.size} bytes to upstream")
                             writer.write(data)

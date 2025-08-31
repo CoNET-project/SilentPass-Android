@@ -38,6 +38,7 @@ private fun checksumWithPseudo(ps: Long, data: ByteArray): Short {
     while ((sum ushr 16) != 0L) sum = (sum and 0xffff) + (sum ushr 16)
     return ((sum.inv() and 0xffff).toInt()).toShort()
 }
+
 object IpBuilders {
     fun udpFrom(src: IPv4Address, dst: IPv4Address, srcPort: Int, dstPort: Int, payload: ByteArray): ByteArray {
         val ipHdr = 20; val udpHdr = 8
@@ -56,7 +57,7 @@ object IpBuilders {
         bb.putShort((udpHdr + payload.size).toShort()); bb.putShort(0)
         bb.put(payload)
 
-        // fill UDP checksum (optional for IPv4，但建议计算)
+        // fill UDP checksum
         val arr = bb.array()
         val udpOff = ipHdr
         val ps = pseudoHeaderSum(src.raw, dst.raw, 17, udpHdr + payload.size)
@@ -70,7 +71,6 @@ object IpBuilders {
         arr[11] = (ipCsum.toInt() and 0xff).toByte()
         return arr
     }
-
 
     fun icmpPortUnreachable(ip: IPv4Packet): ByteArray {
         val icmpHdr = 8
@@ -101,9 +101,36 @@ object IpBuilders {
         return arr
     }
 
+    // 原始方法保持兼容性
     fun tcpPayloadFromServer(src: IPv4Address, dst: IPv4Address, srcPort: Int, dstPort: Int, payload: ByteArray,
                              seq: Int, ack: Int, flags: Int = 0x18, window: Int = 65535): ByteArray {
-        val ipHdr = 20; val tcpHdr = 20
+        return tcpPayloadFromServerWithOptions(src, dst, srcPort, dstPort, payload, seq, ack, flags, window, null)
+    }
+
+    // 新方法：支持TCP选项
+    fun tcpPayloadFromServerWithOptions(
+        src: IPv4Address, dst: IPv4Address,
+        srcPort: Int, dstPort: Int,
+        payload: ByteArray,
+        seq: Int, ack: Int,
+        flags: Int = 0x18,
+        window: Int = 65535,
+        tcpOptions: ByteArray? = null
+    ): ByteArray {
+        val ipHdr = 20
+
+        // 计算TCP选项的填充
+        var optionsWithPadding = tcpOptions ?: ByteArray(0)
+        if (optionsWithPadding.isNotEmpty()) {
+            // TCP选项必须是4字节对齐
+            val optLen = optionsWithPadding.size
+            val padding = (4 - (optLen % 4)) % 4
+            if (padding > 0) {
+                optionsWithPadding = optionsWithPadding + ByteArray(padding) // NOP padding
+            }
+        }
+
+        val tcpHdr = 20 + optionsWithPadding.size
         val total = ipHdr + tcpHdr + payload.size
         val bb = ByteBuffer.allocate(total)
 
@@ -115,20 +142,71 @@ object IpBuilders {
         // TCP header
         bb.putShort(srcPort.toShort()); bb.putShort(dstPort.toShort())
         bb.putInt(seq); bb.putInt(ack)
-        bb.put(((5 shl 4)).toByte()); bb.put(flags.toByte()) // data offset + flags
+
+        // Data offset (header length in 32-bit words)
+        val dataOffset = tcpHdr / 4
+        bb.put((dataOffset shl 4).toByte()); bb.put(flags.toByte())
         bb.putShort(window.toShort()); bb.putShort(0); bb.putShort(0) // csum=0, urg=0
+
+        // TCP options
+        if (optionsWithPadding.isNotEmpty()) {
+            bb.put(optionsWithPadding)
+        }
+
+        // Payload
         bb.put(payload)
 
         val arr = bb.array()
+
         // TCP checksum with pseudo header
         val ps = pseudoHeaderSum(src.raw, dst.raw, 6, tcpHdr + payload.size)
         val tcpCsum = checksumWithPseudo(ps, arr.copyOfRange(ipHdr, total))
         arr[ipHdr + 16] = (tcpCsum.toInt() ushr 8).toByte()
         arr[ipHdr + 17] = (tcpCsum.toInt() and 0xff).toByte()
 
+        // IP checksum
         val ipCsum = ipChecksum(arr.copyOfRange(0, ipHdr))
         arr[10] = (ipCsum.toInt() ushr 8).toByte()
         arr[11] = (ipCsum.toInt() and 0xff).toByte()
+
         return arr
+    }
+
+    // 用于SYN-ACK的特殊版本，支持MSS和SACK-Permitted选项
+    fun tcpSynAckWithOptions(
+        src: IPv4Address, dst: IPv4Address,
+        srcPort: Int, dstPort: Int,
+        seq: Int, ack: Int,
+        window: Int = 65535,
+        mss: Int = 1460,
+        sackPermitted: Boolean = true
+    ): ByteArray {
+        val options = mutableListOf<Byte>()
+
+        // MSS option (kind=2, length=4)
+        options.add(2)
+        options.add(4)
+        options.add((mss shr 8).toByte())
+        options.add((mss and 0xFF).toByte())
+
+        // SACK-Permitted option (kind=4, length=2)
+        if (sackPermitted) {
+            options.add(4)
+            options.add(2)
+        }
+
+        // NOP padding for alignment if needed
+        while (options.size % 4 != 0) {
+            options.add(1) // NOP
+        }
+
+        return tcpPayloadFromServerWithOptions(
+            src, dst, srcPort, dstPort,
+            ByteArray(0), // No payload for SYN-ACK
+            seq, ack,
+            0x12, // SYN | ACK flags
+            window,
+            options.toByteArray()
+        )
     }
 }
