@@ -5,9 +5,16 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
 import android.util.Log
 import java.util.Collections
+import java.util.LinkedList
+import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 
 object SocketPool {
+
+    private val pool = LinkedList<Socket>()
+    private val activeConnections = WeakHashMap<Socket, Long>()
+    private val maxPoolSize = 10
+    private val maxIdleTime = 30_000L // 30秒
 
     init {
         Log.d("SocketPool", "SocketPool singleton initialized")
@@ -25,50 +32,30 @@ object SocketPool {
     private val totalReleased = AtomicInteger(0)
     private val totalReused = AtomicInteger(0)
 
+    @Synchronized
     fun acquire(): Socket {
-        // 先尝试从池中获取
-        var socket = idlePool.poll()
+        // 清理过期的socket
+        cleanupStale()
 
-        if (socket != null && !socket.isClosed) {
-            activeSockets.add(socket)
-            activeCount.incrementAndGet()
-            totalReused.incrementAndGet()
-            totalAcquired.incrementAndGet()
-            Log.d(LOG_TAG, "Reused socket from pool (active: ${activeCount.get()}, idle: ${idlePool.size})")
-            return socket
-        }
-
-        // 创建新Socket
-        if (activeCount.get() < MAX_ACTIVE_SOCKETS) {
-            socket = Socket()
-            activeSockets.add(socket)
-            activeCount.incrementAndGet()
-            totalAcquired.incrementAndGet()
-            Log.d(LOG_TAG, "Created new socket (active: ${activeCount.get()})")
-            return socket
-        }
-
-        throw IllegalStateException("Socket pool exhausted: ${activeCount.get()} active")
+        val socket = pool.pollFirst() ?: Socket()
+        activeConnections[socket] = System.currentTimeMillis()
+        return socket
     }
 
-    fun release(socket: Socket) {
-        val wasActive = activeSockets.remove(socket)
-        if (wasActive) {
-            activeCount.decrementAndGet()
-            totalReleased.incrementAndGet()
-        }
+    @Synchronized
+    fun release(socket: Socket?) {
+        socket ?: return
 
-        if (!socket.isClosed && idlePool.size < MAX_IDLE_SOCKETS) {
-            try {
-                socket.soTimeout = 0  // 重置超时
-                idlePool.offer(socket)
-                Log.d(LOG_TAG, "Socket returned to pool (active: ${activeCount.get()}, idle: ${idlePool.size})")
-            } catch (e: Exception) {
-                Log.w(LOG_TAG, "Failed to return socket to pool: ${e.message}")
-                closeQuietly(socket)
+        activeConnections.remove(socket)
+
+        try {
+            if (!socket.isClosed && pool.size < maxPoolSize) {
+                pool.offer(socket)
+            } else {
+                socket.close()
             }
-        } else {
-            closeQuietly(socket)
+        } catch (e: Exception) {
+            socket.runCatching { close() }
         }
     }
 
@@ -78,18 +65,35 @@ object SocketPool {
         } catch (_: Exception) {}
     }
 
+    @Synchronized
     fun cleanup() {
-        // 定期清理空闲连接
-        val toRemove = mutableListOf<Socket>()
-        idlePool.forEach { socket ->
-            if (socket.isClosed) toRemove.add(socket)
+        // 清理池中的socket
+        val iter = pool.iterator()
+        while (iter.hasNext()) {
+            val socket = iter.next()
+            if (socket.isClosed) {
+                iter.remove()
+            }
         }
-        toRemove.forEach { idlePool.remove(it) }
 
-        // 输出统计信息
-        Log.d(LOG_TAG, "Pool stats - Active: ${activeCount.get()}, Idle: ${idlePool.size}, " +
-                "Total acquired: ${totalAcquired.get()}, Released: ${totalReleased.get()}, " +
-                "Reused: ${totalReused.get()}")
+        // 清理泄漏的活跃连接（超过60秒未归还）
+        val now = System.currentTimeMillis()
+        activeConnections.entries.removeIf { (socket, time) ->
+            if (now - time > 60_000) {
+                Log.w("SocketPool", "Force closing leaked socket")
+                socket.runCatching { close() }
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    private fun cleanupStale() {
+        val now = System.currentTimeMillis()
+        pool.removeIf { socket ->
+            socket.isClosed || (now - (activeConnections[socket] ?: 0) > maxIdleTime)
+        }
     }
 
     // 强制清理所有连接（应用退出时调用）

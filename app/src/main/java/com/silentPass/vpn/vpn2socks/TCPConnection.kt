@@ -5,8 +5,10 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentSkipListMap
@@ -16,6 +18,7 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.random.Random
 import java.util.concurrent.atomic.AtomicInteger
+
 
 class TCPConnection(
     private val key: String,
@@ -826,14 +829,17 @@ class TCPConnection(
             tryStartDownstream(ip, syn)
 
         } catch (e: Exception) {
-            // 只有池化的socket才归还
-            if (pooledSocket && socket != null) {
-                SocketPool.release(socket)
-            } else {
-                socket?.close()
-            }
             Log.e(LOG_TAG, "Upstream establishment failed: ${e.message}", e)
             closeConnection()
+        } finally {
+            // 确保异常时释放资源
+            if (socket != null && upstream == null) {
+                if (pooledSocket) {
+                    SocketPool.release(socket)
+                } else {
+                    socket.runCatching { close() }
+                }
+            }
         }
     }
 
@@ -925,6 +931,19 @@ class TCPConnection(
         Log.d(LOG_TAG, "Sent FIN|ACK to client for ${getDisplayKey()}")
     }
 
+    private fun isConnectionHealthy(): Boolean {
+        return try {
+            upstream?.let { socket ->
+                !socket.isClosed &&
+                        socket.isConnected &&
+                        !socket.isInputShutdown &&
+                        !socket.isOutputShutdown
+            } ?: false
+        } catch (e: Exception) {
+            false
+        }
+    }
+
     private suspend fun tryFlushUpstream() = withContext(Dispatchers.IO) {
         val writer = upstreamWriter ?: return@withContext
 
@@ -933,9 +952,14 @@ class TCPConnection(
                 if (pending.isEmpty()) null else pending.removeFirst()
             } ?: break
 
-            // Check congestion window
+            // 检查连接状态
+            if (isClosed || upstream?.isClosed == true) {
+                Log.w(LOG_TAG, "Connection closed, stopping flush")
+                break
+            }
+
+            // 检查拥塞窗口
             if (!congestionControl.canSend(chunk.size)) {
-                // Put back and wait
                 pendingLock.withLock {
                     pending.addFirst(chunk)
                 }
@@ -954,43 +978,53 @@ class TCPConnection(
                             writer.flush()
                             congestionControl.onSend(data.size)
                             true
-                        } catch (e: Exception) {
-                            Log.e(LOG_TAG, "Upstream write failed: ${e.message}")
+                        } catch (e: SocketTimeoutException) {
+                            Log.w(LOG_TAG, "Write timeout")
+                            false
+                        } catch (e: IOException) {
+                            Log.e(LOG_TAG, "Write failed: ${e.message}")
                             false
                         }
                     }
 
                     if (!success) {
+                        Log.w(LOG_TAG, "Write failed, initiating graceful close")
                         throw Exception("Write failed")
                     }
                 }
             } catch (e: Exception) {
-                Log.e(LOG_TAG, "Upstream flush error: ${e.message}", e)
+                Log.e(LOG_TAG, "Flush error: ${e.message}", e)
                 congestionControl.onTimeout()
                 closeConnection()
                 break
             }
         }
 
-        // Flush any remaining coalesced data
+        // 清理剩余数据
+        cleanupPendingData()
+    }
+
+    private suspend fun cleanupPendingData() {
         try {
             writeLock.withLock {
-                if (!isClosed) {
-                    writeCoalescer.flush { data: ByteArray ->
+                if (!isClosed && upstreamWriter != null) {
+                    writeCoalescer.flush { data ->
                         try {
-                            Log.d(LOG_TAG, "Final flush ${data.size} bytes to upstream")
-                            writer.write(data)
-                            writer.flush()
+                            upstreamWriter?.write(data)
+                            upstreamWriter?.flush()
                             true
                         } catch (e: Exception) {
+                            Log.w(LOG_TAG, "Final flush failed: ${e.message}")
                             false
                         }
                     }
                 }
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.w(LOG_TAG, "Cleanup failed: ${e.message}")
+        }
 
-        // Handle shutdown if needed
+        // 处理关闭
         val shouldShutdown = stateLock.withLock {
             pendingShutdown && pending.isEmpty()
         }
@@ -998,12 +1032,13 @@ class TCPConnection(
         if (shouldShutdown) {
             try {
                 upstream?.shutdownOutput()
-                Log.d(LOG_TAG, "Upstream output shutdown after flushing all data")
+                Log.d(LOG_TAG, "Upstream output shutdown")
             } catch (e: Exception) {
                 Log.w(LOG_TAG, "Shutdown failed: ${e.message}")
             }
         }
     }
+
 
     private fun isSeqBefore(seq1: Long, seq2: Long): Boolean {
         val diff = (seq1 - seq2) and 0xFFFFFFFFL
@@ -1014,64 +1049,44 @@ class TCPConnection(
         if (!closedOnce.compareAndSet(false, true)) return
 
         isClosed = true
+        scope.cancel("Connection closed")
 
-        scope.launch {
+        // 使用协程清理资源
+        GlobalScope.launch(Dispatchers.IO) {
             try {
-                // Final flush attempt
-                writeLock.withLock {
-                    if (!isClosed && upstreamWriter != null) {
-                        writeCoalescer.flush { data ->
-                            try {
-                                upstreamWriter?.write(data)
-                                upstreamWriter?.flush()
-                                true
-                            } catch (_: Exception) {
-                                false
+                // 取消ACK定时器
+                ackFlushJob?.cancel()
+
+                // 安全关闭流
+                kotlin.runCatching { upstreamReader?.close() }
+                kotlin.runCatching { upstreamWriter?.close() }
+
+                // 处理socket
+                upstream?.let { socket ->
+                    kotlin.runCatching {
+                        if (!socket.isClosed) {
+                            socket.soTimeout = 100  // 快速超时
+                            if (bypassDirect) {
+                                SocketPool.release(socket)
+                            } else {
+                                socket.close()
                             }
                         }
                     }
                 }
-            } catch (_: Exception) {}
 
-            // Cancel delayed-ACK timer
-            try { ackFlushJob?.cancel() } catch (_: Exception) {}
+                // 清理内存
+                sentTimeMap.clear()
+                outOfOrderSegments.clear()
+                pending.clear()
 
-            // 改进的资源清理
-            try {
-                upstreamReader?.close()
-            } catch (_: Exception) {} finally {
+            } catch (e: Exception) {
+                Log.e(LOG_TAG, "Error during cleanup: ${e.message}")
+            } finally {
                 upstreamReader = null
-            }
-
-            try {
-                upstreamWriter?.close()
-            } catch (_: Exception) {} finally {
                 upstreamWriter = null
+                upstream = null
             }
-
-            // 根据连接类型处理socket
-            upstream?.let { socket ->
-                try {
-                    if (bypassDirect) {
-                        // 直连模式的socket归还池
-                        SocketPool.release(socket)
-                    } else {
-                        // SOCKS模式直接关闭
-                        socket.close()
-                    }
-                } catch (e: Exception) {
-                    Log.w(LOG_TAG, "Error handling socket cleanup: ${e.message}")
-                }
-            }
-            upstream = null
-
-            stateLock.withLock { phase = Phase.CLOSED }
-
-            // Clean up tracking maps
-            sentTimeMap.clear()
-            outOfOrderSegments.clear()
         }
-
-        scope.cancel()
     }
 }

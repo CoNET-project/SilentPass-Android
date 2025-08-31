@@ -118,14 +118,30 @@ class ConnectionManager(
     }
 
     init {
-        // 定期清理已关闭的连接
         scope.launch {
             while (isActive) {
                 delay(30_000)
-                cleanupClosedConnections()
-                SocketPool.cleanup()  // 添加Socket池清理
-                // 顺便 flush 所有 DNS 聚合尾窗，避免长期不活动时残留
+
+                // 使用 filter 和计数
+                val closedConnections = tcpConns.filter { it.value.isClosed() }
+                val closedCount = closedConnections.size
+
+                closedConnections.forEach { (key, _) ->
+                    tcpConns.remove(key)
+                }
+
+                if (closedCount > 0) {
+                    Log.d(LOG_TAG, "Cleaned up $closedCount closed connections")
+                }
+
+                // 强制清理socket池
+                SocketPool.cleanup()
+
+                // 清理DNS聚合窗口
                 dnsAggMap.keys.forEach { flushDnsAggIfIdle(it) }
+
+                // 记录状态
+                Log.d(LOG_TAG, "Active connections: ${tcpConns.size}")
             }
         }
     }
