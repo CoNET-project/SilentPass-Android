@@ -5,6 +5,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.ByteArrayOutputStream
+import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
@@ -32,6 +33,15 @@ class TCPConnection(
         private const val MAX_RTO = 60000L
         private const val SACK_PERMITTED = 4
         private const val SACK_OPTION = 5
+
+        // New: soft limits for inbound buffering and advertised window.
+        private const val MAX_PENDING_BYTES = 256 * 1024
+        private const val MIN_ADV_WINDOW = 1024
+        private const val MAX_ADV_WINDOW = 65535
+
+        // New: delayed ACK timers
+        private const val DELAYED_ACK_MS = 40L
+        private const val MAX_PENDING_ACKS = 2
     }
 
     // =============== Connection Statistics ===============
@@ -128,7 +138,7 @@ class TCPConnection(
         var currentEnd: Long? = null
 
         outOfOrderSegments.forEach { (seq, segment) ->
-            val segEnd = seq + segment.data.size.toLong()  // 修复：添加 .toLong()
+            val segEnd = seq + segment.data.size.toLong()
 
             if (currentStart == null) {
                 currentStart = seq
@@ -223,7 +233,6 @@ class TCPConnection(
             }
         }
 
-        // 添加缺失的 flush 方法
         fun flush(writer: (ByteArray) -> Boolean): Boolean {
             synchronized(lock) {
                 if (buffer.size() == 0) return true
@@ -293,6 +302,11 @@ class TCPConnection(
     // Tracking for RTT measurement
     private val sentTimeMap = ConcurrentHashMap<Long, Long>()  // seq -> timestamp
 
+    // New: Delayed-ACK machinery
+    @Volatile private var lastAckTime = 0L
+    @Volatile private var pendingAckCount = 0
+    private var ackFlushJob: Job? = null
+
     fun isClosed(): Boolean = isClosed
 
     // =============== Main Packet Processing ===============
@@ -347,7 +361,7 @@ class TCPConnection(
         if (tcp.isFIN) {
             Log.d(LOG_TAG, "FIN received before establishment for $key")
             clientNextSeq = (clientNextSeq + 1L) and 0xFFFFFFFFL
-            sendAckWithSack(ip, tcp)
+            sendAckWithSack(ip, tcp, immediate = true)
             closeConnection()
             return
         }
@@ -365,7 +379,7 @@ class TCPConnection(
 
         scope.launch { establishUpstream(ip, tcp, domain) }
 
-        // 发送标准 SYN-ACK（暂时不包含 SACK-Permitted 选项）
+        // 发送标准 SYN-ACK（暂不附带TCP选项，保持与现有IpBuilders兼容）
         val synAck = IpBuilders.tcpPayloadFromServer(
             src = ip.dst, dst = ip.src,
             srcPort = tcp.dstPort, dstPort = tcp.srcPort,
@@ -373,8 +387,7 @@ class TCPConnection(
             seq = serverSeq.toInt(),
             ack = clientNextSeq.toInt(),
             flags = 0x12, // SYN | ACK
-            window = 65535
-            // 注意：移除了 options 参数
+            window = calcAdvertisedWindow()
         )
         packetWriter(listOf(synAck), listOf(ConnectionManager.PROTO_IPV4))
         serverSeq = (serverSeq + 1L) and 0xFFFFFFFFL
@@ -437,6 +450,7 @@ class TCPConnection(
         Log.d(LOG_TAG, "Client->Server (in-order): ${tcp.payload.size} bytes for $key")
 
         clientNextSeq = segEnd
+        // Keep using onAck to throttle upstream write pacing heuristically.
         congestionControl.onAck(tcp.payload.size)
 
         // Queue data for upstream
@@ -450,7 +464,7 @@ class TCPConnection(
         // Flush to upstream
         tryFlushUpstream()
 
-        // Send ACK with SACK if needed
+        // Send ACK (with delayed-ACK policy)
         sendAckWithSack(ip, tcp)
     }
 
@@ -464,14 +478,14 @@ class TCPConnection(
             // Complete duplicate
             Log.d(LOG_TAG, "Duplicate segment seq=$segSeq expect=$expect for $key")
             congestionControl.onDuplicateAck()
-            sendAckWithSack(ip, tcp)
+            sendAckWithSack(ip, tcp, immediate = true)
         } else {
             // Partial retransmission with new data
             val overlap = (expect - segSeq).toInt()
             val newData = tcp.payload.copyOfRange(overlap, tcp.payload.size)
             Log.d(LOG_TAG, "Partial retrans: ${newData.size} new bytes for $key")
 
-            clientNextSeq = segEnd
+            clientNextSeq = (expect + newData.size) and 0xFFFFFFFFL
             pendingLock.withLock {
                 pending.addLast(newData)
             }
@@ -483,11 +497,9 @@ class TCPConnection(
     private suspend fun handleOutOfOrderPacket(ip: IPv4Packet, tcp: TCPSegment, segSeq: Long) {
         val gap = segSeq - clientNextSeq
 
-        // 动态调整缓冲区大小
-
         // 如果gap很小，可能是轻微乱序，等待一小段时间
         if (gap < 3 * MSS) {
-            delay(5) // 等待5ms看是否收到缺失的包
+            delay(5)
         }
         val maxGap = when {
             congestionControl.getRto() < 500 -> 32768  // 低延迟网络
@@ -498,26 +510,24 @@ class TCPConnection(
         if (gap > maxGap) {
             Log.w(LOG_TAG, "Dropping far out-of-order segment gap=$gap maxGap=$maxGap")
             stats.droppedPackets++
-            sendAckWithSack(ip, tcp)
+            sendAckWithSack(ip, tcp, immediate = true)
             return
         }
 
-        // 实现更激进的乱序包处理
         outOfOrderLock.withLock {
-            // 如果缓冲区接近满，尝试清理旧数据
             if (oooBufferSize > maxOooBufferSize * 0.8) {
                 cleanOldSegments(aggressiveClean = true)
             }
 
-            // 添加新段
             if (!outOfOrderSegments.containsKey(segSeq)) {
                 outOfOrderSegments[segSeq] = Segment(
                     tcp.payload.copyOf(),
                     timestamp = System.currentTimeMillis()
                 )
                 oooBufferSize += tcp.payload.size
+                stats.outOfOrderPackets++
 
-                // 立即发送带SACK的ACK
+                // 立即发送带SACK意图的ACK（当前仅记录日志）
                 sendAckWithSack(ip, tcp, immediate = true)
             }
         }
@@ -546,11 +556,10 @@ class TCPConnection(
                 val entry = outOfOrderSegments.firstEntry()
 
                 if (entry.key == clientNextSeq) {
-                    // This segment is now in order
                     outOfOrderSegments.pollFirstEntry()
                     oooBufferSize -= entry.value.data.size
 
-                    val segEnd = (entry.key + entry.value.data.size.toLong()) and 0xFFFFFFFFL  // 修复：添加 .toLong()
+                    val segEnd = (entry.key + entry.value.data.size.toLong()) and 0xFFFFFFFFL
                     clientNextSeq = segEnd
 
                     pendingLock.withLock {
@@ -560,12 +569,10 @@ class TCPConnection(
                     delivered++
                     Log.d(LOG_TAG, "Delivered buffered segment seq=${entry.key}, ${entry.value.data.size} bytes")
                 } else if (isSeqBefore(entry.key, clientNextSeq)) {
-                    // Old segment, check for partial validity
                     val overlap = (clientNextSeq - entry.key).toInt()
                     if (overlap < entry.value.data.size) {
-                        // Partial new data
                         val newData = entry.value.data.copyOfRange(overlap, entry.value.data.size)
-                        clientNextSeq = (clientNextSeq + newData.size.toLong()) and 0xFFFFFFFFL  // 修复：添加 .toLong()
+                        clientNextSeq = (clientNextSeq + newData.size.toLong()) and 0xFFFFFFFFL
 
                         pendingLock.withLock {
                             pending.addLast(newData)
@@ -575,7 +582,6 @@ class TCPConnection(
                     outOfOrderSegments.pollFirstEntry()
                     oooBufferSize -= entry.value.data.size
                 } else {
-                    // Gap exists, stop delivery
                     break
                 }
             }
@@ -587,25 +593,16 @@ class TCPConnection(
         }
     }
 
-    private var lastAckTime = 0L
-    private var pendingAckCount = 0
-
-    private suspend fun sendAckWithSack(
-        ip: IPv4Packet,
-        tcp: TCPSegment,
-        immediate: Boolean = false  // 添加默认参数
-    ) {
-        val now = System.currentTimeMillis()
-
-        // 使用延迟ACK策略减少ACK数量
-        if (!immediate && (now - lastAckTime < 40) && pendingAckCount < 2) {
-            pendingAckCount++
-            return
+    // =============== Delayed ACK with safety timer ===============
+    private fun scheduleAckFlush(ip: IPv4Packet, tcp: TCPSegment) {
+        if (ackFlushJob?.isActive == true) return
+        ackFlushJob = scope.launch {
+            delay(DELAYED_ACK_MS)
+            emitAck(ip, tcp)
         }
+    }
 
-        lastAckTime = now
-        pendingAckCount = 0
-
+    private fun emitAck(ip: IPv4Packet, tcp: TCPSegment) {
         val ackPacket = IpBuilders.tcpPayloadFromServer(
             src = ip.dst, dst = ip.src,
             srcPort = tcp.dstPort, dstPort = tcp.srcPort,
@@ -613,18 +610,47 @@ class TCPConnection(
             seq = serverSeq.toInt(),
             ack = clientNextSeq.toInt(),
             flags = 0x10, // ACK
-            window = 65535
+            window = calcAdvertisedWindow()
         )
-
         packetWriter(listOf(ackPacket), listOf(ConnectionManager.PROTO_IPV4))
 
-        // 如果有乱序包，记录 SACK 信息用于诊断
+        // SACK logging for diagnostics
         if (outOfOrderSegments.isNotEmpty()) {
             val sackBlocks = generateSackBlocks()
             if (sackBlocks.isNotEmpty()) {
                 Log.d(LOG_TAG, "Would send SACK blocks: ${sackBlocks.joinToString()}")
             }
         }
+    }
+
+    private suspend fun sendAckWithSack(
+        ip: IPv4Packet,
+        tcp: TCPSegment,
+        immediate: Boolean = false
+    ) {
+        val now = System.currentTimeMillis()
+
+        if (!immediate) {
+            if ((now - lastAckTime < DELAYED_ACK_MS) && pendingAckCount < MAX_PENDING_ACKS) {
+                pendingAckCount++
+                scheduleAckFlush(ip, tcp)
+                return
+            }
+        }
+
+        lastAckTime = now
+        pendingAckCount = 0
+        emitAck(ip, tcp)
+    }
+
+    private fun calcAdvertisedWindow(): Int {
+        // Simple receive window autotuning based on pending + OOO buffers
+        val pendingBytes = runBlocking { pendingLock.withLock { pending.sumOf { it.size } } }
+        val oooBytes = oooBufferSize
+        val used = min(MAX_PENDING_BYTES, pendingBytes + oooBytes)
+        val free = (MAX_PENDING_BYTES - used).coerceAtLeast(0)
+        val win = free.coerceIn(MIN_ADV_WINDOW, MAX_ADV_WINDOW)
+        return win
     }
 
     private suspend fun bufferPreHandshakeData(data: ByteArray) {
@@ -654,7 +680,7 @@ class TCPConnection(
     private suspend fun handleFIN(ip: IPv4Packet, tcp: TCPSegment) {
         Log.d(LOG_TAG, "FIN received for $key (client half-close)")
         clientNextSeq = (clientNextSeq + 1L) and 0xFFFFFFFFL
-        sendAckWithSack(ip, tcp)
+        sendAckWithSack(ip, tcp, immediate = true)
 
         stateLock.withLock {
             clientHalfClosed = true
@@ -675,12 +701,14 @@ class TCPConnection(
             val socket = if (bypassDirect) {
                 Socket().apply {
                     tcpNoDelay = true
+                    soTimeout = 200  // ensure reader.read() wakes up
                     Vpn2SocksService.protectSocket(this)
-                    connect(java.net.InetSocketAddress(hostForDial, port), 15000)
+                    connect(InetSocketAddress(hostForDial, port), 15000)
                 }
             } else {
                 SocksClient(socksEndpoint).dial(hostForDial, port).apply {
                     tcpNoDelay = true
+                    soTimeout = 200
                 }
             }
 
@@ -769,7 +797,7 @@ class TCPConnection(
                 seq = serverSeq.toInt(),
                 ack = clientNextSeq.toInt(),
                 flags = 0x18, // PSH | ACK
-                window = 65535
+                window = calcAdvertisedWindow()
             )
 
             packetWriter(listOf(packet), listOf(ConnectionManager.PROTO_IPV4))
@@ -786,13 +814,11 @@ class TCPConnection(
             seq = serverSeq.toInt(),
             ack = clientNextSeq.toInt(),
             flags = 0x11, // FIN | ACK
-            window = 65535
+            window = calcAdvertisedWindow()
         )
         packetWriter(listOf(finPacket), listOf(ConnectionManager.PROTO_IPV4))
         Log.d(LOG_TAG, "Sent FIN|ACK to client for $key")
     }
-
-
 
     private suspend fun tryFlushUpstream() = withContext(Dispatchers.IO) {
         val writer = upstreamWriter ?: return@withContext
@@ -901,6 +927,9 @@ class TCPConnection(
                     }
                 }
             } catch (_: Exception) {}
+
+            // Cancel delayed-ACK timer
+            try { ackFlushJob?.cancel() } catch (_: Exception) {}
 
             // Clean up resources
             try { upstreamReader?.close() } catch (_: Exception) {}

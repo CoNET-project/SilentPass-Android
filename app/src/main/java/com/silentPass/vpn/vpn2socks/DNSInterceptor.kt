@@ -15,10 +15,136 @@ import javax.net.SocketFactory
 class DNSInterceptor {
     private val LOG_TAG = "DNSInterceptor"
     private val bypassCache = HashMap<String, Boolean>()
+
+    // DNS 查询缓存相关
+    data class DNSCacheEntry(
+        val response: ByteArray,
+        val timestamp: Long,
+        val ttl: Long = 300000L // 默认 5 分钟 TTL (毫秒)
+    ) {
+        fun isExpired(): Boolean {
+            return System.currentTimeMillis() - timestamp > ttl
+        }
+    }
+
+    private val dnsCache = HashMap<String, DNSCacheEntry>()
+    private val dnsCacheMutex = Mutex()
+    private val MAX_CACHE_SIZE = 1000 // 最大缓存条目数
+
+    // 生成缓存键：基于查询内容（跳过 ID 字段）
+    private fun generateCacheKey(query: ByteArray): String {
+        if (query.size < 12) return ""
+
+        // 跳过前两个字节（Transaction ID），从第3个字节开始计算
+        val keyBytes = ByteArrayOutputStream()
+        keyBytes.write(query, 2, query.size - 2)
+
+        // 使用 Base64 编码作为键
+        return android.util.Base64.encodeToString(
+            keyBytes.toByteArray(),
+            android.util.Base64.NO_WRAP
+        )
+    }
+
+    // 从缓存响应中提取 TTL
+    private fun extractTTLFromResponse(response: ByteArray): Long {
+        try {
+            if (response.size < 12) return 300000L // 默认 5 分钟
+
+            // 简单解析：跳过 header 和 question section，查找第一个 answer 的 TTL
+            var pos = 12
+
+            // 跳过 question section
+            val qdCount = ((response[4].toInt() and 0xff) shl 8) or (response[5].toInt() and 0xff)
+            repeat(qdCount) {
+                // 跳过 domain name
+                while (pos < response.size && response[pos].toInt() != 0) {
+                    val len = response[pos].toInt() and 0xff
+                    if ((len and 0xC0) == 0xC0) {
+                        pos += 2
+                        break
+                    } else {
+                        pos += 1 + len
+                    }
+                }
+                if (response[pos].toInt() == 0) pos++ // null terminator
+                pos += 4 // skip QTYPE and QCLASS
+            }
+
+            // 读取第一个 answer 的 TTL
+            val anCount = ((response[6].toInt() and 0xff) shl 8) or (response[7].toInt() and 0xff)
+            if (anCount > 0 && pos < response.size) {
+                // 跳过 answer name
+                if ((response[pos].toInt() and 0xC0) == 0xC0) {
+                    pos += 2
+                } else {
+                    while (pos < response.size && response[pos].toInt() != 0) {
+                        val len = response[pos].toInt() and 0xff
+                        pos += 1 + len
+                    }
+                    pos++ // null terminator
+                }
+
+                if (pos + 10 <= response.size) {
+                    // 跳过 TYPE (2) 和 CLASS (2)
+                    pos += 4
+                    // 读取 TTL (4 bytes)
+                    val ttl = ((response[pos].toLong() and 0xff) shl 24) or
+                            ((response[pos + 1].toLong() and 0xff) shl 16) or
+                            ((response[pos + 2].toLong() and 0xff) shl 8) or
+                            (response[pos + 3].toLong() and 0xff)
+
+                    // 转换为毫秒，限制在合理范围内
+                    val ttlMs = ttl * 1000L
+                    return when {
+                        ttlMs < 60000L -> 60000L      // 最少 1 分钟
+                        ttlMs > 86400000L -> 86400000L // 最多 24 小时
+                        else -> ttlMs
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(LOG_TAG, "Failed to extract TTL from response: ${e.message}")
+        }
+
+        return 300000L // 默认 5 分钟
+    }
+
+    // 清理过期缓存条目
+    private suspend fun cleanupExpiredCache() {
+        dnsCacheMutex.withLock {
+            val expiredKeys = dnsCache.entries
+                .filter { it.value.isExpired() }
+                .map { it.key }
+
+            expiredKeys.forEach { dnsCache.remove(it) }
+
+            // 如果缓存太大，删除最老的条目
+            if (dnsCache.size > MAX_CACHE_SIZE) {
+                val sortedEntries = dnsCache.entries
+                    .sortedBy { it.value.timestamp }
+
+                val toRemove = sortedEntries.size - MAX_CACHE_SIZE
+                if (toRemove > 0) {
+                    sortedEntries.take(toRemove).forEach {
+                        dnsCache.remove(it.key)
+                    }
+                }
+            }
+        }
+    }
+
+    // 更新响应中的 Transaction ID
+    private fun updateTransactionId(response: ByteArray, newId: Int): ByteArray {
+        val updated = response.copyOf()
+        updated[0] = ((newId shr 8) and 0xff).toByte()
+        updated[1] = (newId and 0xff).toByte()
+        return updated
+    }
+
     // 归一化：去掉前导 "*." 或 "."，去掉尾部点，转小写
     private fun normalizeDomain(d: String): String =
         d.trim().trim('.').removePrefix("*.").removePrefix(".").lowercase()
-
 
     // 需要直连的域名（含 APNs/FCM/自管域等）
     private val bypassDomains = setOf(
@@ -95,16 +221,17 @@ class DNSInterceptor {
         "short.weixin.qq.com",
         "long.weixin.qq.com",
     )
-    // 预处理一份“规范化后的”绕行域名集合（保持原 bypassDomains 不动）
+
+    // 预处理一份"规范化后的"绕行域名集合（保持原 bypassDomains 不动）
     private val bypassNorm: Set<String> = bypassDomains.map { normalizeDomain(it) }.toSet()
-    // 严格的“标签边界后缀匹配”
-    // 例：若 base = "google.com"，则 "google.com"、"a.google.com"、"a.b.google.com" 均返回 true，
-    // 而 "evilgoogle.com"、"google.com.evil.com" 返回 false。
+
+    // 严格的"标签边界后缀匹配"
     private fun isSubdomainOf(domain: String, base: String): Boolean {
         if (domain == base) return true
         // 必须以 ".base" 结尾，确保标签边界
         return domain.endsWith(".$base")
     }
+
     private val directIPs = HashSet<Int>()
     private val directMutex = Mutex()
 
@@ -160,12 +287,12 @@ class DNSInterceptor {
         }
     }
 
-    // 主查询方法：优先使用 DoH
-    private fun queryOverUpstreams(query: ByteArray): ByteArray? {
-        // 首先尝试 DoH
+    // 主查询方法：优先使用 DoH（带缓存）
+    private suspend fun queryOverUpstreams(query: ByteArray): ByteArray? {
+        // 首先尝试 DoH（内部会先检查缓存）
         val dohResult = queryViaDoH(query)
         if (dohResult != null) {
-            Log.d(LOG_TAG, "DoH query successful")
+            Log.d(LOG_TAG, "DoH query successful (possibly from cache)")
             return dohResult
         }
 
@@ -174,8 +301,41 @@ class DNSInterceptor {
         return queryViaTraditionalTCP(query)
     }
 
-    // DNS-over-HTTPS 实现
-    private fun queryViaDoH(query: ByteArray): ByteArray? {
+    // DNS-over-HTTPS 实现（带缓存）
+    private suspend fun queryViaDoH(query: ByteArray): ByteArray? {
+        // 生成缓存键
+        val cacheKey = generateCacheKey(query)
+
+        // 提取原始查询的 Transaction ID
+        val originalId = if (query.size >= 2) {
+            ((query[0].toInt() and 0xff) shl 8) or (query[1].toInt() and 0xff)
+        } else {
+            0
+        }
+
+        // 先检查缓存
+        dnsCacheMutex.withLock {
+            dnsCache[cacheKey]?.let { entry ->
+                if (!entry.isExpired()) {
+                    Log.d(LOG_TAG, "DNS cache hit for query")
+                    // 更新响应中的 Transaction ID 以匹配当前查询
+                    return updateTransactionId(entry.response, originalId)
+                } else {
+                    // 删除过期条目
+                    dnsCache.remove(cacheKey)
+                    Log.d(LOG_TAG, "DNS cache expired, removing entry")
+                }
+            }
+        }
+
+        // 缓存未命中，执行实际的 DoH 查询
+        Log.d(LOG_TAG, "DNS cache miss, performing DoH query")
+
+        // 定期清理过期缓存
+        if (dnsCache.size > MAX_CACHE_SIZE / 2) {
+            cleanupExpiredCache()
+        }
+
         val providers = listOf(
             "https://1.1.1.1/dns-query",
             "https://cloudflare-dns.com/dns-query",
@@ -188,7 +348,6 @@ class DNSInterceptor {
             try {
                 Log.d(LOG_TAG, "Trying DoH POST to: $provider")
 
-                // 使用新的 API
                 val requestBody = query.toRequestBody("application/dns-message".toMediaType())
 
                 val request = Request.Builder()
@@ -200,15 +359,25 @@ class DNSInterceptor {
 
                 val response = httpClient.newCall(request).execute()
                 if (response.isSuccessful) {
-                    // 使用新的属性访问方式
                     val responseBytes = response.body?.bytes()
                     response.close()
                     if (responseBytes != null) {
                         Log.d(LOG_TAG, "DoH POST successful from $provider")
+
+                        // 将响应存入缓存
+                        val ttl = extractTTLFromResponse(responseBytes)
+                        dnsCacheMutex.withLock {
+                            dnsCache[cacheKey] = DNSCacheEntry(
+                                response = responseBytes,
+                                timestamp = System.currentTimeMillis(),
+                                ttl = ttl
+                            )
+                            Log.d(LOG_TAG, "Cached DNS response with TTL: ${ttl}ms")
+                        }
+
                         return responseBytes
                     }
                 } else {
-                    // 使用新的属性访问方式
                     Log.w(LOG_TAG, "DoH POST failed with code ${response.code} from $provider")
                     response.close()
                 }
@@ -237,15 +406,25 @@ class DNSInterceptor {
 
                 val response = httpClient.newCall(request).execute()
                 if (response.isSuccessful) {
-                    // 使用新的属性访问方式
                     val responseBytes = response.body?.bytes()
                     response.close()
                     if (responseBytes != null) {
                         Log.d(LOG_TAG, "DoH GET successful from $provider")
+
+                        // 将响应存入缓存
+                        val ttl = extractTTLFromResponse(responseBytes)
+                        dnsCacheMutex.withLock {
+                            dnsCache[cacheKey] = DNSCacheEntry(
+                                response = responseBytes,
+                                timestamp = System.currentTimeMillis(),
+                                ttl = ttl
+                            )
+                            Log.d(LOG_TAG, "Cached DNS response with TTL: ${ttl}ms")
+                        }
+
                         return responseBytes
                     }
                 } else {
-                    // 使用新的属性访问方式
                     Log.w(LOG_TAG, "DoH GET failed with code ${response.code} from $provider")
                     response.close()
                 }
@@ -325,10 +504,8 @@ class DNSInterceptor {
         }
     }
 
-    // 以下所有方法保持不变...
     private val mutex = Mutex()
 
-    // Change from private to public
     fun shouldBypass(domain: String): Boolean {
         val d = normalizeDomain(domain)
         bypassCache[d]?.let { return it }
