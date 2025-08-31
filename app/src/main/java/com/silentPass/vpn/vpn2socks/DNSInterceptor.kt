@@ -79,32 +79,28 @@ class DNSInterceptor private constructor() {
         val instanceId = System.identityHashCode(this)
         Log.d(LOG_TAG, "DNSInterceptor instance created: $instanceId")
 
-        // Mark as initialized immediately to avoid blocking
+        // Mark as initialized immediately
         initialized = true
         signalReady()
 
-        // Do actual initialization in background thread
+        // Only try socket protection if we're using DoH
         Thread {
-            var attempts = 0
-            while (attempts < 20) {
-                try {
-                    val testSocket = Socket()
-                    val protected = Vpn2SocksService.protectSocket(testSocket)
-                    testSocket.close()
+            // Give VPN time to establish
+            Thread.sleep(500)
 
-                    if (protected) {
-                        Log.d(LOG_TAG, "DNSInterceptor socket protection successful")
-                        break
-                    }
-                } catch (e: Exception) {
-                    // Continue trying
+            // Try once to verify socket protection is working
+            try {
+                val testSocket = Socket()
+                val protected = Vpn2SocksService.protectSocket(testSocket)
+                testSocket.close()
+
+                if (protected) {
+                    Log.d(LOG_TAG, "Socket protection verified")
+                } else {
+                    Log.d(LOG_TAG, "Socket protection not available (may be using SOCKS)")
                 }
-                Thread.sleep(100)
-                attempts++
-            }
-
-            if (attempts >= 20) {
-                Log.w(LOG_TAG, "DNSInterceptor socket protection failed after 20 attempts")
+            } catch (e: Exception) {
+                Log.d(LOG_TAG, "Socket protection check failed: ${e.message}")
             }
         }.start()
     }
