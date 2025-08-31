@@ -123,6 +123,7 @@ class ConnectionManager(
             while (isActive) {
                 delay(30_000)
                 cleanupClosedConnections()
+                SocketPool.cleanup()  // 添加Socket池清理
                 // 顺便 flush 所有 DNS 聚合尾窗，避免长期不活动时残留
                 dnsAggMap.keys.forEach { flushDnsAggIfIdle(it) }
             }

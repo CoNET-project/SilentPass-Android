@@ -12,26 +12,44 @@ import java.nio.ByteBuffer
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import javax.net.SocketFactory
+import java.io.IOException
 
-class DNSInterceptor {
+class DNSInterceptor private constructor() {
 
 	companion object {
+
+        fun getInstance(): DNSInterceptor {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: DNSInterceptor().also {
+                    INSTANCE = it
+                    Log.d("DNSInterceptor", "Created singleton instance")
+                }
+            }
+        }
+
+        @Volatile
+        private var INSTANCE: DNSInterceptor? = null
 		private val initGate = java.util.concurrent.CountDownLatch(1)
 		private val initDone = java.util.concurrent.atomic.AtomicBoolean(false)
 		private val lastInitWarnAt = java.util.concurrent.atomic.AtomicLong(0L)
 		fun signalReady() {
 			if (initDone.compareAndSet(false, true)) initGate.countDown()
 		}
+
 		fun awaitReady(timeoutMs: Long): Boolean {
-			if (initDone.get()) return true
-			return try { initGate.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS) } catch (_: InterruptedException) { false }
+            if (initDone.get()) return true
+            return try {
+                initGate.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+            } catch (_: InterruptedException) {
+                false
+            }
 		}
 		fun throttledInitWarn(msg: String) {
-			val now = System.currentTimeMillis()
-			val prev = lastInitWarnAt.get()
-			if (now - prev >= 1000L && lastInitWarnAt.compareAndSet(prev, now)) {
-				android.util.Log.w("DNSInterceptor", msg)
-			}
+            val now = System.currentTimeMillis()
+            val prev = lastInitWarnAt.get()
+            if (now - prev >= 1000L && lastInitWarnAt.compareAndSet(prev, now)) {
+                android.util.Log.w("DNSInterceptor", msg)
+            }
 		}
 	}
 
@@ -57,33 +75,37 @@ class DNSInterceptor {
     private val MAX_CACHE_SIZE = 1000 // 最大缓存条目数
 
     init {
-        // 等待 VPN 服务就绪
+
+        val instanceId = System.identityHashCode(this)
+        Log.d(LOG_TAG, "DNSInterceptor instance created: $instanceId")
+
+        // Mark as initialized immediately to avoid blocking
+        initialized = true
+        signalReady()
+
+        // Do actual initialization in background thread
         Thread {
             var attempts = 0
-            while (!initialized && attempts < 20) {
+            while (attempts < 20) {
                 try {
-                    // 测试创建一个 socket 看是否能保护
                     val testSocket = Socket()
                     val protected = Vpn2SocksService.protectSocket(testSocket)
                     testSocket.close()
 
                     if (protected) {
-                        initialized = true
-                        Log.d(LOG_TAG, "DNSInterceptor initialized successfully")
-                    } else {
-                        Thread.sleep(100)
-                        attempts++
+                        Log.d(LOG_TAG, "DNSInterceptor socket protection successful")
+                        break
                     }
                 } catch (e: Exception) {
-                    Thread.sleep(100)
-                    attempts++
+                    // Continue trying
                 }
+                Thread.sleep(100)
+                attempts++
             }
 
-            if (!initialized) {
-                Log.e(LOG_TAG, "DNSInterceptor initialization timeout")
+            if (attempts >= 20) {
+                Log.w(LOG_TAG, "DNSInterceptor socket protection failed after 20 attempts")
             }
-
         }.start()
     }
 
@@ -208,6 +230,8 @@ class DNSInterceptor {
         "conet.network",
         "silentpass.io",
         "openpgp.online",
+        "comm100vue.com",
+        "comm100.io",
         // Apple Push 相关
         "conet.network",
         "apple.com",
@@ -310,40 +334,33 @@ class DNSInterceptor {
     // 自定义 SocketFactory 确保 socket 被保护
     inner class ProtectedSocketFactory : SocketFactory() {
         override fun createSocket(): Socket {
-            val socket = Socket()
+            val socket = SocketPool.acquire()  // 使用池
 
-            // 设置 socket 选项以便更好地保护
             try {
                 socket.tcpNoDelay = true
                 socket.keepAlive = false
                 socket.reuseAddress = false
-            } catch (e: Exception) {
-                Log.w(LOG_TAG, "Failed to set socket options: ${e.message}")
-            }
 
-            // 尝试保护 socket，带重试机制
-            var protected = false
-            var attempts = 0
-            val maxAttempts = 5
-
-            while (!protected && attempts < maxAttempts) {
-                protected = Vpn2SocksService.protectSocket(socket)
-                if (!protected) {
-                    attempts++
-                    if (attempts < maxAttempts) {
-                        Log.w(LOG_TAG, "Socket protection attempt $attempts failed, retrying...")
-                        Thread.sleep(100L * attempts) // 递增延迟
+                var protected = false
+                var attempts = 0
+                while (!protected && attempts < 3) {  // 减少重试次数
+                    protected = Vpn2SocksService.protectSocket(socket)
+                    if (!protected) {
+                        attempts++
+                        Thread.sleep(50L * attempts)
                     }
                 }
-            }
 
-            if (!protected) {
-                Log.e(LOG_TAG, "Failed to protect DNS socket after $maxAttempts attempts")
-                // 可选：抛出异常阻止未保护的连接
-                // throw IOException("Cannot create protected socket for DNS")
-            }
+                if (!protected) {
+                    SocketPool.release(socket)  // 失败时归还
+                    throw java.io.IOException("Cannot protect socket")  // 修正：添加java.io.
+                }
 
-            return socket
+                return socket
+            } catch (e: Exception) {
+                SocketPool.release(socket)  // 异常时归还
+                throw e
+            }
         }
 
         override fun createSocket(host: String?, port: Int): Socket {
@@ -449,32 +466,33 @@ class DNSInterceptor {
                     .addHeader("Content-Type", "application/dns-message")
                     .build()
 
-                val response = httpClient.newCall(request).execute()
-                if (response.isSuccessful) {
-                    protectedQueries.incrementAndGet()
-                    val responseBytes = response.body?.bytes()
-                    response.close()
-                    if (responseBytes != null) {
-                        Log.d(LOG_TAG, "DoH POST successful from $provider")
+                httpClient.newCall(request).execute().use { response ->
+					if (response.isSuccessful) {
+						protectedQueries.incrementAndGet()
+						val responseBytes = response.body?.bytes()
+						
+						if (responseBytes != null) {
+							Log.d(LOG_TAG, "DoH POST successful from $provider")
 
-                        // 将响应存入缓存
-                        val ttl = extractTTLFromResponse(responseBytes)
-                        dnsCacheMutex.withLock {
-                            dnsCache[cacheKey] = DNSCacheEntry(
-                                response = responseBytes,
-                                timestamp = System.currentTimeMillis(),
-                                ttl = ttl
-                            )
-                            Log.d(LOG_TAG, "Cached DNS response with TTL: ${ttl}ms")
-                        }
+							// 将响应存入缓存
+							val ttl = extractTTLFromResponse(responseBytes)
+							dnsCacheMutex.withLock {
+								dnsCache[cacheKey] = DNSCacheEntry(
+									response = responseBytes,
+									timestamp = System.currentTimeMillis(),
+									ttl = ttl
+								)
+								Log.d(LOG_TAG, "Cached DNS response with TTL: ${ttl}ms")
+							}
 
-                        return responseBytes
-                    }
-                } else {
-                    unprotectedQueries.incrementAndGet()
-                    Log.w(LOG_TAG, "DoH POST failed with code ${response.code} from $provider")
-                    response.close()
-                }
+							return responseBytes
+						}
+					} else {
+						unprotectedQueries.incrementAndGet()
+						Log.w(LOG_TAG, "DoH POST failed with code ${response.code} from $provider")
+						response.close()
+					}
+				}
             } catch (e: Exception) {
                 Log.e(LOG_TAG, "DoH POST error for $provider: ${e.message}")
             }
@@ -529,6 +547,10 @@ class DNSInterceptor {
 
         return null
     }
+
+
+
+
 
 
 

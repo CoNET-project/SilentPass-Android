@@ -16,6 +16,11 @@ import java.net.Socket
 class Vpn2SocksService : VpnService() {
 
     companion object {
+
+        private var vpnInterface: ParcelFileDescriptor? = null
+
+
+
         const val ACTION_START_VPN = "com.silentPass.vpn.ACTION_START_VPN"
         const val ACTION_STOP_VPN = "com.silentPass.vpn.ACTION_STOP_VPN"
         const val EXTRA_SOCKS_HOST = "socks_host"
@@ -27,13 +32,20 @@ class Vpn2SocksService : VpnService() {
 
         @JvmStatic
         fun protectSocket(sock: Socket): Boolean {
-            if (!protectionEnabled) {
-                // Try once
-                val result = instance?.protect(sock) ?: false
-                if (result) protectionEnabled = true
-                return result
+            // Check if VPN service instance is available
+            val service = instance
+            if (service == null) {
+                Log.w("Vpn2SocksService", "VPN service not available")
+                return false
             }
-            return instance?.protect(sock) ?: false
+
+            // Try to protect the socket
+            return try {
+                service.protect(sock)
+            } catch (e: Exception) {
+                Log.e("Vpn2SocksService", "Failed to protect socket: ${e.message}")
+                false
+            }
         }
 
         @JvmStatic
@@ -118,13 +130,10 @@ class Vpn2SocksService : VpnService() {
 
         val builder = Builder()
             .setSession("SilentPass VPN")
-            // 建议：仍用 172.16.0.1 作为虚拟地址（保持你当前实现）
             .addAddress("172.16.0.1", 32)
-            // 把系统 DNS 指向我们的 FakeDNS
             .addDnsServer(fakeDns)
-            // ★ 关键：只路由 FakeDNS 主机 & Fake-IP 段，去掉 0.0.0.0/0 和 ::/0
-            .addRoute(fakeDns, 32)         // 确保到 172.16.0.2 的 DNS 查询走 TUN
-            .addRoute("198.18.0.0", 15)    // 只让 Fake-IP 段进 TUN
+            .addRoute(fakeDns, 32)
+            .addRoute("198.18.0.0", 15)
             .setMtu(1500)
 
         try {
@@ -138,12 +147,16 @@ class Vpn2SocksService : VpnService() {
         tunFd = builder.establish()
         requireNotNull(tunFd) { "Failed to establish VPN" }
 
-        // 在 VPN 建立后再初始化 DNS
-        dns = DNSInterceptor()
+        // Store the VPN interface
+        vpnInterface = tunFd
+
+        // Now create DNSInterceptor (VPN is ready)
+        dns = DNSInterceptor.getInstance()
+
+        // Wait briefly for DNS to be ready
+        DNSInterceptor.awaitReady(500)
 
         packetIO = TunPacketIO(tunFd!!)
-
-
 
         connMgr = ConnectionManager(
             mtu = 1500,
@@ -153,8 +166,7 @@ class Vpn2SocksService : VpnService() {
             socksEndpoint = SocksEndpoint(socksHost, socksPort)
         )
 
-
-
+        Log.d("Vpn2SocksService", "VPN service initialized with single DNSInterceptor instance")
 
         scope.launch { packetPump() }
     }

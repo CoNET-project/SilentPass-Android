@@ -9,11 +9,13 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentSkipListMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.random.Random
+import java.util.concurrent.atomic.AtomicInteger
 
 class TCPConnection(
     private val key: String,
@@ -53,6 +55,16 @@ class TCPConnection(
         var ackedPackets: Long = 0,
         var duplicateAcks: Long = 0
     )
+
+    private var resolvedDomain: String? = null
+
+    private fun getDisplayKey(): String {
+        return if (resolvedDomain != null) {
+            "$key ($resolvedDomain)"  // Use 'key' directly, not getDisplayKey()
+        } else {
+            key
+        }
+    }
 
     private val stats = ConnectionStats()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -138,11 +150,13 @@ class TCPConnection(
     // =============== SACK Support ===============
     private data class SackBlock(val start: Long, val end: Long)
 
+    private val outOfOrderSyncLock = Any()
     private fun generateSackBlocks(): List<SackBlock> {
         val blocks = mutableListOf<SackBlock>()
         var currentStart: Long? = null
         var currentEnd: Long? = null
 
+        // ConcurrentSkipListMap is thread-safe for iteration
         outOfOrderSegments.forEach { (seq, segment) ->
             val segEnd = seq + segment.data.size.toLong()
 
@@ -150,10 +164,8 @@ class TCPConnection(
                 currentStart = seq
                 currentEnd = segEnd
             } else if (seq == currentEnd) {
-                // Contiguous segment
                 currentEnd = segEnd
             } else {
-                // Gap found, save current block
                 blocks.add(SackBlock(currentStart!!, currentEnd!!))
                 currentStart = seq
                 currentEnd = segEnd
@@ -164,7 +176,7 @@ class TCPConnection(
             blocks.add(SackBlock(currentStart!!, currentEnd!!))
         }
 
-        return blocks.take(3)  // TCP allows max 3 SACK blocks
+        return blocks.take(3)
     }
 
     private fun buildSackOption(blocks: List<SackBlock>): ByteArray {
@@ -214,7 +226,7 @@ class TCPConnection(
                         val length = tcp.raw[optionsStart + i + 1].toInt() and 0xFF
                         if (length == 2) {
                             peerSupportsSack = true
-                            Log.d(LOG_TAG, "Peer supports SACK for $key")
+                            Log.d(LOG_TAG, "Peer supports SACK for ${getDisplayKey()}")
                         }
                         i += length
                     } else {
@@ -311,8 +323,8 @@ class TCPConnection(
     )
 
     private val outOfOrderLock = Mutex()
-    private val outOfOrderSegments = TreeMap<Long, Segment>()
-    private var oooBufferSize = 0
+    private val outOfOrderSegments = ConcurrentSkipListMap<Long, Segment>()
+    private var oooBufferSize = AtomicInteger(0)
     private val maxOooBufferSize = 256 * 1024  // 256KB max
 
     // =============== Upstream Connection ===============
@@ -355,13 +367,13 @@ class TCPConnection(
 
     private suspend fun processPacket(ip: IPv4Packet, tcp: TCPSegment) {
         if (isClosed) {
-            Log.w(LOG_TAG, "Connection already closed for $key")
+            Log.w(LOG_TAG, "Connection already closed for ${getDisplayKey()}")
             return
         }
 
         // RST handling
         if (tcp.isRST) {
-            Log.d(LOG_TAG, "RST received for $key")
+            Log.d(LOG_TAG, "RST received for ${getDisplayKey()}")
             closeConnection()
             return
         }
@@ -396,7 +408,7 @@ class TCPConnection(
 
         // FIN before establishment
         if (tcp.isFIN) {
-            Log.d(LOG_TAG, "FIN received before establishment for $key")
+            Log.d(LOG_TAG, "FIN received before establishment for ${getDisplayKey()}")
             clientNextSeq = (clientNextSeq + 1L) and 0xFFFFFFFFL
             sendAckWithSack(ip, tcp, immediate = true)
             closeConnection()
@@ -411,6 +423,8 @@ class TCPConnection(
 
     private suspend fun handleSyn(ip: IPv4Packet, tcp: TCPSegment) {
         val domain = dns.lookupDomain(ip.dst)
+        resolvedDomain = domain  // Store the domain
+
         clientSeq0 = tcp.seq.toLong() and 0xFFFFFFFFL
         clientNextSeq = (clientSeq0!! + 1L) and 0xFFFFFFFFL
 
@@ -435,7 +449,7 @@ class TCPConnection(
         packetWriter(listOf(synAck), listOf(ConnectionManager.PROTO_IPV4))
         serverSeq = (serverSeq + 1L) and 0xFFFFFFFFL
 
-        Log.d(LOG_TAG, "Sent SYN-ACK with MSS=$MSS and SACK-Permitted=$weSupportSack for $key")
+        Log.d(LOG_TAG, "Sent SYN-ACK with MSS=$MSS and SACK-Permitted=$weSupportSack for ${getDisplayKey()}")
     }
 
     private suspend fun handleHandshakeAck(ip: IPv4Packet, tcp: TCPSegment) {
@@ -445,7 +459,7 @@ class TCPConnection(
                 handshakeAcked = true
                 phase = Phase.HANDSHAKE_ACKED
             }
-            Log.d(LOG_TAG, "3-way handshake established for $key (SACK enabled: $peerSupportsSack)")
+            Log.d(LOG_TAG, "3-way handshake established for ${getDisplayKey()} (SACK enabled: $peerSupportsSack)")
 
             flushPreHandshakeBuffer()
             tryStartDownstream(ip, tcp)
@@ -492,7 +506,7 @@ class TCPConnection(
     }
 
     private suspend fun handleInOrderPacket(ip: IPv4Packet, tcp: TCPSegment, segEnd: Long) {
-        Log.d(LOG_TAG, "Client->Server (in-order): ${tcp.payload.size} bytes for $key")
+        Log.d(LOG_TAG, "Client->Server (in-order): ${tcp.payload.size} bytes for ${getDisplayKey()}")
 
         clientNextSeq = segEnd
         // Keep using onAck to throttle upstream write pacing heuristically.
@@ -521,14 +535,14 @@ class TCPConnection(
 
         if (isSeqBefore(segEnd, expect)) {
             // Complete duplicate
-            Log.d(LOG_TAG, "Duplicate segment seq=$segSeq expect=$expect for $key")
+            Log.d(LOG_TAG, "Duplicate segment seq=$segSeq expect=$expect for ${getDisplayKey()}")
             congestionControl.onDuplicateAck()
             sendAckWithSack(ip, tcp, immediate = true)
         } else {
             // Partial retransmission with new data
             val overlap = (expect - segSeq).toInt()
             val newData = tcp.payload.copyOfRange(overlap, tcp.payload.size)
-            Log.d(LOG_TAG, "Partial retrans: ${newData.size} new bytes for $key")
+            Log.d(LOG_TAG, "Partial retrans: ${newData.size} new bytes for ${getDisplayKey()}")
 
             clientNextSeq = (expect + newData.size) and 0xFFFFFFFFL
             pendingLock.withLock {
@@ -544,20 +558,17 @@ class TCPConnection(
     private suspend fun handleOutOfOrderPacket(ip: IPv4Packet, tcp: TCPSegment, segSeq: Long) {
         val gap = segSeq - clientNextSeq
 
-        // Don't wait for small gaps - they'll likely arrive soon
         if (gap < 3 * MSS) {
-            // Just buffer it without sending immediate SACK
-            outOfOrderLock.withLock {
-                if (!outOfOrderSegments.containsKey(segSeq)) {
-                    outOfOrderSegments[segSeq] = Segment(
-                        tcp.payload.copyOf(),
-                        timestamp = System.currentTimeMillis()
-                    )
-                    oooBufferSize += tcp.payload.size
-                    stats.outOfOrderPackets++
-                }
+            // Thread-safe put-if-absent
+            val newSegment = Segment(
+                tcp.payload.copyOf(),
+                timestamp = System.currentTimeMillis()
+            )
+
+            if (outOfOrderSegments.putIfAbsent(segSeq, newSegment) == null) {
+                oooBufferSize.addAndGet(tcp.payload.size)  // Note: oooBufferSize should be AtomicInteger
+                stats.outOfOrderPackets++
             }
-            // Don't send immediate ACK for small gaps
             return
         }
 
@@ -574,22 +585,20 @@ class TCPConnection(
             return
         }
 
-        outOfOrderLock.withLock {
-            if (oooBufferSize > maxOooBufferSize * 0.8) {
-                cleanOldSegments(aggressiveClean = true)
-            }
+        // Clean old segments if needed
+        if (oooBufferSize.get() > maxOooBufferSize * 0.8) {
+            cleanOldSegments(aggressiveClean = true)
+        }
 
-            if (!outOfOrderSegments.containsKey(segSeq)) {
-                outOfOrderSegments[segSeq] = Segment(
-                    tcp.payload.copyOf(),
-                    timestamp = System.currentTimeMillis()
-                )
-                oooBufferSize += tcp.payload.size
-                stats.outOfOrderPackets++
+        val newSegment = Segment(
+            tcp.payload.copyOf(),
+            timestamp = System.currentTimeMillis()
+        )
 
-                // Only send immediate SACK for larger gaps
-                sendAckWithSack(ip, tcp, immediate = true)
-            }
+        if (outOfOrderSegments.putIfAbsent(segSeq, newSegment) == null) {
+            oooBufferSize.addAndGet(tcp.payload.size)
+            stats.outOfOrderPackets++
+            sendAckWithSack(ip, tcp, immediate = true)
         }
     }
 
@@ -602,7 +611,7 @@ class TCPConnection(
         }
 
         expired.forEach { entry ->
-            oooBufferSize -= entry.value.data.size
+            oooBufferSize.addAndGet(-entry.value.data.size)
             outOfOrderSegments.remove(entry.key)
             Log.d(LOG_TAG, "Cleaned expired segment seq=${entry.key}")
         }
@@ -611,13 +620,15 @@ class TCPConnection(
     private suspend fun deliverBufferedSegments() {
         var delivered = 0
 
-        outOfOrderLock.withLock {
-            while (outOfOrderSegments.isNotEmpty()) {
-                val entry = outOfOrderSegments.firstEntry()
+        while (outOfOrderSegments.isNotEmpty()) {
+            val entry = outOfOrderSegments.firstEntry()
 
-                if (entry.key == clientNextSeq) {
-                    outOfOrderSegments.pollFirstEntry()
-                    oooBufferSize -= entry.value.data.size
+            if (entry == null) break
+
+            if (entry.key == clientNextSeq) {
+                // Remove and process
+                if (outOfOrderSegments.remove(entry.key, entry.value)) {
+                    oooBufferSize.addAndGet(-entry.value.data.size)
 
                     val segEnd = (entry.key + entry.value.data.size.toLong()) and 0xFFFFFFFFL
                     clientNextSeq = segEnd
@@ -628,44 +639,45 @@ class TCPConnection(
 
                     delivered++
                     Log.d(LOG_TAG, "Delivered buffered segment seq=${entry.key}, ${entry.value.data.size} bytes")
-                } else if (isSeqBefore(entry.key, clientNextSeq)) {
-                    val overlap = (clientNextSeq - entry.key).toInt()
-                    if (overlap < entry.value.data.size) {
-                        val newData = entry.value.data.copyOfRange(overlap, entry.value.data.size)
-                        clientNextSeq = (clientNextSeq + newData.size.toLong()) and 0xFFFFFFFFL
-
-                        pendingLock.withLock {
-                            pending.addLast(newData)
-                        }
-                        delivered++
-                    }
-                    outOfOrderSegments.pollFirstEntry()
-                    oooBufferSize -= entry.value.data.size
-                } else {
-                    break
                 }
+            } else if (isSeqBefore(entry.key, clientNextSeq)) {
+                // Handle overlap
+                val overlap = (clientNextSeq - entry.key).toInt()
+                if (overlap < entry.value.data.size) {
+                    val newData = entry.value.data.copyOfRange(overlap, entry.value.data.size)
+                    clientNextSeq = (clientNextSeq + newData.size.toLong()) and 0xFFFFFFFFL
+
+                    pendingLock.withLock {
+                        pending.addLast(newData)
+                    }
+                    delivered++
+                }
+                outOfOrderSegments.remove(entry.key)
+                oooBufferSize.addAndGet(-entry.value.data.size)
+            } else {
+                break
             }
         }
 
         if (delivered > 0) {
-            Log.d(LOG_TAG, "Delivered $delivered buffered segments for $key")
+            Log.d(LOG_TAG, "Delivered $delivered buffered segments for ${getDisplayKey()}")
             tryFlushUpstream()
         }
     }
 
     // =============== Delayed ACK with SACK support ===============
     private fun scheduleAckFlush(ip: IPv4Packet, tcp: TCPSegment) {
-        ackFlushJob?.cancel() // Cancel previous timer
+        ackFlushJob?.cancel()
         ackFlushJob = scope.launch {
             delay(DELAYED_ACK_MS)
-            emitAck(ip, tcp)
+            emitAck(ip, tcp)  // This is now a suspend function
         }
     }
 
     private fun emitAck(ip: IPv4Packet, tcp: TCPSegment) {
         // Build SACK options if we have out-of-order segments and peer supports SACK
         val tcpOptions = if (peerSupportsSack && outOfOrderSegments.isNotEmpty()) {
-            val sackBlocks = generateSackBlocks()
+            val sackBlocks = generateSackBlocks()  // Now properly synchronized
             if (sackBlocks.isNotEmpty()) {
                 Log.d(LOG_TAG, "Sending SACK blocks: ${sackBlocks.joinToString()}")
                 buildSackOption(sackBlocks)
@@ -699,9 +711,15 @@ class TCPConnection(
     ) {
         val now = System.currentTimeMillis()
 
-        // For out-of-order segments or duplicates, always send immediately with SACK
+
+        // Check out-of-order segments safely
+        val hasOutOfOrder = outOfOrderLock.withLock {
+            outOfOrderSegments.isNotEmpty()
+        }
+
         val shouldSendImmediate = immediate ||
-                (peerSupportsSack && outOfOrderSegments.isNotEmpty())
+                (peerSupportsSack && hasOutOfOrder)
+
 
         if (!shouldSendImmediate) {
             if ((now - lastAckTime < DELAYED_ACK_MS) && pendingAckCount < MAX_PENDING_ACKS) {
@@ -717,9 +735,11 @@ class TCPConnection(
     }
 
     private fun calcAdvertisedWindow(): Int {
-        // Simple receive window autotuning based on pending + OOO buffers
-        val pendingBytes = runBlocking { pendingLock.withLock { pending.sumOf { it.size } } }
-        val oooBytes = oooBufferSize
+        // Use regular synchronization for pending, not runBlocking in synchronized
+        val pendingBytes = synchronized(pending) {
+            pending.sumOf { it.size }
+        }
+        val oooBytes = oooBufferSize.get()
         val used = min(MAX_PENDING_BYTES, pendingBytes + oooBytes)
         val free = (MAX_PENDING_BYTES - used).coerceAtLeast(0)
         val win = free.coerceIn(MIN_ADV_WINDOW, MAX_ADV_WINDOW)
@@ -730,7 +750,7 @@ class TCPConnection(
         preHandshakeLock.withLock {
             if (preHandshakeBuf.size() + data.size <= 32 * 1024) {
                 preHandshakeBuf.write(data)
-                Log.d(LOG_TAG, "Buffered pre-handshake ${data.size}B for $key")
+                Log.d(LOG_TAG, "Buffered pre-handshake ${data.size}B for ${getDisplayKey()}")
             }
         }
     }
@@ -744,14 +764,14 @@ class TCPConnection(
                     pending.addLast(data)
                 }
                 clientNextSeq = (clientNextSeq + data.size) and 0xFFFFFFFFL
-                Log.d(LOG_TAG, "Flushed pre-handshake ${data.size}B for $key")
+                Log.d(LOG_TAG, "Flushed pre-handshake ${data.size}B for ${getDisplayKey()}")
             }
         }
         tryFlushUpstream()
     }
 
     private suspend fun handleFIN(ip: IPv4Packet, tcp: TCPSegment) {
-        Log.d(LOG_TAG, "FIN received for $key (client half-close)")
+        Log.d(LOG_TAG, "FIN received for ${getDisplayKey()} (client half-close)")
         clientNextSeq = (clientNextSeq + 1L) and 0xFFFFFFFFL
         sendAckWithSack(ip, tcp, immediate = true)
 
@@ -765,20 +785,26 @@ class TCPConnection(
     }
 
     private suspend fun establishUpstream(ip: IPv4Packet, syn: TCPSegment, domain: String?) = withContext(Dispatchers.IO) {
+        var socket: Socket? = null
+        var pooledSocket = false  // 标记是否从池中获取
+
         try {
             val port = syn.dstPort
             val hostForDial = domain ?: ip.dst.toString()
 
             Log.d(LOG_TAG, "Establishing upstream to $hostForDial:$port")
 
-            val socket = if (bypassDirect) {
-                Socket().apply {
+            socket = if (bypassDirect) {
+                // 直连模式使用池管理
+                pooledSocket = true
+                SocketPool.acquire().apply {
                     tcpNoDelay = true
-                    soTimeout = 200  // ensure reader.read() wakes up
+                    soTimeout = 200
                     Vpn2SocksService.protectSocket(this)
                     connect(InetSocketAddress(hostForDial, port), 15000)
                 }
             } else {
+                // SOCKS模式不使用池（因为SocksClient内部创建Socket）
                 SocksClient(socksEndpoint).dial(hostForDial, port).apply {
                     tcpNoDelay = true
                     soTimeout = 200
@@ -794,12 +820,18 @@ class TCPConnection(
                 phase = Phase.SOCKS_PRIMED
             }
 
-            Log.d(LOG_TAG, "Upstream established for $key")
+            Log.d(LOG_TAG, "Upstream established for ${getDisplayKey()}")
 
             tryFlushUpstream()
             tryStartDownstream(ip, syn)
 
         } catch (e: Exception) {
+            // 只有池化的socket才归还
+            if (pooledSocket && socket != null) {
+                SocketPool.release(socket)
+            } else {
+                socket?.close()
+            }
             Log.e(LOG_TAG, "Upstream establishment failed: ${e.message}", e)
             closeConnection()
         }
@@ -826,7 +858,7 @@ class TCPConnection(
         val buffer = ByteArray(32 * 1024)
 
         try {
-            Log.d(LOG_TAG, "Downstream loop started for $key")
+            Log.d(LOG_TAG, "Downstream loop started for ${getDisplayKey()}")
 
             while (!isClosed) {
                 val n = try {
@@ -836,13 +868,13 @@ class TCPConnection(
                 }
 
                 if (n <= 0) {
-                    Log.i(LOG_TAG, "Downstream EOF for $key (server done sending)")
+                    Log.i(LOG_TAG, "Downstream EOF for ${getDisplayKey()} (server done sending)")
                     sendFinToClient(ip, tcp)
                     stateLock.withLock { phase = Phase.HALF_CLOSED_REMOTE }
                     break
                 }
 
-                Log.d(LOG_TAG, "Server->Client: $n bytes for $key")
+                Log.d(LOG_TAG, "Server->Client: $n bytes for ${getDisplayKey()}")
                 sendDataToClient(ip, tcp, buffer.copyOf(n))
             }
         } catch (e: Exception) {
@@ -890,7 +922,7 @@ class TCPConnection(
             window = calcAdvertisedWindow()
         )
         packetWriter(listOf(finPacket), listOf(ConnectionManager.PROTO_IPV4))
-        Log.d(LOG_TAG, "Sent FIN|ACK to client for $key")
+        Log.d(LOG_TAG, "Sent FIN|ACK to client for ${getDisplayKey()}")
     }
 
     private suspend fun tryFlushUpstream() = withContext(Dispatchers.IO) {
@@ -1004,13 +1036,33 @@ class TCPConnection(
             // Cancel delayed-ACK timer
             try { ackFlushJob?.cancel() } catch (_: Exception) {}
 
-            // Clean up resources
-            try { upstreamReader?.close() } catch (_: Exception) {}
-            try { upstreamWriter?.close() } catch (_: Exception) {}
-            try { upstream?.close() } catch (_: Exception) {}
+            // 改进的资源清理
+            try {
+                upstreamReader?.close()
+            } catch (_: Exception) {} finally {
+                upstreamReader = null
+            }
 
-            upstreamReader = null
-            upstreamWriter = null
+            try {
+                upstreamWriter?.close()
+            } catch (_: Exception) {} finally {
+                upstreamWriter = null
+            }
+
+            // 根据连接类型处理socket
+            upstream?.let { socket ->
+                try {
+                    if (bypassDirect) {
+                        // 直连模式的socket归还池
+                        SocketPool.release(socket)
+                    } else {
+                        // SOCKS模式直接关闭
+                        socket.close()
+                    }
+                } catch (e: Exception) {
+                    Log.w(LOG_TAG, "Error handling socket cleanup: ${e.message}")
+                }
+            }
             upstream = null
 
             stateLock.withLock { phase = Phase.CLOSED }
