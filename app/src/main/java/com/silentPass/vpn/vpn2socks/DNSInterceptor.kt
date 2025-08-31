@@ -222,6 +222,281 @@ class DNSInterceptor private constructor() {
     private fun normalizeDomain(d: String): String =
         d.trim().trim('.').removePrefix("*.").removePrefix(".").lowercase()
 
+
+
+    // 广告域名的正则模式
+    private val adBlockPatterns = listOf(
+        Regex(""".*\.(doubleclick|googleadservices|googlesyndication|google-analytics|adsrvr|adnxs|pubmatic|criteo|casalemedia|openx|rubiconproject|taboola|outbrain|scorecardresearch|quantserve|demdex|krxd)\..*"""),
+        Regex("""^ad[sxvmn]?\d*[.-].*"""),
+        Regex("""^.*[.-]ad[sxvmn]?\d*[.-].*"""),
+        Regex("""^banner[sz]?[.-].*"""),
+        Regex("""^.*[.-]banner[sz]?[.-].*"""),
+        Regex("""^track(er|ing)?[.-].*"""),
+        Regex("""^.*[.-]track(er|ing)?[.-].*"""),
+        Regex("""^stat[sz]?[.-].*"""),
+        Regex("""^.*[.-]stat[sz]?[.-].*"""),
+        Regex("""^analytics?[.-].*"""),
+        Regex("""^.*[.-]analytics?[.-].*"""),
+        Regex("""^metric[sz]?[.-].*"""),
+        Regex("""^.*[.-]metric[sz]?[.-].*"""),
+        Regex("""^telemetry[.-].*"""),
+        Regex("""^.*[.-]telemetry[.-].*"""),
+        Regex("""^pixel[.-].*"""),
+        Regex("""^.*[.-]pixel[.-].*"""),
+        Regex("""^click[.-].*"""),
+        Regex("""^.*[.-]click[.-].*"""),
+        Regex("""^counter[.-].*"""),
+        Regex("""^.*[.-]counter[.-].*"""),
+        Regex("""^beacon[.-].*"""),
+        Regex("""^.*[.-]beacon[.-].*""")
+    )
+
+    // 广告和跟踪域名黑名单
+    private val adBlockDomains = setOf(
+        // Google Ads
+        "doubleclick.net",
+        "googleadservices.com",
+        "googlesyndication.com",
+        "googletagmanager.com",
+        "googletagservices.com",
+        "google-analytics.com",
+        "googleanalytics.com",
+        "adsystem.com",
+        "adsrvr.org",
+
+        // Facebook/Meta
+        "facebook-analytics.com",
+        "fbcdn.net",
+
+        // Amazon
+        "amazon-adsystem.com",
+        "amazontrust.com",
+
+        // Microsoft
+        "adsrvr.org",
+        "bing.com",
+        "msftconnecttest.com",
+
+        // 通用广告网络
+        "adsrvr.org",
+        "adnxs.com",
+        "adzerk.net",
+        "pubmatic.com",
+        "criteo.com",
+        "criteo.net",
+        "casalemedia.com",
+        "openx.net",
+        "rubiconproject.com",
+        "serving-sys.com",
+        "taboola.com",
+        "outbrain.com",
+        "media.net",
+        "yieldmo.com",
+        "3lift.com",
+        "indexexchange.com",
+        "sovrn.com",
+        "sharethrough.com",
+        "spotx.tv",
+        "springserve.com",
+        "tremor.io",
+        "tribalfusion.com",
+        "undertone.com",
+        "yieldlab.net",
+        "yieldmanager.com",
+        "zedo.com",
+        "zemanta.com",
+
+        // 分析和跟踪
+        "scorecardresearch.com",
+        "quantserve.com",
+        "imrworldwide.com",
+        "nielsen.com",
+        "alexa.com",
+        "hotjar.com",
+        "mouseflow.com",
+        "luckyorange.com",
+        "clicktale.com",
+        "demdex.net",
+        "krxd.net",
+        "bluekai.com",
+        "exelator.com",
+        "mathtag.com",
+        "turn.com",
+        "acuityplatform.com",
+        "adform.net",
+        "bidswitch.net",
+        "contextweb.com",
+        "districtm.io",
+        "emxdgt.com",
+        "gumgum.com",
+        "improve-digital.com",
+        "inmobi.com",
+        "loopme.com",
+        "mobfox.com",
+        "nexage.com",
+        "rhythmone.com",
+        "smaato.com",
+        "smartadserver.com",
+        "stroeer.io",
+        "teads.tv",
+        "triplelift.com",
+        "verizonmedia.com",
+        "vertamedia.com",
+        "video.io",
+        "viralize.com",
+        "weborama.com",
+        "widespace.com",
+
+        // 中国广告网络
+        "baidu.com",
+        "tanx.com",
+        "mediav.com",
+        "admaster.com.cn",
+        "dsp.com",
+        "vamaker.com",
+        "allyes.com",
+        "ipinyou.com",
+        "irs01.com",
+        "istreamsche.com",
+        "jusha.com",
+        "knet.cn",
+        "madserving.com",
+        "miaozhen.com",
+        "mmstat.com",
+        "moad.cn",
+        "mobaders.com",
+        "mydas.mobi",
+        "n.shifen.com",
+        "netease.gg",
+        "newrelic.com",
+        "nexac.com",
+        "ntalker.com",
+        "nylalobghyhirgh.com",
+        "o2omobi.com",
+        "oimagea2.ydstatic.com",
+        "optaim.com",
+        "optimix.asia",
+        "optimizely.com",
+        "overture.com",
+        "p0y.cn",
+        "pagead.l.google.com",
+        "pageadimg.l.google.com",
+        "pbcdn.com",
+        "pingdom.net",
+        "pixanalytics.com",
+        "ppjia55.com",
+        "punchbox.org",
+        "qchannel01.cn",
+        "qiyou.com",
+        "qtmojo.com",
+        "quantcount.com",
+
+        // 恶意软件和垃圾邮件
+        "2o7.net",
+        "omtrdc.net",
+        "everesttech.net",
+        "everest-tech.net",
+        "rubiconproject.com",
+        "adsafeprotected.com",
+        "adsymptotic.com",
+        "adtechjp.com",
+        "advertising.com",
+        "evidon.com",
+        "voicefive.com",
+        "buysellads.com",
+        "carbonads.com",
+        "cdn.ampproject.org",
+
+        // 更多跟踪器
+        "mixpanel.com",
+        "kissmetrics.com",
+        "segment.com",
+        "segment.io",
+        "keen.io",
+        "amplitude.com",
+        "appsflyer.com",
+        "branch.io",
+        "adjust.com",
+        "kochava.com",
+        "tenjin.io",
+        "singular.net",
+        "apptentive.com",
+        "appboy.com",
+        "braze.com",
+        "customer.io",
+        "intercom.io",
+        "drift.com",
+        "zendesk.com"
+    )
+
+    // 预处理黑名单（规范化）
+    private val adBlockNorm: Set<String> = adBlockDomains.map { normalizeDomain(it) }.toSet()
+
+    // 检查是否为广告域名
+    private fun isAdDomain(domain: String): Boolean {
+        val d = normalizeDomain(domain)
+
+        // 缓存检查（复用 bypassCache 的逻辑）
+        val cacheKey = "ad:$d"
+        bypassCache[cacheKey]?.let { return it }
+
+        // 精确匹配
+        if (adBlockNorm.contains(d)) {
+            bypassCache[cacheKey] = true
+            return true
+        }
+
+        // 检查是否为子域名
+        for (adDomain in adBlockNorm) {
+            if (isSubdomainOf(d, adDomain)) {
+                bypassCache[cacheKey] = true
+                return true
+            }
+        }
+
+        // 正则模式匹配
+        val matched = adBlockPatterns.any { pattern ->
+            pattern.matches(d)
+        }
+
+        bypassCache[cacheKey] = matched
+        return matched
+    }
+
+    // 构建 NXDOMAIN 响应
+    private fun buildNXDomainResponse(id: Int, query: ByteArray): ByteArray {
+        val out = ByteArrayOutputStream()
+
+        // Header
+        out.write(byteArrayOf((id shr 8).toByte(), (id and 0xff).toByte()))
+
+        // Flags: QR=1, OPCODE=0, AA=1, TC=0, RD=1, RA=1, Z=0, RCODE=3 (NXDOMAIN)
+        val rd = (query[2].toInt() and 0x01)
+        val flHigh = 0x81 or (rd shl 0)  // QR=1, OPCODE=0, AA=1, TC=0, RD
+        val flLow = 0x83  // RA=1, Z=0, RCODE=3 (NXDOMAIN)
+        out.write(byteArrayOf(flHigh.toByte(), flLow.toByte()))
+
+        // QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
+        out.write(byteArrayOf(0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00))
+
+        // Copy original question section
+        out.write(query, 12, query.size - 12)
+
+        return out.toByteArray()
+    }
+
+    // 构建 0.0.0.0 响应（可选方案）
+    private fun buildZeroResponse(id: Int, query: ByteArray, qname: String): ByteArray {
+        return buildAResponse(
+            id = id,
+            query = query,
+            qname = qname,
+            ip = byteArrayOf(0, 0, 0, 0),  // 0.0.0.0
+            ttl = 86400  // 24 hours
+        )
+    }
+
+
     // 需要直连的域名（含 APNs/FCM/自管域等）
     private val bypassDomains = setOf(
         "conet.network",
@@ -730,7 +1005,6 @@ class DNSInterceptor private constructor() {
 
     suspend fun handleQuery(query: ByteArray): Pair<ByteArray, IPv4Address?>? {
         if (!initialized) {
-            // 最多等 500ms，一次性闸门 + 告警节流
             val ok = awaitReady(500)
             if (!ok && !initialized) throttledInitWarn("DNSInterceptor not yet initialized; gating DNS up to 500ms")
         }
@@ -751,6 +1025,18 @@ class DNSInterceptor private constructor() {
         Log.i(LOG_TAG, "Q: id=$id name=$name qtype=$qtype")
         Log.d(LOG_TAG, "Parsed domain name: $name")
 
+        // 检查是否为广告域名 - 新增
+        if (isAdDomain(name)) {
+            Log.d(LOG_TAG, "Blocked ad domain: $name")
+            // 可以选择返回 NXDOMAIN 或 0.0.0.0
+            // 选项 1: NXDOMAIN（域名不存在）
+//            val response = buildNXDomainResponse(id, query)
+            // 选项 2: 0.0.0.0（黑洞地址）
+            val response = buildZeroResponse(id, query, name)
+            return response to null
+        }
+
+        // 检查是否需要绕过（直连）
         if (shouldBypass(name)) {
             Log.d(LOG_TAG, "Bypass domain: $name (direct connection)")
             val resp = queryOverUpstreams(query)
@@ -761,7 +1047,7 @@ class DNSInterceptor private constructor() {
                         val d = name.trim('.').lowercase()
                         ips.forEach {
                             directIPs.add(it.raw)
-                            ipToDomain[it.raw] = d          // ★ 新增：建立反查
+                            ipToDomain[it.raw] = d
                             Log.d(LOG_TAG, "Registered direct IP: $it for domain: $d")
                         }
                     }
