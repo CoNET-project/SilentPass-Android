@@ -17,12 +17,59 @@ class TCPConnection(
     private val socksEndpoint: SocksEndpoint,
     private val bypassDirect: Boolean
 ) {
+
+    private data class ConnectionStats(
+        var totalPackets: Long = 0,
+        var outOfOrderPackets: Long = 0,
+        var retransmittedPackets: Long = 0,
+        var droppedPackets: Long = 0,
+        var bufferHits: Long = 0,
+        var bufferMisses: Long = 0
+    ) {
+        fun getOutOfOrderRatio() = if (totalPackets > 0)
+            outOfOrderPackets.toDouble() / totalPackets else 0.0
+
+        fun logStats(tag: String, key: String) {
+            if (totalPackets % 100 == 0L) {  // 每100个包记录一次
+                Log.i(tag, "Stats for $key: OOO=${getOutOfOrderRatio() * 100}%, " +
+                        "Retrans=$retransmittedPackets, Dropped=$droppedPackets, " +
+                        "BufferHit=${bufferHits}/${bufferHits + bufferMisses}")
+            }
+        }
+    }
+
+    private val stats = ConnectionStats()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     // === Upstream socket / IO ===
     private var upstream: Socket? = null
     private var upstreamWriter: java.io.OutputStream? = null
     private var upstreamReader: java.io.InputStream? = null
+    // === 乱序重组缓冲（加锁 + 动态尺寸限制）===
+    private data class Segment(val seq: Long, val data: ByteArray, val timestamp: Long = System.currentTimeMillis())
+
+    // 动态调整缓冲区大小
+    private var oooBufferLimit = 256 * 1024  // 初始256KB
+    private val OOO_BUFFER_MIN = 128 * 1024
+    private val OOO_BUFFER_MAX = 512 * 1024
+    private var oooBufferHitCount = 0
+    private var oooBufferMissCount = 0
+
+    // 自适应调整缓冲区大小
+    private fun adjustOOOBufferSize() {
+        if (oooBufferHitCount > oooBufferMissCount * 2 && oooBufferLimit < OOO_BUFFER_MAX) {
+            oooBufferLimit = minOf(oooBufferLimit * 2, OOO_BUFFER_MAX)
+            Log.d(LOG_TAG, "Increased OOO buffer to ${oooBufferLimit / 1024}KB for $key")
+        } else if (oooBufferMissCount > oooBufferHitCount * 2 && oooBufferLimit > OOO_BUFFER_MIN) {
+            oooBufferLimit = maxOf(oooBufferLimit / 2, OOO_BUFFER_MIN)
+            Log.d(LOG_TAG, "Decreased OOO buffer to ${oooBufferLimit / 1024}KB for $key")
+        }
+        // 重置计数器
+        if (oooBufferHitCount + oooBufferMissCount > 100) {
+            oooBufferHitCount = 0
+            oooBufferMissCount = 0
+        }
+    }
 
     // === Synchronization & State ===
     private val writeLock = Mutex()
@@ -61,8 +108,7 @@ class TCPConnection(
     private val downPrimeLock = Mutex()
     private var downPrime: ByteArray? = null
 
-    // === 乱序重组缓冲（加锁 + 尺寸限额） ===
-    private data class Segment(val seq: Long, val data: ByteArray)
+
     private val outOfOrderLock = Mutex()
     private val outOfOrderSegments = mutableListOf<Segment>()
     private val OOO_BUFFER_LIMIT_BYTES = 128 * 1024
@@ -231,6 +277,48 @@ class TCPConnection(
         tryFlushUpstream()
     }
 
+    private suspend fun smartDropSegment(newSeq: Long, newSize: Int) {
+        outOfOrderLock.withLock {
+            if (outOfOrderSegments.isEmpty()) return@withLock
+
+            // 策略1: 丢弃最旧的段
+            val now = System.currentTimeMillis()
+            val oldestIndex = outOfOrderSegments.indices.minByOrNull { index ->
+                outOfOrderSegments[index].timestamp
+            }
+
+            if (oldestIndex != null && now - outOfOrderSegments[oldestIndex].timestamp > 500) {
+                val dropped = outOfOrderSegments.removeAt(oldestIndex)
+                Log.d(LOG_TAG, "Dropped oldest segment seq=${dropped.seq} age=${now - dropped.timestamp}ms for $key")
+                stats.droppedPackets++
+                return@withLock
+            }
+
+            // 策略2: 丢弃离期望序列号最远的段
+            val farthestIndex = outOfOrderSegments.indices.maxByOrNull { index ->
+                kotlin.math.abs(outOfOrderSegments[index].seq - clientNextSeq).toDouble()
+            }
+
+            if (farthestIndex != null) {
+                val dropped = outOfOrderSegments.removeAt(farthestIndex)
+                Log.d(LOG_TAG, "Dropped farthest segment seq=${dropped.seq} for $key")
+                stats.droppedPackets++
+            }
+        }
+    }
+
+    private var lastTripleDupAckTime = 0L
+    private fun sendTripleDupAck(ip: IPv4Packet, tcp: TCPSegment) {
+        val now = System.currentTimeMillis()
+        if (now - lastTripleDupAckTime > 100) {  // 限制频率
+            repeat(3) {
+                sendPureAck(ip, tcp, ackOverride = clientNextSeq.toInt())
+            }
+            lastTripleDupAckTime = now
+            Log.d(LOG_TAG, "Sent triple duplicate ACK for fast retransmit, expect seq=$clientNextSeq for $key")
+        }
+    }
+
     // =============== Handle Established Data ===============
     private suspend fun handleEstablishedData(ip: IPv4Packet, tcp: TCPSegment) {
         val segSeq = tcp.seq.toLong() and 0xFFFFFFFFL
@@ -238,93 +326,199 @@ class TCPConnection(
         val segEnd = (segSeq + dataLen) and 0xFFFFFFFFL
         val expect = clientNextSeq
 
-        if (segSeq == expect) {
-            // in-order
-            Log.d(LOG_TAG, "Client->Server (in-order): $dataLen bytes for $key")
-            clientNextSeq = segEnd
-
-            pendingLock.withLock { pending.addLast(tcp.payload.copyOf()) }
-            tryFlushUpstream()
-
-            // 尝试吐出乱序缓冲
-            deliverBufferedSegments(ip, tcp)
-
-            // 发送 ACK
-            sendPureAck(ip, tcp, ackOverride = clientNextSeq.toInt())
-
-        } else if (isSeqBefore(segSeq, expect)) {
-            // 旧段或部分重传
-            if (isSeqBefore(segEnd, expect)) {
-                Log.d(LOG_TAG, "Duplicate segment seq=$segSeq expect=$expect, ACK for $key")
-                sendPureAck(ip, tcp, ackOverride = clientNextSeq.toInt())
-            } else {
-                val overlap = (expect - segSeq).toInt()
-                val newData = tcp.payload.copyOfRange(overlap, tcp.payload.size)
-                Log.d(LOG_TAG, "Partial retrans: ${newData.size} new bytes for $key")
-
-                clientNextSeq = segEnd
-                pendingLock.withLock { pending.addLast(newData) }
-                tryFlushUpstream()
-                sendPureAck(ip, tcp, ackOverride = clientNextSeq.toInt())
+        when {
+            segSeq == expect -> {
+                // 顺序包 - 优化路径
+                handleInOrderPacket(ip, tcp, segEnd)
             }
+            isSeqBefore(segSeq, expect) -> {
+                // 旧段或部分重传
+                handleRetransmission(ip, tcp, segSeq, segEnd, expect)
+            }
+            else -> {
+                // 乱序包 - 智能处理
+                handleOutOfOrderPacket(ip, tcp, segSeq, expect)
+            }
+        }
+    }
 
+    private suspend fun handleRetransmission(
+        ip: IPv4Packet,
+        tcp: TCPSegment,
+        segSeq: Long,
+        segEnd: Long,
+        expect: Long
+    ) {
+        if (isSeqBefore(segEnd, expect)) {
+            // 完全重复的段
+            Log.d(LOG_TAG, "Duplicate segment seq=$segSeq expect=$expect, ACK for $key")
+            sendPureAck(ip, tcp, ackOverride = clientNextSeq.toInt())
+            stats.retransmittedPackets++
         } else {
-            // 乱序：缓冲并限额（按总字节数）
-            Log.d(LOG_TAG, "Out-of-order segment seq=$segSeq expect=$expect, buffering for $key")
-            outOfOrderLock.withLock {
-                val currentBytes = outOfOrderSegments.sumOf { it.data.size } + tcp.payload.size
-                if (currentBytes <= OOO_BUFFER_LIMIT_BYTES) {
-                    val exists = outOfOrderSegments.any { it.seq == segSeq }
-                    if (!exists) {
-                        outOfOrderSegments.add(Segment(segSeq, tcp.payload.copyOf()))
-                        outOfOrderSegments.sortBy { it.seq }
-                        Log.d(LOG_TAG, "Buffered out-of-order segment, buffer size=${outOfOrderSegments.size} (bytes=$currentBytes) for $key")
-                    }
-                } else {
-                    Log.w(LOG_TAG, "OOO buffer limit reached, drop seg seq=$segSeq size=${tcp.payload.size} for $key")
-                }
-            }
-            // 重复 ACK，促使对端快速重传
+            // 部分重传
+            val overlap = (expect - segSeq).toInt()
+            val newData = tcp.payload.copyOfRange(overlap, tcp.payload.size)
+            Log.d(LOG_TAG, "Partial retrans: ${newData.size} new bytes for $key")
+
+            clientNextSeq = segEnd
+            pendingLock.withLock { pending.addLast(newData) }
+            tryFlushUpstream()
             sendPureAck(ip, tcp, ackOverride = clientNextSeq.toInt())
+            stats.retransmittedPackets++
         }
     }
 
-    // Deliver buffered OOO segments now in-order
-    private suspend fun deliverBufferedSegments(ip: IPv4Packet, tcp: TCPSegment) {
-        while (true) {
-            val first = outOfOrderLock.withLock {
-                if (outOfOrderSegments.isNotEmpty()) {
-                    val seg = outOfOrderSegments.first()
-                    when {
-                        seg.seq == clientNextSeq -> {
-                            outOfOrderSegments.removeAt(0)
-                            seg
+    private suspend fun handleInOrderPacket(ip: IPv4Packet, tcp: TCPSegment, segEnd: Long) {
+        Log.d(LOG_TAG, "Client->Server (in-order): ${tcp.payload.size} bytes for $key")
+        clientNextSeq = segEnd
+        stats.totalPackets++
+
+        pendingLock.withLock {
+            pending.addLast(tcp.payload.copyOf())
+        }
+        tryFlushUpstream()
+
+        // 尝试释放缓冲的乱序段
+        deliverBufferedSegments(ip, tcp)
+        oooBufferHitCount++
+        stats.bufferHits++
+
+        // 发送 ACK
+        sendPureAck(ip, tcp, ackOverride = clientNextSeq.toInt())
+
+        // 记录统计信息
+        stats.logStats(LOG_TAG, key)
+    }
+
+    private suspend fun handleOutOfOrderPacket(ip: IPv4Packet, tcp: TCPSegment, segSeq: Long, expect: Long) {
+        val gap = segSeq - expect
+        val isReasonableGap = gap > 0 && gap < 65536  // 64KB窗口内认为合理
+
+        if (!isReasonableGap) {
+            Log.w(LOG_TAG, "Dropping far out-of-order segment seq=$segSeq expect=$expect gap=$gap for $key")
+            oooBufferMissCount++
+            stats.droppedPackets++
+            sendPureAck(ip, tcp, ackOverride = clientNextSeq.toInt())
+            return
+        }
+
+        Log.d(LOG_TAG, "Out-of-order segment seq=$segSeq expect=$expect, buffering for $key")
+        stats.outOfOrderPackets++
+
+        outOfOrderLock.withLock {
+            // 清理过期段（超过1秒的认为丢失）
+            val now = System.currentTimeMillis()
+            val sizeBefore = outOfOrderSegments.size
+            outOfOrderSegments.removeAll { segment ->
+                (now - segment.timestamp) > 1000
+            }
+            if (sizeBefore > outOfOrderSegments.size) {
+                Log.d(LOG_TAG, "Cleaned ${sizeBefore - outOfOrderSegments.size} expired segments")
+            }
+
+            // 检查缓冲区大小
+            val currentBytes = outOfOrderSegments.sumOf { it.data.size } + tcp.payload.size
+            if (currentBytes <= oooBufferLimit) {
+                // 检查是否已存在
+                val exists = outOfOrderSegments.any { it.seq == segSeq }
+                if (!exists) {
+                    // 插入并保持有序
+                    val segment = Segment(segSeq, tcp.payload.copyOf(), System.currentTimeMillis())
+
+                    // 使用二分查找找到插入位置
+                    var insertPos = 0
+                    for (i in outOfOrderSegments.indices) {
+                        if (outOfOrderSegments[i].seq > segSeq) {
+                            insertPos = i
+                            break
                         }
-                        isSeqBefore(seg.seq, clientNextSeq) -> {
-                            outOfOrderSegments.removeAt(0)
-                            null // 过期段，丢弃并继续
-                        }
-                        else -> null // 有 gap，先退出
+                        insertPos = i + 1
                     }
-                } else null
-            }
+                    outOfOrderSegments.add(insertPos, segment)
 
-            if (first != null) {
-                val segEnd = (first.seq + first.data.size.toLong()) and 0xFFFFFFFFL
-                clientNextSeq = segEnd
-                Log.d(LOG_TAG, "Delivering buffered segment seq=${first.seq}, ${first.data.size} bytes for $key")
-                pendingLock.withLock { pending.addLast(first.data) }
-                tryFlushUpstream()
+                    Log.d(LOG_TAG, "Buffered out-of-order segment, buffer size=${outOfOrderSegments.size} " +
+                            "(bytes=$currentBytes/${oooBufferLimit}) for $key")
+
+                    // 触发快速重传机制
+                    if (outOfOrderSegments.size >= 3) {
+                        sendTripleDupAck(ip, tcp)
+                    }
+                }
             } else {
-                break
+                // 缓冲区满，智能丢弃
+                smartDropSegment(segSeq, tcp.payload.size)
+                oooBufferMissCount++
+                stats.bufferMisses++
             }
         }
+
+        // 定期调整缓冲区大小
+        if ((oooBufferHitCount + oooBufferMissCount) % 50 == 0) {
+            adjustOOOBufferSize()
+        }
+
+        // 发送重复 ACK
+        sendPureAck(ip, tcp, ackOverride = clientNextSeq.toInt())
     }
+
 
     // TCP sequence number comparison (handles wraparound)
     private fun isSeqBefore(seq1: Long, seq2: Long): Boolean {
         val diff = (seq1 - seq2) and 0xFFFFFFFFL
         return diff > 0x80000000L
+    }
+
+    private suspend fun deliverBufferedSegments(ip: IPv4Packet, tcp: TCPSegment) {
+        var delivered = 0
+        val maxDelivery = 10  // 限制每次最多释放10个段，避免阻塞
+
+        while (delivered < maxDelivery) {
+            val segment = outOfOrderLock.withLock {
+                if (outOfOrderSegments.isEmpty()) return@withLock null
+
+                val first = outOfOrderSegments.first()
+                when {
+                    first.seq == clientNextSeq -> {
+                        outOfOrderSegments.removeAt(0)
+                        first
+                    }
+                    isSeqBefore(first.seq, clientNextSeq) -> {
+                        // 过期段，检查是否部分有效
+                        val overlap = (clientNextSeq - first.seq).toInt()
+                        if (overlap < first.data.size) {
+                            // 部分数据仍然有效
+                            val validData = first.data.copyOfRange(overlap, first.data.size)
+                            outOfOrderSegments.removeAt(0)
+                            Segment(clientNextSeq, validData, System.currentTimeMillis())
+                        } else {
+                            // 完全过期
+                            outOfOrderSegments.removeAt(0)
+                            null
+                        }
+                    }
+                    else -> null  // 有gap，停止
+                }
+            }
+
+            if (segment != null) {
+                val segEnd = (segment.seq + segment.data.size.toLong()) and 0xFFFFFFFFL
+                clientNextSeq = segEnd
+                Log.d(LOG_TAG, "Delivering buffered segment seq=${segment.seq}, ${segment.data.size} bytes for $key")
+
+                pendingLock.withLock {
+                    pending.addLast(segment.data)
+                }
+                delivered++
+            } else {
+                break
+            }
+        }
+
+        if (delivered > 0) {
+            tryFlushUpstream()
+            Log.d(LOG_TAG, "Delivered $delivered buffered segments for $key")
+        }
+
     }
 
     // =============== Upstream Establishment ===============
