@@ -15,8 +15,29 @@ import javax.net.SocketFactory
 
 class DNSInterceptor {
 
+	companion object {
+		private val initGate = java.util.concurrent.CountDownLatch(1)
+		private val initDone = java.util.concurrent.atomic.AtomicBoolean(false)
+		private val lastInitWarnAt = java.util.concurrent.atomic.AtomicLong(0L)
+		fun signalReady() {
+			if (initDone.compareAndSet(false, true)) initGate.countDown()
+		}
+		fun awaitReady(timeoutMs: Long): Boolean {
+			if (initDone.get()) return true
+			return try { initGate.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS) } catch (_: InterruptedException) { false }
+		}
+		fun throttledInitWarn(msg: String) {
+			val now = System.currentTimeMillis()
+			val prev = lastInitWarnAt.get()
+			if (now - prev >= 1000L && lastInitWarnAt.compareAndSet(prev, now)) {
+				android.util.Log.w("DNSInterceptor", msg)
+			}
+		}
+	}
+
     @Volatile
     private var initialized = false
+
     private val LOG_TAG = "DNSInterceptor"
     private val bypassCache = HashMap<String, Boolean>()
 
@@ -62,6 +83,7 @@ class DNSInterceptor {
             if (!initialized) {
                 Log.e(LOG_TAG, "DNSInterceptor initialization timeout")
             }
+
         }.start()
     }
 
@@ -610,14 +632,10 @@ class DNSInterceptor {
     fun lookupDomain(ip: IPv4Address): String? = ipToDomain[ip.raw]
 
     suspend fun handleQuery(query: ByteArray): Pair<ByteArray, IPv4Address?>? {
-
         if (!initialized) {
-            Log.w(LOG_TAG, "DNSInterceptor not yet initialized, waiting...")
-            // 等待初始化
-            for (i in 1..10) {
-                if (initialized) break
-                kotlinx.coroutines.delay(100)
-            }
+            // 最多等 500ms，一次性闸门 + 告警节流
+            val ok = awaitReady(500)
+            if (!ok && !initialized) throttledInitWarn("DNSInterceptor not yet initialized; gating DNS up to 500ms")
         }
 
         if (query.size < 12) return null
