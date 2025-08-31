@@ -38,6 +38,7 @@ private fun checksumWithPseudo(ps: Long, data: ByteArray): Short {
     while ((sum ushr 16) != 0L) sum = (sum and 0xffff) + (sum ushr 16)
     return ((sum.inv() and 0xffff).toInt()).toShort()
 }
+
 object IpBuilders {
     fun udpFrom(src: IPv4Address, dst: IPv4Address, srcPort: Int, dstPort: Int, payload: ByteArray): ByteArray {
         val ipHdr = 20; val udpHdr = 8
@@ -56,7 +57,7 @@ object IpBuilders {
         bb.putShort((udpHdr + payload.size).toShort()); bb.putShort(0)
         bb.put(payload)
 
-        // fill UDP checksum (optional for IPv4，但建议计算)
+        // fill UDP checksum
         val arr = bb.array()
         val udpOff = ipHdr
         val ps = pseudoHeaderSum(src.raw, dst.raw, 17, udpHdr + payload.size)
@@ -70,7 +71,6 @@ object IpBuilders {
         arr[11] = (ipCsum.toInt() and 0xff).toByte()
         return arr
     }
-
 
     fun icmpPortUnreachable(ip: IPv4Packet): ByteArray {
         val icmpHdr = 8
@@ -101,9 +101,33 @@ object IpBuilders {
         return arr
     }
 
+    // 原始方法保持不变（向后兼容）
     fun tcpPayloadFromServer(src: IPv4Address, dst: IPv4Address, srcPort: Int, dstPort: Int, payload: ByteArray,
                              seq: Int, ack: Int, flags: Int = 0x18, window: Int = 65535): ByteArray {
-        val ipHdr = 20; val tcpHdr = 20
+        return tcpPayloadFromServer(src, dst, srcPort, dstPort, payload, seq, ack, flags, window, ByteArray(0))
+    }
+
+    // 新增支持TCP选项的重载方法
+    fun tcpPayloadFromServer(src: IPv4Address, dst: IPv4Address, srcPort: Int, dstPort: Int, payload: ByteArray,
+                             seq: Int, ack: Int, flags: Int = 0x18, window: Int = 65535,
+                             options: ByteArray = ByteArray(0)): ByteArray {
+
+        // 确保选项长度是4的倍数
+        val paddedOptions = if (options.isEmpty()) {
+            ByteArray(0)
+        } else {
+            val padding = (4 - (options.size % 4)) % 4
+            if (padding > 0) {
+                // 添加NOP填充
+                options + ByteArray(padding) { 1 } // NOP = 1
+            } else {
+                options
+            }
+        }
+
+        val ipHdr = 20
+        val tcpHdrBase = 20
+        val tcpHdr = tcpHdrBase + paddedOptions.size
         val total = ipHdr + tcpHdr + payload.size
         val bb = ByteBuffer.allocate(total)
 
@@ -115,20 +139,33 @@ object IpBuilders {
         // TCP header
         bb.putShort(srcPort.toShort()); bb.putShort(dstPort.toShort())
         bb.putInt(seq); bb.putInt(ack)
-        bb.put(((5 shl 4)).toByte()); bb.put(flags.toByte()) // data offset + flags
+
+        // Data offset (header length in 32-bit words)
+        val dataOffset = tcpHdr / 4
+        bb.put((dataOffset shl 4).toByte()); bb.put(flags.toByte())
         bb.putShort(window.toShort()); bb.putShort(0); bb.putShort(0) // csum=0, urg=0
+
+        // TCP options
+        if (paddedOptions.isNotEmpty()) {
+            bb.put(paddedOptions)
+        }
+
+        // Payload
         bb.put(payload)
 
         val arr = bb.array()
+
         // TCP checksum with pseudo header
         val ps = pseudoHeaderSum(src.raw, dst.raw, 6, tcpHdr + payload.size)
         val tcpCsum = checksumWithPseudo(ps, arr.copyOfRange(ipHdr, total))
         arr[ipHdr + 16] = (tcpCsum.toInt() ushr 8).toByte()
         arr[ipHdr + 17] = (tcpCsum.toInt() and 0xff).toByte()
 
+        // IP checksum
         val ipCsum = ipChecksum(arr.copyOfRange(0, ipHdr))
         arr[10] = (ipCsum.toInt() ushr 8).toByte()
         arr[11] = (ipCsum.toInt() and 0xff).toByte()
+
         return arr
     }
 }
