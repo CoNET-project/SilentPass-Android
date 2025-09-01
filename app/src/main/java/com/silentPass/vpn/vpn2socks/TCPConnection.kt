@@ -388,10 +388,25 @@ class TCPConnection(
 
     private suspend fun monitorConnectionHealth() {
         // 等待一段时间让连接有机会建立
-        delay(3000)
+        delay(5000)
 
         while (!isClosed) {
-            delay(1000)
+            val checkInterval = when (phase) {
+                Phase.SYN, Phase.HANDSHAKE_ACKED, Phase.SOCKS_PRIMED -> 3000L  // Less frequent during setup
+                Phase.STREAMING -> 1000L  // Normal monitoring during data transfer
+                else -> 5000L
+            }
+            delay(checkInterval)
+
+            if (phase == Phase.STREAMING ||
+                phase == Phase.HALF_CLOSED_LOCAL ||
+                phase == Phase.HALF_CLOSED_REMOTE) {
+                if (!isSocketHealthy() && !isClosed) {
+                    Log.w(LOG_TAG, "Socket unhealthy in phase $phase")
+                    closeConnection()
+                    break
+                }
+            }
 
             try {
                 // 获取当前状态
@@ -895,6 +910,7 @@ class TCPConnection(
             upstreamWriter = socket.getOutputStream()
             upstreamReader = socket.getInputStream()
 
+            // Only then update phase
             stateLock.withLock {
                 socksPrimed = true
                 phase = Phase.SOCKS_PRIMED
@@ -927,14 +943,14 @@ class TCPConnection(
     private fun isSocketHealthy(): Boolean {
         return try {
             val socket = upstream
+            val currentPhase = phase
 
+            // During establishment phases, only check if we should have a socket
             if (socket == null) {
-                // Socket 还没创建不一定是问题
-                val currentPhase = phase  // volatile read
-                // 只有在应该有 socket 的阶段才认为是不健康
-                return currentPhase == Phase.SYN ||
-                        currentPhase == Phase.HANDSHAKE_ACKED ||
-                        currentPhase == Phase.SOCKS_PRIMED
+                // Only consider unhealthy if we're in streaming phase without a socket
+                return currentPhase != Phase.STREAMING &&
+                        currentPhase != Phase.HALF_CLOSED_LOCAL &&
+                        currentPhase != Phase.HALF_CLOSED_REMOTE
             }
 
             // 检查基本连接状态
@@ -956,7 +972,8 @@ class TCPConnection(
                         "healthy=$healthy (canRead=$canRead, canWrite=$canWrite)")
             }
 
-            healthy
+            socket.isConnected && !socket.isClosed &&
+                    (!socket.isInputShutdown || !socket.isOutputShutdown)
         } catch (e: Exception) {
             Log.e(LOG_TAG, "Error checking socket health: ${e.message}")
             false
@@ -982,7 +999,8 @@ class TCPConnection(
     private suspend fun downstreamLoop(ip: IPv4Packet, tcp: TCPSegment) = withContext(Dispatchers.IO) {
         val reader = upstreamReader ?: return@withContext
         val buffer = ByteArray(32 * 1024)
-        var totalRead = 0  // 添加计数器
+        var totalRead = 0
+        var consecutiveTimeouts = 0
 
         try {
             Log.d(LOG_TAG, "Downstream loop started for ${getDisplayKey()}")
@@ -990,18 +1008,24 @@ class TCPConnection(
             while (!isClosed && isSocketHealthy()) {
                 val n = try {
                     reader.read(buffer)
-                } catch (e: java.net.SocketTimeoutException) {
-                    // 超时是正常的，继续循环
+                } catch (e: SocketTimeoutException) {
+                    consecutiveTimeouts++
+                    if (consecutiveTimeouts > 10) {  // Allow multiple timeouts
+                        Log.w(LOG_TAG, "Too many consecutive timeouts")
+                        break
+                    }
                     continue
-                } catch (e: IOException) {
-                    Log.e(LOG_TAG, "Read error in downstream: ${e.message} for ${getDisplayKey()}")
-                    break
                 }
 
+                consecutiveTimeouts = 0  // Reset on successful read
+
                 if (n <= 0) {
-                    Log.i(LOG_TAG, "Downstream EOF after reading $totalRead bytes for ${getDisplayKey()}")
-                    sendFinToClient(ip, tcp)
-                    stateLock.withLock { phase = Phase.HALF_CLOSED_REMOTE }
+                    // Don't immediately close on first EOF
+                    delay(100)
+                    if (totalRead == 0) {
+                        // Retry once if no data received yet
+                        continue
+                    }
                     break
                 }
 
