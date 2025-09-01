@@ -916,10 +916,12 @@ class TCPConnection(
                 }
             }
 
+
             upstream = socket
             upstreamWriter = socket.getOutputStream()
             upstreamReader = socket.getInputStream()
 
+            
             // Only then update phase
             stateLock.withLock {
                 socksPrimed = true
