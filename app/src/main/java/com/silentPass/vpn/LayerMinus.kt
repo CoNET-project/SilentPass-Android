@@ -15,21 +15,66 @@ import org.web3j.utils.Numeric
 import java.io.BufferedWriter
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.io.OutputStreamWriter
+import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.nio.charset.StandardCharsets
 import java.security.SecureRandom
 import java.util.UUID
 
 
 
-class LayerMinus(startVPNData: StartVPNData) {
-    private val credentials: Credentials = Credentials.create(
-        startVPNData.privateKey.removePrefix("0x")
-    )
-    val entryNodes = startVPNData.entryNodes
-    val exitNode = startVPNData.exitNode
+object LayerMinus {
+
+    // ---- 全局共享状态（单例） ----
+    @Volatile private var initialized = false
+    private lateinit var credentials: Credentials
+    lateinit var entryNodes: List<Node>
+        private set
+    lateinit var exitNode: List<Node>
+        private set
     val jsonGson = Gson()
+
+    private const val CONNECT_TIMEOUT_MS = 5_000
+
+    private const val ENTRY_DISABLE_MS = 5 * 60 * 1000 // 5 分钟
+
+    @Synchronized
+    fun init(startVPNData: StartVPNData) {
+        credentials = Credentials.create(startVPNData.privateKey.removePrefix("0x"))
+        entryNodes = startVPNData.entryNodes
+        exitNode = startVPNData.exitNode
+        initialized = true
+        Log.i("LayerMinus", "Initialized: entries=${entryNodes.size}, exits=${exitNode.size}")
+    }
+
+
+    private val disabledEntryUntilMs = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    private fun ensureInitialized() {
+        check(initialized) { "LayerMinus not initialized. Call LayerMinus.init(startVPNData) first." }
+    }
+
+    private fun now() = System.currentTimeMillis()
+
+    private fun isEntryAvailable(ip: String): Boolean {
+        val until = disabledEntryUntilMs[ip] ?: return true
+        if (until <= now()) {
+            disabledEntryUntilMs.remove(ip)
+            return true
+        }
+        return false
+    }
+
+    private fun markEntryTimeout(ip: String) {
+        disabledEntryUntilMs[ip] = now() + ENTRY_DISABLE_MS
+        Log.w("LayerMinus", "Entry node $ip 超时，禁用 5 分钟")
+    }
+
+
+
     fun getKeyIdFromArmoredPublicKey(armoredPublicKey: String): Long {
         val publicKeyRing = PGPainless.readKeyRing()
             .publicKeyRing(ByteArrayInputStream(armoredPublicKey.toByteArray(Charsets.UTF_8)))!!
@@ -38,8 +83,10 @@ class LayerMinus(startVPNData: StartVPNData) {
         return primaryKey.keyID
     }
 
-    fun postEncryptedPGPMessage(host: String, pgpMessage: String): Socket {
-        val socket = Socket(host, 80)
+
+    private fun postEncryptedPGPMessage(host: String, pgpMessage: String): Socket {
+        val socket = Socket()
+        socket.connect(InetSocketAddress(host, 80), CONNECT_TIMEOUT_MS)
         val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
 
         val path = "/post"
@@ -117,20 +164,20 @@ class LayerMinus(startVPNData: StartVPNData) {
     }
 
     fun connectToLayerMinus(host: String, _port: String, buffer: ByteArray?): Socket? {
-
-        val randomEntryNode = if (this.entryNodes.isNotEmpty()) {
-//            this.entryNodes[0]
-            this.entryNodes.random()
-        } else {
-            return null // or throw Exception("No entry nodes available")
+        val availableEntries = this.entryNodes.filter { isEntryAvailable(it.ip_addr) }
+        if (availableEntries.isEmpty()) {
+            Log.e("LayerMinus", "没有可用的 entryNodes（全部处于禁用期）")
+            return null
         }
+        val randomEntryNode = availableEntries.random()
 
         val randomExitNode = if (this.exitNode.isNotEmpty()) {
-//            this.exitNode[0]
             this.exitNode.random()
         } else {
             return null // or throw Exception("No entry nodes available")
         }
+
+
         val port = _port ?: "80"
 
         val base64String = buffer?.let {
@@ -161,7 +208,19 @@ class LayerMinus(startVPNData: StartVPNData) {
         Log.d("WebAppInterface", "connectToLayerMinus Entry Node ${randomEntryNode.ip_addr}:80 Exit Node ${randomExitNode.ip_addr}")
 
         if (_postData.isNotEmpty()) {
-            return postEncryptedPGPMessage(randomEntryNode.ip_addr, _postData)
+            try {
+                return postEncryptedPGPMessage(randomEntryNode.ip_addr, _postData)
+            } catch (e: SocketTimeoutException) {
+                // 连接超时：禁用该 entry 节点 5 分钟
+                markEntryTimeout(randomEntryNode.ip_addr)
+                Log.e("LayerMinus", "连接 entryNode 超时: ${randomEntryNode.ip_addr}", e)
+                return null
+            } catch (e: IOException) {
+                // 其他 IO 异常不自动禁用，只记录（如需也禁用，可改为调用 markEntryTimeout）
+                Log.e("LayerMinus", "连接 entryNode 失败: ${randomEntryNode.ip_addr}", e)
+                return null
+            }
+
         }
         return null
     }

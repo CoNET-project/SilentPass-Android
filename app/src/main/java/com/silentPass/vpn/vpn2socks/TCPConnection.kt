@@ -1,5 +1,6 @@
 package com.silentPass.vpn.vpn2socks
 
+import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
@@ -42,20 +43,20 @@ class TCPConnection(
         private const val MIN_CWND_MULTIPLIER = 2
 
         // Other constants
-        private const val INITIAL_RTO = 3000L  // 1 second
-        private const val MIN_RTO = 200L
-        private const val MAX_RTO = 60000L
+        private const val INITIAL_RTO = 5000L  // 1 second
+        private const val MIN_RTO = 500L
+        private const val MAX_RTO = 120000L
         private const val SACK_PERMITTED = 4
         private const val SACK_OPTION = 5
 
         // Buffering and window limits
         private const val MAX_PENDING_BYTES = 256 * 1024
-        private const val MIN_ADV_WINDOW = 1024
+        private const val MIN_ADV_WINDOW = 32 * 1024
         private const val MAX_ADV_WINDOW = 65535
 
         // Delayed ACK timers
-        private const val DELAYED_ACK_MS = 40L
-        private const val MAX_PENDING_ACKS = 2
+        private const val DELAYED_ACK_MS = 80L
+        private const val MAX_PENDING_ACKS = 4
     }
 
 	// ---- Log deduplication (noise control) ----
@@ -113,6 +114,8 @@ class TCPConnection(
 
     // =============== Congestion Control ===============
     private inner class CongestionControl {
+
+
         @Volatile private var cwnd = this@TCPConnection.INITIAL_CWND  // Use instance value
         @Volatile private var ssthresh = Int.MAX_VALUE
         @Volatile private var flightSize = 0
@@ -136,6 +139,9 @@ class TCPConnection(
                 srtt = ((1 - alpha) * srtt + alpha * measuredRtt).toLong()
             }
             rto = (srtt + 4 * rttvar).coerceIn(MIN_RTO, MAX_RTO)
+
+            // ===== 新增：高 RTO 触发临时放宽 OOO 上限 =====
+            maybeBoostOooLimitOnRto(rto)
         }
 
         fun onAck(ackedBytes: Int) {
@@ -178,6 +184,28 @@ class TCPConnection(
         }
 
         fun getRto(): Long = rto
+    }
+
+    // 高 RTO（>1000ms）时，临时把 OOO 上限放宽到 384KB，并刷新“高 RTO 时间戳”
+    private fun maybeBoostOooLimitOnRto(rtoMs: Long, now: Long = SystemClock.elapsedRealtime()) {
+        if (rtoMs > 1000) {
+            lastHighRtoAt.set(now)
+            if (currentOooMax.get() != BOOSTED_OOO_MAX) {
+                currentOooMax.set(BOOSTED_OOO_MAX)
+                Log.i(LOG_TAG, "High RTO=${rtoMs}ms -> increase OOO limit to ${BOOSTED_OOO_MAX / 1024}KB")
+            }
+        }
+    }
+
+    // 若 5s 内未再出现“高 RTO”，恢复到 256KB；可选做一次更激进的过期清理以尽快回收
+    private fun maybeDecayOooLimit(now: Long = SystemClock.elapsedRealtime()) {
+        val last = lastHighRtoAt.get()
+        if (last != 0L && now - last >= 5000 && currentOooMax.get() != BASE_OOO_MAX) {
+            currentOooMax.set(BASE_OOO_MAX)
+            Log.i(LOG_TAG, "OOO limit restored to ${BASE_OOO_MAX / 1024}KB (quiet ${(now - last)}ms)")
+            // 恢复时做一次“aggressive”清理，避免高水位长时间占用
+            cleanOldSegments(aggressiveClean = true)
+        }
     }
 
     // Add standard MSS values
@@ -369,8 +397,69 @@ class TCPConnection(
 
     private val outOfOrderLock = Mutex()
     private val outOfOrderSegments = ConcurrentSkipListMap<Long, Segment>()
+
+	// Evict OOO buffer to respect dynamic cap.
+	private fun trimOooBuffer(bytesToFree: Int) {
+		if (bytesToFree <= 0) return
+		var remain = bytesToFree
+		// Drop oldest segments first to preserve recent progress.
+		val victims = outOfOrderSegments.entries.sortedBy { it.value.timestamp }
+		for (e in victims) {
+			if (remain <= 0) break
+			val removed = outOfOrderSegments.remove(e.key) ?: continue
+			oooBufferSize.addAndGet(-removed.data.size)
+			remain -= removed.data.size
+		}
+	}
+
+
+
+
     private var oooBufferSize = AtomicInteger(0)
-    private val maxOooBufferSize = 256 * 1024  // 256KB max
+    // 乱序缓冲自适应上限（基础/加宽）
+    private val BASE_OOO_MAX = 256 * 1024      // 256 KB
+    private val BOOSTED_OOO_MAX = 384 * 1024   // 384 KB
+
+    // 当前生效的上限（原子，避免并发读写）
+    @Volatile private var currentOooMax = AtomicInteger(BASE_OOO_MAX)
+
+    // 最近一次观测到“高 RTO”的时间（elapsedRealtime，避免系统时钟回拨影响）
+    @Volatile private var lastHighRtoAt = AtomicLong(0L)
+
+    // 读取当前上限
+    private fun currentMaxOooBufferSize(): Int = currentOooMax.get() // 256KB max
+
+    // === 新增：在尝试向 OOO 插入 bytes 前，确保有容量 ===
+    private fun ensureOooCapacityFor(bytes: Int, aggressiveFirst: Boolean = false): Boolean {
+        // 先按需尝试恢复（可能把 384KB 恢复成 256KB，同时做 aggressive 清理）
+        maybeDecayOooLimit()
+
+        val limit = currentMaxOooBufferSize()
+        // 是否已足够
+        if (oooBufferSize.get() + bytes <= limit) return true
+
+        // 优先清理过期/最旧段
+        cleanOldSegments(aggressiveClean = aggressiveFirst || (oooBufferSize.get() > (limit * 0.9)))
+
+        if (oooBufferSize.get() + bytes <= limit) return true
+
+        // 仍不足：逐个从“最小序号开始”的老段起淘汰，直到满足或为空
+        val it = outOfOrderSegments.entries.iterator()
+        while (oooBufferSize.get() + bytes > limit && it.hasNext()) {
+            val e = it.next()
+            oooBufferSize.addAndGet(-e.value.data.size)
+            it.remove()
+            Log.w(LOG_TAG, "OOO over limit -> evict seq=${e.key} size=${e.value.data.size}")
+        }
+        return (oooBufferSize.get() + bytes) <= limit
+    }
+
+    // === 新增：统一的“每个 TCP 段处理完成后调用”的钩子 ===
+    private fun onPacketProcessedHook() {
+        // 仅做一次快速检查，满足“5s 无高 RTO 即恢复”
+        maybeDecayOooLimit()
+    }
+
 
     // =============== Upstream Connection ===============
     private var upstream: Socket? = null
@@ -396,8 +485,8 @@ class TCPConnection(
     @Volatile private var downstreamStarted = false
     private val closedOnce = AtomicBoolean(false)
 
-    // Tracking for RTT measurement
-    private val sentTimeMap = ConcurrentHashMap<Long, Long>()  // seq -> timestamp
+    // Tracking for RTT measurement (store by segment END seq for accurate matching)
+    private val sentTimeMap = ConcurrentSkipListMap<Long, Long>()  // endSeq -> sendTs
 
     // New: Delayed-ACK machinery
     @Volatile private var lastAckTime = 0L
@@ -495,61 +584,70 @@ class TCPConnection(
 
 
     private suspend fun processPacket(ip: IPv4Packet, tcp: TCPSegment) {
-        if (isClosed) {
-            if (shouldLog(tupleKeyForDedup("ALREADY_CLOSED"), 5000L)) Log.d(LOG_TAG, "Connection already closed for ${getDisplayKey()}")
-            return
-        }
 
-        // RST handling - check if already closing
-        if (tcp.isRST) {
-            Log.d(LOG_TAG, "RST received for ${getDisplayKey()}")
-            if (!isClosed) {
-                closeConnection()
-            }
-            return
-        }
-
-
-        // SYN handling
-        if (tcp.isSYN && !tcp.isACK) {
-            handleSyn(ip, tcp)
-            return
-        }
-
-        // Handshake completion
-        if (!handshakeAcked && tcp.isACK && !tcp.isSYN) {
-            handleHandshakeAck(ip, tcp)
-            return
-        }
-
-        // Established connection
-        if (handshakeAcked) {
-            // Measure RTT if this is an ACK
-            if (tcp.isACK) {
-                measureRtt(tcp)
+        try {
+            if (isClosed) {
+                if (shouldLog(tupleKeyForDedup("ALREADY_CLOSED"), 5000L)) Log.d(
+                    LOG_TAG,
+                    "Connection already closed for ${getDisplayKey()}"
+                )
+                return
             }
 
-            if (tcp.payload.isNotEmpty()) {
-                handleEstablishedData(ip, tcp)
+
+            // RST handling - check if already closing
+            if (tcp.isRST) {
+                Log.d(LOG_TAG, "RST received for ${getDisplayKey()}")
+                if (!isClosed) {
+                    closeConnection()
+                }
+                return
             }
+
+
+            // SYN handling
+            if (tcp.isSYN && !tcp.isACK) {
+                handleSyn(ip, tcp)
+                return
+            }
+
+            // Handshake completion
+            if (!handshakeAcked && tcp.isACK && !tcp.isSYN) {
+                handleHandshakeAck(ip, tcp)
+                return
+            }
+
+            // Established connection
+            if (handshakeAcked) {
+                // Measure RTT if this is an ACK
+                if (tcp.isACK) {
+                    measureRtt(tcp)
+                }
+
+                if (tcp.payload.isNotEmpty()) {
+                    handleEstablishedData(ip, tcp)
+                }
+                if (tcp.isFIN) {
+                    handleFIN(ip, tcp)
+                }
+                return
+            }
+
+            // FIN before establishment
             if (tcp.isFIN) {
-                handleFIN(ip, tcp)
+                Log.d(LOG_TAG, "FIN received before establishment for ${getDisplayKey()}")
+                clientNextSeq = (clientNextSeq + 1L) and 0xFFFFFFFFL
+                sendAckWithSack(ip, tcp, immediate = true)
+                closeConnection()
+                return
             }
-            return
-        }
 
-        // FIN before establishment
-        if (tcp.isFIN) {
-            Log.d(LOG_TAG, "FIN received before establishment for ${getDisplayKey()}")
-            clientNextSeq = (clientNextSeq + 1L) and 0xFFFFFFFFL
-            sendAckWithSack(ip, tcp, immediate = true)
-            closeConnection()
-            return
-        }
-
-        // Buffer pre-handshake data
-        if (tcp.payload.isNotEmpty()) {
-            bufferPreHandshakeData(tcp.payload)
+            // Buffer pre-handshake data
+            if (tcp.payload.isNotEmpty()) {
+                bufferPreHandshakeData(tcp.payload)
+            }
+        } finally {
+            onPacketProcessedHook() // NEW: 兜底恢复检查
         }
     }
 
@@ -605,11 +703,15 @@ class TCPConnection(
     }
 
     private suspend fun measureRtt(tcp: TCPSegment) {
-        val ackSeq = tcp.ack.toLong() and 0xFFFFFFFFL
-        sentTimeMap.remove(ackSeq)?.let { sentTime ->
-            val rtt = System.currentTimeMillis() - sentTime
-            congestionControl.updateRtt(rtt)
-        }
+         val ackSeq = tcp.ack.toLong() and 0xFFFFFFFFL
+		// find the latest segment-end that is <= ackSeq
+		val e = sentTimeMap.floorEntry(ackSeq)
+		if (e != null) {
+			val rtt = System.currentTimeMillis() - e.value
+			// clear all entries up to ackSeq to avoid growth/leaks
+			sentTimeMap.headMap(ackSeq, /*inclusive=*/true).clear()
+			congestionControl.updateRtt(rtt)
+		}
     }
 
     private suspend fun handleEstablishedData(ip: IPv4Packet, tcp: TCPSegment) {
@@ -655,6 +757,12 @@ class TCPConnection(
         deliverBufferedSegments()
         tryFlushUpstream()
         sendAckWithSack(ip, tcp)
+
+        deliverBufferedSegments()
+        tryFlushUpstream()
+        sendAckWithSack(ip, tcp)
+        onPacketProcessedHook() // NEW
+        maybeDecayOooLimit()
     }
 
     private suspend fun handleRetransmission(
@@ -688,6 +796,10 @@ class TCPConnection(
             tryFlushUpstream()
             sendAckWithSack(ip, tcp)
         }
+
+        tryFlushUpstream()
+        sendAckWithSack(ip, tcp)
+        onPacketProcessedHook() // NEW
     }
 
 
@@ -696,30 +808,31 @@ class TCPConnection(
         val gap = segSeq - clientNextSeq
         val segEnd = (segSeq + tcp.payload.size) and 0xFFFFFFFFL
 
-        // Small gap - wait briefly
-        if (gap <= mss) {  // Changed MSS to mss
-
+        if (gap <= mss) {
             if (segSeq == clientNextSeq) {
                 handleInOrderPacket(ip, tcp, segEnd)
+                onPacketProcessedHook() // NEW
                 return
             }
         }
 
-        // For small gaps, buffer immediately without delay
         if (gap <= 3 * mss) {
-            val newSegment = Segment(
-                tcp.payload.copyOf(),
-                timestamp = System.currentTimeMillis()
-            )
-
+            val bytes = tcp.payload.size
+            if (!ensureOooCapacityFor(bytes, aggressiveFirst = true)) {
+                Log.w(LOG_TAG, "OOO insert refused (no capacity after cleanup): gap=$gap bytes=$bytes")
+                stats.droppedPackets++
+                sendAckWithSack(ip, tcp, immediate = true)
+                onPacketProcessedHook() // NEW
+                return
+            }
+            val newSegment = Segment(tcp.payload.copyOf(), timestamp = System.currentTimeMillis())
             if (outOfOrderSegments.putIfAbsent(segSeq, newSegment) == null) {
-                oooBufferSize.addAndGet(tcp.payload.size)
+                oooBufferSize.addAndGet(bytes)
                 stats.outOfOrderPackets++
             }
-
-            // Try immediate delivery
-            deliverBufferedSegments()
+            deliverBufferedSegments() // 可能合并推进 clientNextSeq
             sendAckWithSack(ip, tcp, immediate = true)
+            onPacketProcessedHook() // NEW
             return
         }
 
@@ -733,29 +846,35 @@ class TCPConnection(
             Log.w(LOG_TAG, "Dropping far out-of-order segment gap=$gap maxGap=$maxGap")
             stats.droppedPackets++
             sendAckWithSack(ip, tcp, immediate = true)
+            onPacketProcessedHook() // NEW
             return
         }
 
-        // Clean old segments if needed
-        if (oooBufferSize.get() > maxOooBufferSize * 0.8) {
-            cleanOldSegments(aggressiveClean = true)
+        // ========== 小改：删去旧的 0.8*limit 清理，统一走 ensureOooCapacityFor ==========
+        val bytes = tcp.payload.size
+        if (!ensureOooCapacityFor(bytes)) {
+            Log.w(LOG_TAG, "OOO insert refused (no capacity after cleanup): gap=$gap bytes=$bytes")
+            stats.droppedPackets++
+            sendAckWithSack(ip, tcp, immediate = true)
+            onPacketProcessedHook() // NEW
+            return
         }
 
-        val newSegment = Segment(
-            tcp.payload.copyOf(),
-            timestamp = System.currentTimeMillis()
-        )
-
+        val newSegment = Segment(tcp.payload.copyOf(), timestamp = System.currentTimeMillis())
         if (outOfOrderSegments.putIfAbsent(segSeq, newSegment) == null) {
-            oooBufferSize.addAndGet(tcp.payload.size)
+            oooBufferSize.addAndGet(bytes)
             stats.outOfOrderPackets++
             sendAckWithSack(ip, tcp, immediate = true)
         }
+
+        onPacketProcessedHook() // NEW
     }
 
     private fun cleanOldSegments(aggressiveClean: Boolean = false) {
         val now = System.currentTimeMillis()
-        val timeout = if (aggressiveClean) 500L else 1000L
+    	val rto = congestionControl.getRto().coerceAtLeast(300L)
+    	val timeout = if (aggressiveClean) (2 * rto).coerceAtLeast(1200L)
+                  else (4 * rto).coerceAtLeast(2000L)
 
         val expired = outOfOrderSegments.entries.filter {
             now - it.value.timestamp > timeout
@@ -812,6 +931,9 @@ class TCPConnection(
             tryFlushUpstream()
         }
 
+        
+        onPacketProcessedHook() // NEW
+
     }
 
     // =============== Delayed ACK with SACK support ===============
@@ -864,17 +986,22 @@ class TCPConnection(
         val now = System.currentTimeMillis()
 
 
-        // Check out-of-order segments safely
-        val hasOutOfOrder = outOfOrderLock.withLock {
-            outOfOrderSegments.isNotEmpty()
-        }
+		val oooStats = outOfOrderLock.withLock { outOfOrderSegments.size }
+		val hasOutOfOrder = (oooStats > 0)   // ✅ 修复：定义 hasOutOfOrder
+		val manyOoo = (oooStats >= 2) || (oooBufferSize.get() >= 2 * mss) // 乱序统计（保持不动）
 
-        val shouldSendImmediate = immediate ||
-                (peerSupportsSack && hasOutOfOrder)
+		// 最小补丁：去掉未定义的 hasOutOfOrder，纯用 SACK 能力来放宽 ACK 预算
+
+		val ackBudget = if (peerSupportsSack) DELAYED_ACK_MS * 3 else DELAYED_ACK_MS
+
+		val maxPending = if (peerSupportsSack) MAX_PENDING_ACKS * 2 else MAX_PENDING_ACKS
+
+
+		val shouldSendImmediate = immediate
 
 
         if (!shouldSendImmediate) {
-            if ((now - lastAckTime < DELAYED_ACK_MS) && pendingAckCount < MAX_PENDING_ACKS) {
+            if ((now - lastAckTime < ackBudget) && pendingAckCount < maxPending) {
                 pendingAckCount++
                 scheduleAckFlush(ip, tcp)
                 return
@@ -887,12 +1014,21 @@ class TCPConnection(
     }
 
     private fun calcAdvertisedWindow(): Int {
-        // 直接使用缓存的大小，避免遍历
-        val pendingBytes = pendingSize.get()
-        val oooBytes = oooBufferSize.get()
-        val used = min(MAX_PENDING_BYTES, pendingBytes + oooBytes)
-        val free = (MAX_PENDING_BYTES - used).coerceAtLeast(0)
-        return free.coerceIn(MIN_ADV_WINDOW, MAX_ADV_WINDOW)
+		// 使用“占比缩放 + 下限”策略：按 (pending+ooo)/容量 线性收缩，但至少保留 32KB 窗口
+		val pendingBytes = pendingSize.get()
+		val oooBytes = oooBufferSize.get()
+		val used = (pendingBytes + oooBytes).coerceAtMost(MAX_PENDING_BYTES)
+
+		val usageRatio = used.toDouble() / MAX_PENDING_BYTES.toDouble()
+		val proportional = (MAX_ADV_WINDOW * (1.0 - usageRatio))
+			.toInt()
+			.coerceIn(MIN_ADV_WINDOW, MAX_ADV_WINDOW)
+
+		val free = (MAX_PENDING_BYTES - used).coerceAtLeast(0)
+        val w = min(free, proportional).coerceIn(MIN_ADV_WINDOW, MAX_ADV_WINDOW)
+        val MIN_ADV_WIN = 32 * 1024
+
+		return if (w < MIN_ADV_WIN) MIN_ADV_WIN else w
     }
 
     private suspend fun bufferPreHandshakeData(data: ByteArray) {
@@ -1180,8 +1316,10 @@ class TCPConnection(
             val chunkSize = min(mss, data.size - offset)
             val chunk = data.copyOfRange(offset, offset + chunkSize)
 
-            // Track send time for RTT measurement
-            sentTimeMap[serverSeq] = System.currentTimeMillis()
+			// Track send time for RTT measurement at segment END seq
+			val seqStart = serverSeq
+			val seqEnd = (serverSeq + chunkSize) and 0xFFFFFFFFL
+			sentTimeMap[seqEnd] = System.currentTimeMillis()
 
             val packet = IpBuilders.tcpPayloadFromServer(
                 src = ip.dst, dst = ip.src,
@@ -1194,7 +1332,7 @@ class TCPConnection(
             )
 
             packetWriter(listOf(packet), listOf(ConnectionManager.PROTO_IPV4))
-            serverSeq = (serverSeq + chunkSize) and 0xFFFFFFFFL
+            serverSeq = seqEnd
             offset += chunkSize
         }
     }

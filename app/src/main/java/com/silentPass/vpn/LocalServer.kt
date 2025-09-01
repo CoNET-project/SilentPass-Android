@@ -22,12 +22,14 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.URL
 import android.util.Base64
+
 import com.google.gson.Gson
 import java.io.ByteArrayOutputStream
 import kotlin.ByteArray
 import java.net.DatagramSocket
 import java.net.DatagramPacket
 import java.net.InetSocketAddress
+import java.net.SocketException
 
 class SocketServerService : Service() {
 
@@ -74,7 +76,8 @@ class SocketServerService : Service() {
                 val decodedBytes = Base64.decode(base64, Base64.DEFAULT)
                 val jsonString = String(decodedBytes, Charsets.UTF_8)
                 var startVPNData = Gson().fromJson(jsonString, StartVPNData::class.java)
-                this.layerMinus = LayerMinus(startVPNData)
+                LayerMinus.init(startVPNData)
+                this.layerMinus = LayerMinus
 
                 // Use vpnData to start your server...
             } catch (e: Exception) {
@@ -552,24 +555,60 @@ class SocketServerService : Service() {
                                             // 启动反向转发
 
                                             // 先把所有需要的流拿到手，避免参数求值时触发 Socket 已关闭
-                                            val rs = remoteSocket!!
-                                            val remoteIn  = BufferedInputStream(rs.getInputStream())
-                                            val remoteOut = rs.getOutputStream()
+                                            // ---- 启动 远端->客户端（读远端→写客户端）----
+                                           val rs = remoteSocket!!
+                                           val remoteIn  = BufferedInputStream(rs.getInputStream())
                                             val clientOut = client.getOutputStream()
-
-                                            // 启动 远端->客户端
-                                            Thread {
-                                                forwardTraffic(remoteIn, clientOut)
+                                           val remoteAlive =
+                                               java.util.concurrent.atomic.AtomicBoolean(true)
+                                           Thread {
+                                                try {
+                                                    forwardTraffic(remoteIn, clientOut)
+                                                } finally {
+                                                    // 标记远端读向已结束，并尽量让写端尽快退出
+                                                    remoteAlive.set(false)
+                                                    try { rs.shutdownOutput() } catch (_: Exception) {}
+                                                }
                                             }.start()
+
+											// 将标记存进 socket 的附加字段（简单起见放到 socket 属性上不做）
+											// 后续写入前通过 rs.isClosed / isOutputShutdown + remoteAlive 来判断
+
+
+
+
+
 
 
                                         } else {
-                                            remoteSocket?.getOutputStream()?.write(buffer, 0, bytesRead)
-                                            remoteSocket?.getOutputStream()?.flush()
+                                            val rs = remoteSocket
+                                            if (rs == null) break
+                                            // 若远端已关闭或停止输出，平滑退出
+                                            if (rs.isClosed || rs.isOutputShutdown) {
+                                               Log.d(LOG_TAG, "Remote socket closed/output shutdown; stop client->server")
+                                                break
+                                           }
+                                           try {
+                                               val out = rs.getOutputStream()
+                                              out.write(buffer, 0, bytesRead)
+                                                out.flush()
+                                            } catch (se: SocketException) {
+                                                val msg = se.message ?: ""
+                                                // 常见正常收尾：对端先关、管道断、复位等
+                                                if (msg.contains("Socket closed", true) ||
+                                                    msg.contains("Broken pipe", true) ||
+                                                    msg.contains("reset", true)) {
+                                                    Log.d(LOG_TAG, "Client->server write ended (normal): $msg")
+                                                    break
+                                                } else {
+                                                    throw se
+                                                }
+                                            }
                                         }
                                     }
                                 } catch (e: Exception) {
-                                    Log.e(LOG_TAG, "Client to server forward error", e)
+                                    // 非致命：统一降级为 warn，避免误以为崩溃
+                                    Log.w(LOG_TAG, "Client->server forward ended: ${e.message}")
                                 } finally {
                                     remoteSocket?.close()
                                     client.close()

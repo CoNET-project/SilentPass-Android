@@ -459,6 +459,8 @@ class DNSInterceptor private constructor() {
         "googleanalytics.com",
         "adsystem.com",
         "adsrvr.org",
+		"onetrust.com",
+		"liadm.com",
 
         // Facebook/Meta
         "facebook-analytics.com",
