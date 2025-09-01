@@ -26,7 +26,7 @@ class TCPConnection(
     private val mtu: Int,
     private val packetWriter: (List<ByteArray>, List<Int>) -> Unit,
     private val dns: DNSInterceptor,
-    private val socksEndpoint: SocksEndpoint,
+    private val socksEndpoint: SocksEndpoint?,
     private val bypassDirect: Boolean
 ) {
     companion object {
@@ -303,10 +303,11 @@ class TCPConnection(
 
                 // 动态决定是否flush
                 val shouldFlush = when {
-                    buffer.size() >= mtu - 100 -> true // 接近MTU
-                    pendingWrites.size >= 3 -> true // 累积了多个小包
-                    timeSinceLastWrite > 10 && buffer.size() > 0 -> true // 超时
-                    data.size > 1000 -> true // 大包立即发送
+                    buffer.size() >= mtu - 100 -> true
+                    buffer.size() >= 8192 -> true  // Reduced from 16KB
+                    pendingWrites.size >= 2 -> true
+                    timeSinceLastWrite > 2 && buffer.size() > 0 -> true  // Reduced from 5ms
+                    data.size > 1000 -> true
                     else -> false
                 }
 
@@ -680,7 +681,8 @@ class TCPConnection(
             }
         }
 
-        if (gap < 3 * mss) {  // Changed MSS to mss
+        // For small gaps, buffer immediately without delay
+        if (gap <= 3 * mss) {
             val newSegment = Segment(
                 tcp.payload.copyOf(),
                 timestamp = System.currentTimeMillis()
@@ -690,6 +692,10 @@ class TCPConnection(
                 oooBufferSize.addAndGet(tcp.payload.size)
                 stats.outOfOrderPackets++
             }
+
+            // Try immediate delivery
+            deliverBufferedSegments()
+            sendAckWithSack(ip, tcp, immediate = true)
             return
         }
 
@@ -740,36 +746,27 @@ class TCPConnection(
 
     private suspend fun deliverBufferedSegments() {
         var delivered = 0
+        val toDeliver = mutableListOf<ByteArray>()
 
         while (outOfOrderSegments.isNotEmpty()) {
-            val entry = outOfOrderSegments.firstEntry()
-            if (entry == null) break
+            val entry = outOfOrderSegments.firstEntry() ?: break
 
             if (entry.key == clientNextSeq) {
+                // Remove and prepare for delivery
                 if (outOfOrderSegments.remove(entry.key, entry.value)) {
                     oooBufferSize.addAndGet(-entry.value.data.size)
-
                     val segEnd = (entry.key + entry.value.data.size.toLong()) and 0xFFFFFFFFL
                     clientNextSeq = segEnd
-
-                    pendingLock.withLock {
-                        pending.addLast(entry.value.data)
-                        pendingSize.addAndGet(entry.value.data.size)  // 更新大小
-                    }
-
+                    toDeliver.add(entry.value.data)
                     delivered++
-                    Log.d(LOG_TAG, "Delivered buffered segment seq=${entry.key}, ${entry.value.data.size} bytes")
                 }
             } else if (isSeqBefore(entry.key, clientNextSeq)) {
+                // Handle overlap
                 val overlap = (clientNextSeq - entry.key).toInt()
                 if (overlap < entry.value.data.size) {
                     val newData = entry.value.data.copyOfRange(overlap, entry.value.data.size)
                     clientNextSeq = (clientNextSeq + newData.size.toLong()) and 0xFFFFFFFFL
-
-                    pendingLock.withLock {
-                        pending.addLast(newData)
-                        pendingSize.addAndGet(newData.size)  // 更新大小
-                    }
+                    toDeliver.add(newData)
                     delivered++
                 }
                 outOfOrderSegments.remove(entry.key)
@@ -779,10 +776,18 @@ class TCPConnection(
             }
         }
 
-        if (delivered > 0) {
+        // Batch add to pending queue
+        if (toDeliver.isNotEmpty()) {
+            pendingLock.withLock {
+                for (data in toDeliver) {
+                    pending.addLast(data)
+                    pendingSize.addAndGet(data.size)
+                }
+            }
             Log.d(LOG_TAG, "Delivered $delivered buffered segments for ${getDisplayKey()}")
             tryFlushUpstream()
         }
+
     }
 
     // =============== Delayed ACK with SACK support ===============
