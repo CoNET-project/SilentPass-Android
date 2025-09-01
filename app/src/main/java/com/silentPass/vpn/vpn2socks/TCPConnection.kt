@@ -31,23 +31,43 @@ class TCPConnection(
 ) {
     companion object {
         private const val LOG_TAG = "TCPConnection"
-        private const val MSS = 1460  // Maximum Segment Size
-        private const val INITIAL_CWND = 10 * MSS
-        private const val MIN_CWND = 2 * MSS
+
+        // MSS constants for different connection types
+        private const val MSS_STANDARD = 1460     // Standard Ethernet
+        private const val MSS_SOCKS = 1420        // SOCKS proxy
+        private const val MSS_VPN = 1380          // VPN tunnel
+
+        // Multipliers for CWND calculations
+        private const val INITIAL_CWND_MULTIPLIER = 10
+        private const val MIN_CWND_MULTIPLIER = 2
+
+        // Other constants
         private const val INITIAL_RTO = 1000L  // 1 second
         private const val MIN_RTO = 200L
         private const val MAX_RTO = 60000L
         private const val SACK_PERMITTED = 4
         private const val SACK_OPTION = 5
 
-        // New: soft limits for inbound buffering and advertised window.
+        // Buffering and window limits
         private const val MAX_PENDING_BYTES = 256 * 1024
         private const val MIN_ADV_WINDOW = 1024
         private const val MAX_ADV_WINDOW = 65535
 
-        // New: delayed ACK timers
+        // Delayed ACK timers
         private const val DELAYED_ACK_MS = 40L
         private const val MAX_PENDING_ACKS = 2
+    }
+
+    private val mss: Int = calculateOptimalMSS()
+    // Dynamic CWND values based on instance MSS
+    private val INITIAL_CWND = INITIAL_CWND_MULTIPLIER * mss
+    private val MIN_CWND = MIN_CWND_MULTIPLIER * mss
+    private fun calculateOptimalMSS(): Int {
+        return when {
+            bypassDirect -> MSS_STANDARD        // Direct connection uses standard value
+            socksEndpoint != null -> MSS_SOCKS  // SOCKS proxy needs some overhead
+            else -> MSS_VPN                     // VPN tunnel uses conservative value
+        }
     }
 
     // =============== Connection Statistics ===============
@@ -80,7 +100,7 @@ class TCPConnection(
 
     // =============== Congestion Control ===============
     private inner class CongestionControl {
-        @Volatile private var cwnd = INITIAL_CWND
+        @Volatile private var cwnd = this@TCPConnection.INITIAL_CWND  // Use instance value
         @Volatile private var ssthresh = Int.MAX_VALUE
         @Volatile private var flightSize = 0
 
@@ -110,12 +130,10 @@ class TCPConnection(
             duplicateAckCount.set(0)
 
             if (ackedBytes > 0) {
-                // 增加慢启动阈值
                 if (cwnd < ssthresh) {
-                    cwnd = min(cwnd + min(ackedBytes, MSS * 2), ssthresh) // 更激进的增长
+                    cwnd = min(cwnd + min(ackedBytes, mss * 2), ssthresh)
                 } else {
-                    // 拥塞避免阶段也可以更激进
-                    cwnd += (MSS * ackedBytes * 2) / cwnd  // 2倍增长因子
+                    cwnd += (mss * ackedBytes * 2) / cwnd
                 }
             }
         }
@@ -125,16 +143,15 @@ class TCPConnection(
             stats.duplicateAcks++
 
             if (count == 3L) {
-                // Fast retransmit/recovery
-                ssthresh = max(flightSize / 2, MIN_CWND)
-                cwnd = ssthresh + 3 * MSS
+                ssthresh = max(flightSize / 2, this@TCPConnection.MIN_CWND)  // Use instance value
+                cwnd = ssthresh + 3 * mss
                 Log.d(LOG_TAG, "Fast recovery triggered: ssthresh=$ssthresh, cwnd=$cwnd")
             }
         }
 
         fun onTimeout() {
-            ssthresh = max(cwnd / 2, MIN_CWND)
-            cwnd = MIN_CWND
+            ssthresh = max(cwnd / 2, this@TCPConnection.MIN_CWND)  // Use instance value
+            cwnd = this@TCPConnection.MIN_CWND  // Use instance value
             duplicateAckCount.set(0)
             Log.d(LOG_TAG, "Timeout: ssthresh=$ssthresh, cwnd=$cwnd")
         }
@@ -149,6 +166,9 @@ class TCPConnection(
 
         fun getRto(): Long = rto
     }
+
+    // Add standard MSS values
+
 
     // =============== SACK Support ===============
     private data class SackBlock(val start: Long, val end: Long)
@@ -380,7 +400,10 @@ class TCPConnection(
     }
 
     init {
-        // 启动健康监测
+        // Log the MSS being used for this connection
+        Log.d(LOG_TAG, "Connection initialized with MSS=$mss for $key (bypassDirect=$bypassDirect, hasSocks=${socksEndpoint != null})")
+
+        // Start health monitoring
         scope.launch {
             monitorConnectionHealth()
         }
@@ -518,17 +541,16 @@ class TCPConnection(
 
     private suspend fun handleSyn(ip: IPv4Packet, tcp: TCPSegment) {
         val domain = dns.lookupDomain(ip.dst)
-        resolvedDomain = domain  // Store the domain
+        resolvedDomain = domain
 
         clientSeq0 = tcp.seq.toLong() and 0xFFFFFFFFL
         clientNextSeq = (clientSeq0!! + 1L) and 0xFFFFFFFFL
 
-        // Parse client's TCP options to check for SACK support
         parseTcpOptions(tcp)
 
         scope.launch { establishUpstream(ip, tcp, domain) }
 
-        // Send SYN-ACK with MSS and SACK-Permitted options
+        // Send SYN-ACK with dynamic MSS
         val synAck = IpBuilders.tcpSynAckWithOptions(
             src = ip.dst,
             dst = ip.src,
@@ -537,14 +559,14 @@ class TCPConnection(
             seq = serverSeq.toInt(),
             ack = clientNextSeq.toInt(),
             window = calcAdvertisedWindow(),
-            mss = MSS,
+            mss = mss,  // Use dynamic mss instead of MSS
             sackPermitted = weSupportSack
         )
 
         packetWriter(listOf(synAck), listOf(ConnectionManager.PROTO_IPV4))
         serverSeq = (serverSeq + 1L) and 0xFFFFFFFFL
 
-        Log.d(LOG_TAG, "Sent SYN-ACK with MSS=$MSS and SACK-Permitted=$weSupportSack for ${getDisplayKey()}")
+        Log.d(LOG_TAG, "Sent SYN-ACK with MSS=$mss and SACK-Permitted=$weSupportSack for ${getDisplayKey()}")
     }
 
     private suspend fun handleHandshakeAck(ip: IPv4Packet, tcp: TCPSegment) {
@@ -647,27 +669,25 @@ class TCPConnection(
 
     private suspend fun handleOutOfOrderPacket(ip: IPv4Packet, tcp: TCPSegment, segSeq: Long) {
         val gap = segSeq - clientNextSeq
-        val segEnd = (segSeq + tcp.payload.size) and 0xFFFFFFFFL // 添加这行
+        val segEnd = (segSeq + tcp.payload.size) and 0xFFFFFFFFL
 
-        // 小间隙直接等待
-        if (gap <= MSS) {
+        // Small gap - wait briefly
+        if (gap <= mss) {  // Changed MSS to mss
             delay(5)
-            // 重新检查是否已经收到
             if (segSeq == clientNextSeq) {
                 handleInOrderPacket(ip, tcp, segEnd)
                 return
             }
         }
 
-        if (gap < 3 * MSS) {
-            // Thread-safe put-if-absent
+        if (gap < 3 * mss) {  // Changed MSS to mss
             val newSegment = Segment(
                 tcp.payload.copyOf(),
                 timestamp = System.currentTimeMillis()
             )
 
             if (outOfOrderSegments.putIfAbsent(segSeq, newSegment) == null) {
-                oooBufferSize.addAndGet(tcp.payload.size)  // Note: oooBufferSize should be AtomicInteger
+                oooBufferSize.addAndGet(tcp.payload.size)
                 stats.outOfOrderPackets++
             }
             return
@@ -921,7 +941,7 @@ class TCPConnection(
             upstreamWriter = socket.getOutputStream()
             upstreamReader = socket.getInputStream()
 
-            
+
             // Only then update phase
             stateLock.withLock {
                 socksPrimed = true
