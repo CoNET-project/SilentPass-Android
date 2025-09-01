@@ -1027,6 +1027,7 @@ class TCPConnection(
 
                 consecutiveTimeouts = 0  // Reset on successful read
 
+
                 if (n <= 0) {
                     delay(100)
                     if (totalRead == 0) {
