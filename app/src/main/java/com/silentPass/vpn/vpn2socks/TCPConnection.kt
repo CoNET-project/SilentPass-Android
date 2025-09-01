@@ -463,12 +463,15 @@ class TCPConnection(
             return
         }
 
-        // RST handling
+        // RST handling - check if already closing
         if (tcp.isRST) {
             Log.d(LOG_TAG, "RST received for ${getDisplayKey()}")
-            closeConnection()
+            if (!isClosed) {
+                closeConnection()
+            }
             return
         }
+
 
         // SYN handling
         if (tcp.isSYN && !tcp.isACK) {
@@ -866,6 +869,13 @@ class TCPConnection(
     }
 
     private suspend fun handleFIN(ip: IPv4Packet, tcp: TCPSegment) {
+
+        // Check if already closing
+        if (isClosed || clientHalfClosed) {
+            Log.d(LOG_TAG, "FIN received but already closing for ${getDisplayKey()}")
+            return
+        }
+
         Log.d(LOG_TAG, "FIN received for ${getDisplayKey()} (client half-close)")
         clientNextSeq = (clientNextSeq + 1L) and 0xFFFFFFFFL
         sendAckWithSack(ip, tcp, immediate = true)
@@ -1042,16 +1052,28 @@ class TCPConnection(
                 Log.d(LOG_TAG, "Server->Client: $n bytes (total: $totalRead) for ${getDisplayKey()}")
                 sendDataToClient(ip, tcp, buffer.copyOf(n))
             }
+        } catch (e: CancellationException) {
+            // This is expected when connection is closed
+            Log.d(LOG_TAG, "Downstream loop cancelled after $totalRead bytes for ${getDisplayKey()}")
         } catch (e: Exception) {
-            Log.e(LOG_TAG, "Downstream error after $totalRead bytes: ${e.message}", e)
+            // Only log as error if it's unexpected
+            if (!isClosed) {
+                Log.e(LOG_TAG, "Downstream error after $totalRead bytes: ${e.message}", e)
+            } else {
+                Log.d(LOG_TAG, "Downstream stopped after $totalRead bytes: ${e.message}")
+            }
         } finally {
-            // Only log error if no data was received
-            if (totalRead == 0) {
+            // Only log error if no data was received AND connection wasn't intentionally closed
+            if (totalRead == 0 && !isClosed) {
                 Log.e(LOG_TAG, "Downstream loop exiting with NO DATA for ${getDisplayKey()}")
             } else {
                 Log.d(LOG_TAG, "Downstream loop exiting after $totalRead bytes for ${getDisplayKey()}")
             }
-            closeConnection()
+
+            // Only close if not already closing
+            if (!isClosed) {
+                closeConnection()
+            }
         }
     }
 
@@ -1229,17 +1251,28 @@ class TCPConnection(
 
 
     private fun closeConnection() {
-        if (!closedOnce.compareAndSet(false, true)) return
+        // Already closing/closed, just return
+        if (!closedOnce.compareAndSet(false, true)) {
+            Log.d(LOG_TAG, "Connection already closing/closed for ${getDisplayKey()}")
+            return
+        }
+
+        Log.d(LOG_TAG, "Starting connection close for ${getDisplayKey()}")
 
         isClosed = true
         canWrite = false  // 立即禁止写入
 
-        scope.cancel("Connection closed")
+        // Use cancelChildren instead of cancel to avoid propagating cancellation
+        scope.coroutineContext.cancelChildren()
 
         cleanupScope.launch {
             try {
+
+                // Give coroutines time to handle cancellation gracefully
+                delay(100)
+
                 ackFlushJob?.cancelAndJoin()
-                delay(50)
+
 
                 // 安全关闭写入流
                 writeLock.withLock {
