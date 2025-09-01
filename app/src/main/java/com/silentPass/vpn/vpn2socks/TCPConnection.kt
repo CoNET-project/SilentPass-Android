@@ -8,6 +8,7 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
@@ -72,7 +73,6 @@ class TCPConnection(
     private val stats = ConnectionStats()
 
     private val pendingSize = AtomicInteger(0)  // 新增：缓存pending的总大小
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     // SACK support flag (set during handshake)
     @Volatile private var peerSupportsSack = false
@@ -349,6 +349,9 @@ class TCPConnection(
     private val preHandshakeBuf = ByteArrayOutputStream(32 * 1024)
     private val preHandshakeLock = Mutex()
 
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     // =============== Flow Control ===============
     private val congestionControl = CongestionControl()
     private val writeCoalescer = AdaptiveWriteCoalescer()
@@ -384,25 +387,58 @@ class TCPConnection(
     }
 
     private suspend fun monitorConnectionHealth() {
+        // 等待一段时间让连接有机会建立
+        delay(3000)
+
         while (!isClosed) {
             delay(1000)
 
-            val packetLoss = if (stats.totalPackets > 0) {
-                stats.droppedPackets.toFloat() / stats.totalPackets
-            } else 0f
+            try {
+                // 获取当前状态
+                val currentPhase = stateLock.withLock { phase }
 
-            val rtt = congestionControl.getRto()
+                // 根据不同阶段采取不同的健康检查策略
+                when (currentPhase) {
+                    Phase.SYN, Phase.HANDSHAKE_ACKED, Phase.SOCKS_PRIMED -> {
+                        // 建立阶段，不检查 socket 健康状态
+                        // 但可以检查是否超时
+                        // 这里可以添加建立超时逻辑
+                    }
 
-            // 动态调整策略
-            if (packetLoss > 0.05) { // 5% 丢包率
-                Log.w(LOG_TAG, "High packet loss detected: ${packetLoss * 100}% for ${getDisplayKey()}")
-                // 可以在这里调整拥塞控制参数
-            }
+                    Phase.STREAMING, Phase.HALF_CLOSED_LOCAL, Phase.HALF_CLOSED_REMOTE -> {
+                        // 数据传输阶段，检查 socket 健康状态
+                        if (!isSocketHealthy() && !isClosed) {
+                            Log.w(LOG_TAG, "Socket unhealthy in phase $currentPhase for ${getDisplayKey()}")
+                            closeConnection()
+                            break
+                        }
+                    }
 
-            if (rtt > 2000) { // RTT > 2秒
-                Log.w(LOG_TAG, "High RTT detected: ${rtt}ms for ${getDisplayKey()}")
+                    Phase.CLOSED -> {
+                        // 已关闭，退出监控
+                        break
+                    }
+                }
+
+                // 监控统计信息
+                if (stats.totalPackets > 100) {  // 有足够的样本
+                    val packetLoss = stats.droppedPackets.toFloat() / stats.totalPackets
+                    if (packetLoss > 0.05) {
+                        Log.w(LOG_TAG, "High packet loss: ${(packetLoss * 100).toInt()}% for ${getDisplayKey()}")
+                    }
+                }
+
+                val rtt = congestionControl.getRto()
+                if (rtt > 2000 && currentPhase == Phase.STREAMING) {
+                    Log.w(LOG_TAG, "High RTT: ${rtt}ms for ${getDisplayKey()}")
+                }
+
+            } catch (e: Exception) {
+                Log.e(LOG_TAG, "Health monitor error: ${e.message}")
             }
         }
+
+        Log.d(LOG_TAG, "Health monitor exited for ${getDisplayKey()}")
     }
 
 
@@ -875,12 +911,55 @@ class TCPConnection(
         } finally {
             // 确保异常时释放资源
             if (socket != null && upstream == null) {
-                if (pooledSocket) {
-                    SocketPool.release(socket)
-                } else {
-                    socket.runCatching { close() }
+                try {
+                    if (pooledSocket) {
+                        SocketPool.release(socket)
+                    } else {
+                        socket.close()
+                    }
+                } catch (e: Exception) {
+                    Log.w(LOG_TAG, "Failed to cleanup socket: ${e.message}")
                 }
             }
+        }
+    }
+
+    private fun isSocketHealthy(): Boolean {
+        return try {
+            val socket = upstream
+
+            if (socket == null) {
+                // Socket 还没创建不一定是问题
+                val currentPhase = phase  // volatile read
+                // 只有在应该有 socket 的阶段才认为是不健康
+                return currentPhase == Phase.SYN ||
+                        currentPhase == Phase.HANDSHAKE_ACKED ||
+                        currentPhase == Phase.SOCKS_PRIMED
+            }
+
+            // 检查基本连接状态
+            val isConnected = socket.isConnected && !socket.isClosed
+
+            // 检查输入输出状态（半关闭状态也算健康）
+            val canRead = !socket.isInputShutdown
+            val canWrite = !socket.isOutputShutdown
+
+            // 只要连接还在，且至少能读或写，就认为是健康的
+            val healthy = isConnected && (canRead || canWrite)
+
+            if (!healthy) {
+                // 详细日志帮助调试
+                Log.d(LOG_TAG, "Socket state: closed=${socket.isClosed}, " +
+                        "connected=${socket.isConnected}, " +
+                        "inputShutdown=${socket.isInputShutdown}, " +
+                        "outputShutdown=${socket.isOutputShutdown}, " +
+                        "healthy=$healthy (canRead=$canRead, canWrite=$canWrite)")
+            }
+
+            healthy
+        } catch (e: Exception) {
+            Log.e(LOG_TAG, "Error checking socket health: ${e.message}")
+            false
         }
     }
 
@@ -903,30 +982,37 @@ class TCPConnection(
     private suspend fun downstreamLoop(ip: IPv4Packet, tcp: TCPSegment) = withContext(Dispatchers.IO) {
         val reader = upstreamReader ?: return@withContext
         val buffer = ByteArray(32 * 1024)
+        var totalRead = 0  // 添加计数器
 
         try {
             Log.d(LOG_TAG, "Downstream loop started for ${getDisplayKey()}")
 
-            while (!isClosed) {
+            while (!isClosed && isSocketHealthy()) {
                 val n = try {
                     reader.read(buffer)
                 } catch (e: java.net.SocketTimeoutException) {
+                    // 超时是正常的，继续循环
                     continue
+                } catch (e: IOException) {
+                    Log.e(LOG_TAG, "Read error in downstream: ${e.message} for ${getDisplayKey()}")
+                    break
                 }
 
                 if (n <= 0) {
-                    Log.i(LOG_TAG, "Downstream EOF for ${getDisplayKey()} (server done sending)")
+                    Log.i(LOG_TAG, "Downstream EOF after reading $totalRead bytes for ${getDisplayKey()}")
                     sendFinToClient(ip, tcp)
                     stateLock.withLock { phase = Phase.HALF_CLOSED_REMOTE }
                     break
                 }
 
-                Log.d(LOG_TAG, "Server->Client: $n bytes for ${getDisplayKey()}")
+                totalRead += n
+                Log.d(LOG_TAG, "Server->Client: $n bytes (total: $totalRead) for ${getDisplayKey()}")
                 sendDataToClient(ip, tcp, buffer.copyOf(n))
             }
         } catch (e: Exception) {
-            Log.e(LOG_TAG, "Downstream error: ${e.message}", e)
+            Log.e(LOG_TAG, "Downstream error after $totalRead bytes: ${e.message}", e)
         } finally {
+            Log.d(LOG_TAG, "Downstream loop exiting after $totalRead bytes for ${getDisplayKey()}")
             closeConnection()
         }
     }
@@ -972,42 +1058,31 @@ class TCPConnection(
         Log.d(LOG_TAG, "Sent FIN|ACK to client for ${getDisplayKey()}")
     }
 
-    private fun isConnectionHealthy(): Boolean {
-        return try {
-            upstream?.let { socket ->
-                !socket.isClosed &&
-                        socket.isConnected &&
-                        !socket.isInputShutdown &&
-                        !socket.isOutputShutdown
-            } ?: false
-        } catch (e: Exception) {
-            false
-        }
-    }
-
     private suspend fun tryFlushUpstream() = withContext(Dispatchers.IO) {
         val writer = upstreamWriter ?: return@withContext
+        var totalFlushed = 0  // 添加计数器
 
         while (true) {
+            if (!isSocketHealthy()) {
+                Log.w(LOG_TAG, "Socket unhealthy, stopping flush for ${getDisplayKey()}")
+                break  // 使用 break 而不是 return
+            }
+
             val chunk = pendingLock.withLock {
                 if (pending.isEmpty()) {
                     null
                 } else {
                     val data = pending.removeFirst()
-                    pendingSize.addAndGet(-data.size)  // 更新大小
+                    pendingSize.addAndGet(-data.size)
                     data
                 }
-            } ?: break
+            } ?: break  // 没有更多数据，退出循环
 
-            if (isClosed || upstream?.isClosed == true) {
-                Log.w(LOG_TAG, "Connection closed, stopping flush")
-                break
-            }
 
             if (!congestionControl.canSend(chunk.size)) {
                 pendingLock.withLock {
                     pending.addFirst(chunk)
-                    pendingSize.addAndGet(chunk.size)  // 恢复大小
+                    pendingSize.addAndGet(chunk.size)
                 }
                 delay(congestionControl.getRto() / 10)
                 continue
@@ -1015,52 +1090,72 @@ class TCPConnection(
 
             try {
                 writeLock.withLock {
-                    if (isClosed) return@withLock
+                    if (!isSocketHealthy()) {
+                        pendingLock.withLock {
+                            pending.addFirst(chunk)
+                            pendingSize.addAndGet(chunk.size)
+                        }
+                        return@withLock
+                    }
 
                     val success = writeCoalescer.offer(chunk) { data: ByteArray ->
                         try {
-                            Log.d(LOG_TAG, "Flushing ${data.size} bytes to upstream")
+                            if (!isSocketHealthy()) {
+                                Log.w(LOG_TAG, "Socket became unhealthy before write")
+                                return@offer false
+                            }
+
+                            Log.d(LOG_TAG, "Flushing ${data.size} bytes to upstream for ${getDisplayKey()}")
                             writer.write(data)
                             writer.flush()
+                            totalFlushed += data.size
+                            Log.d(LOG_TAG, "Successfully flushed, total: $totalFlushed bytes for ${getDisplayKey()}")
                             congestionControl.onSend(data.size)
                             true
-                        } catch (e: SocketTimeoutException) {
-                            Log.w(LOG_TAG, "Write timeout")
+                        } catch (e: SocketException) {
+                            Log.e(LOG_TAG, "Socket exception during write for ${getDisplayKey()}: ${e.message}")
                             false
                         } catch (e: IOException) {
-                            Log.e(LOG_TAG, "Write failed: ${e.message}")
+                            Log.e(LOG_TAG, "IO exception during write for ${getDisplayKey()}: ${e.message}")
                             false
                         }
                     }
 
                     if (!success) {
-                        Log.w(LOG_TAG, "Write failed, initiating graceful close")
-                        throw Exception("Write failed")
+                        Log.w(LOG_TAG, "Write failed after $totalFlushed bytes for ${getDisplayKey()}")
+                        closeConnection()  // 关闭连接而不是只返回
+                        return@withContext
                     }
                 }
             } catch (e: Exception) {
-                Log.e(LOG_TAG, "Flush error: ${e.message}", e)
+                Log.e(LOG_TAG, "Flush error after $totalFlushed bytes: ${e.message}")
                 congestionControl.onTimeout()
                 closeConnection()
-                break
+                return@withContext
             }
         }
 
+        // 完成后调用清理
         cleanupPendingData()
     }
 
     private suspend fun cleanupPendingData() {
         try {
             writeLock.withLock {
-                if (!isClosed && upstreamWriter != null) {
-                    // 正确调用flush，传入writer lambda
+                if (isSocketHealthy() && upstreamWriter != null) {
                     writeCoalescer.flush { data ->
                         try {
-                            upstreamWriter?.write(data)
-                            upstreamWriter?.flush()
-                            true
+                            // 使用 helper 方法检查
+                            if (isSocketHealthy()) {
+                                upstreamWriter?.write(data)
+                                upstreamWriter?.flush()
+                                true
+                            } else {
+                                Log.d(LOG_TAG, "Socket unhealthy during final flush")
+                                false
+                            }
                         } catch (e: Exception) {
-                            Log.w(LOG_TAG, "Final flush failed: ${e.message}")
+                            Log.d(LOG_TAG, "Final flush exception: ${e.message}")
                             false
                         }
                     }
@@ -1070,12 +1165,11 @@ class TCPConnection(
             Log.w(LOG_TAG, "Cleanup failed: ${e.message}")
         }
 
-        // 处理关闭
         val shouldShutdown = stateLock.withLock {
             pendingShutdown && pending.isEmpty()
         }
 
-        if (shouldShutdown) {
+        if (shouldShutdown && isSocketHealthy()) {
             try {
                 upstream?.shutdownOutput()
                 Log.d(LOG_TAG, "Upstream output shutdown")
@@ -1091,24 +1185,46 @@ class TCPConnection(
         return diff > 0x80000000L
     }
 
+
+
     private fun closeConnection() {
         if (!closedOnce.compareAndSet(false, true)) return
 
         isClosed = true
+
+        // 先取消主作用域
         scope.cancel("Connection closed")
 
-        GlobalScope.launch(Dispatchers.IO) {
+        // 使用清理作用域进行资源清理
+        cleanupScope.launch {
             try {
-                ackFlushJob?.cancel()
+                // 取消所有子任务
+                ackFlushJob?.cancelAndJoin()
 
+                // 给一点时间让正在进行的操作完成
+                delay(50)
+
+                // 关闭流
+                kotlin.runCatching {
+                    upstreamWriter?.flush()
+                    upstreamWriter?.close()
+                }
                 kotlin.runCatching { upstreamReader?.close() }
-                kotlin.runCatching { upstreamWriter?.close() }
 
+                // 处理 socket
                 upstream?.let { socket ->
                     kotlin.runCatching {
                         if (!socket.isClosed) {
                             socket.soTimeout = 100
-                            if (bypassDirect) {
+
+                            // 确保所有数据都已发送
+                            try {
+                                socket.shutdownOutput()
+                            } catch (e: Exception) {
+                                // Socket 可能已经关闭
+                            }
+
+                            if (bypassDirect && !socket.isInputShutdown && !socket.isOutputShutdown) {
                                 SocketPool.release(socket)
                             } else {
                                 socket.close()
@@ -1121,7 +1237,8 @@ class TCPConnection(
                 sentTimeMap.clear()
                 outOfOrderSegments.clear()
                 pending.clear()
-                pendingSize.set(0)  // 重置大小计数器
+                pendingSize.set(0)
+                oooBufferSize.set(0)
 
             } catch (e: Exception) {
                 Log.e(LOG_TAG, "Error during cleanup: ${e.message}")
@@ -1129,6 +1246,10 @@ class TCPConnection(
                 upstreamReader = null
                 upstreamWriter = null
                 upstream = null
+
+                // 最后取消清理作用域自身
+                delay(100) // 给一点时间确保日志输出
+                cleanupScope.cancel()
             }
         }
     }
