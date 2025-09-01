@@ -58,6 +58,19 @@ class TCPConnection(
         private const val MAX_PENDING_ACKS = 2
     }
 
+	// ---- Log deduplication (noise control) ----
+	private val lastLogTs = ConcurrentHashMap<String, Long>()
+	private fun shouldLog(key: String, windowMs: Long = 3000L): Boolean {
+		val now = System.currentTimeMillis()
+		val last = lastLogTs[key]
+		if (last != null && now - last < windowMs) return false
+			lastLogTs[key] = now
+			return true
+    }
+
+	private fun tupleKeyForDedup(extra: String): String = getDisplayKey() + "|" + extra
+
+
     private val mss: Int = calculateOptimalMSS()
     // Dynamic CWND values based on instance MSS
     private val INITIAL_CWND = INITIAL_CWND_MULTIPLIER * mss
@@ -402,7 +415,7 @@ class TCPConnection(
 
     init {
         // Log the MSS being used for this connection
-        Log.d(LOG_TAG, "Connection initialized with MSS=$mss for $key (bypassDirect=$bypassDirect, hasSocks=${socksEndpoint != null})")
+        android.util.Log.i(LOG_TAG, "Connection initialized with MSS=$mss for ${getDisplayKey()} (bypassDirect=$bypassDirect")
 
         // Start health monitoring
         scope.launch {
@@ -483,7 +496,7 @@ class TCPConnection(
 
     private suspend fun processPacket(ip: IPv4Packet, tcp: TCPSegment) {
         if (isClosed) {
-            Log.w(LOG_TAG, "Connection already closed for ${getDisplayKey()}")
+            if (shouldLog(tupleKeyForDedup("ALREADY_CLOSED"), 5000L)) Log.d(LOG_TAG, "Connection already closed for ${getDisplayKey()}")
             return
         }
 
@@ -567,7 +580,7 @@ class TCPConnection(
         packetWriter(listOf(synAck), listOf(ConnectionManager.PROTO_IPV4))
         serverSeq = (serverSeq + 1L) and 0xFFFFFFFFL
 
-        Log.d(LOG_TAG, "Sent SYN-ACK with MSS=$mss and SACK-Permitted=$weSupportSack for ${getDisplayKey()}")
+        android.util.Log.v(LOG_TAG, "Sent SYN-ACK with MSS=$mss and SACK-Permitted=$weSupportSack for ${getDisplayKey()}")
     }
 
     private suspend fun handleHandshakeAck(ip: IPv4Packet, tcp: TCPSegment) {
@@ -577,7 +590,7 @@ class TCPConnection(
                 handshakeAcked = true
                 phase = Phase.HANDSHAKE_ACKED
             }
-            Log.d(LOG_TAG, "3-way handshake established for ${getDisplayKey()} (SACK enabled: $peerSupportsSack)")
+            android.util.Log.i(LOG_TAG, "3-way handshake established for ${getDisplayKey()} (SACK enabled: $peerSupportsSack)")
 
             flushPreHandshakeBuffer()
             tryStartDownstream(ip, tcp)
@@ -624,7 +637,10 @@ class TCPConnection(
     }
 
     private suspend fun handleInOrderPacket(ip: IPv4Packet, tcp: TCPSegment, segEnd: Long) {
-        Log.d(LOG_TAG, "Client->Server (in-order): ${tcp.payload.size} bytes for ${getDisplayKey()}")
+        LogNoiseLimiter.log(LOG_TAG, "cs:${getDisplayKey()}", 'V', 900) {
+            "Client->Server (in-order): ${tcp.payload.size} bytes for ${getDisplayKey()}"
+        }
+
 
         clientNextSeq = segEnd
         congestionControl.onAck(tcp.payload.size)
@@ -648,13 +664,21 @@ class TCPConnection(
         stats.retransmittedPackets++
 
         if (isSeqBefore(segEnd, expect)) {
-            Log.d(LOG_TAG, "Duplicate segment seq=$segSeq expect=$expect for ${getDisplayKey()}")
+            if (shouldLog(tupleKeyForDedup("DUP_SEG")))
+                LogNoiseLimiter.log(LOG_TAG, "dup:${getDisplayKey()}", 'V', 1500) {
+                    "Duplicate segment seq=$segSeq expect=$expect for ${getDisplayKey()}"
+                }
             congestionControl.onDuplicateAck()
             sendAckWithSack(ip, tcp, immediate = true)
         } else {
             val overlap = (expect - segSeq).toInt()
             val newData = tcp.payload.copyOfRange(overlap, tcp.payload.size)
-            Log.d(LOG_TAG, "Partial retrans: ${newData.size} new bytes for ${getDisplayKey()}")
+
+            LogNoiseLimiter.log(LOG_TAG, "retran:${getDisplayKey()}", 'V', 1500) {
+                "Partial retrans: ${newData.size} new bytes for ${getDisplayKey()}"
+            }
+
+
 
             clientNextSeq = (expect + newData.size) and 0xFFFFFFFFL
             pendingLock.withLock {
@@ -804,7 +828,10 @@ class TCPConnection(
         val tcpOptions = if (peerSupportsSack && outOfOrderSegments.isNotEmpty()) {
             val sackBlocks = generateSackBlocks()  // Now properly synchronized
             if (sackBlocks.isNotEmpty()) {
-                Log.d(LOG_TAG, "Sending SACK blocks: ${sackBlocks.joinToString()}")
+                if (shouldLog(tupleKeyForDedup("SACK")))
+                    LogNoiseLimiter.log(LOG_TAG, "sack:${getDisplayKey()}", 'V', 1500) {
+                        "Sending SACK blocks: ${sackBlocks.joinToString()}"
+                    }
                 buildSackOption(sackBlocks)
             } else {
                 null
@@ -953,7 +980,7 @@ class TCPConnection(
                 phase = Phase.SOCKS_PRIMED
             }
 
-            Log.d(LOG_TAG, "Upstream established for ${getDisplayKey()}")
+            android.util.Log.i(LOG_TAG, "Upstream established for ${getDisplayKey()}")
 
             tryFlushUpstream()
             tryStartDownstream(ip, syn)
@@ -1034,7 +1061,7 @@ class TCPConnection(
         val maxConsecutiveTimeouts = 30  // Increase from 10 to 30 (60 seconds with 2s timeout)
 
         try {
-            Log.d(LOG_TAG, "Downstream loop started for ${getDisplayKey()}")
+            android.util.Log.i(LOG_TAG, "Downstream loop started for ${getDisplayKey()}")
 
             while (!isClosed && isSocketHealthy()) {
                 val n = try {
@@ -1076,7 +1103,9 @@ class TCPConnection(
                 }
 
                 totalRead += n
-                Log.d(LOG_TAG, "Server->Client: $n bytes (total: $totalRead) for ${getDisplayKey()}")
+                LogNoiseLimiter.log(LOG_TAG, "sc:${getDisplayKey()}", 'V', 900) {
+                    "Server->Client: $n bytes (total: $totalRead) for ${getDisplayKey()}"
+                }
 
 
 
@@ -1085,7 +1114,7 @@ class TCPConnection(
             }
         } catch (e: CancellationException) {
             // This is expected when connection is closed
-            Log.d(LOG_TAG, "Downstream loop cancelled after $totalRead bytes for ${getDisplayKey()}")
+            android.util.Log.i(LOG_TAG, "Downstream loop cancelled after $totalRead bytes for ${getDisplayKey()}")
         } catch (e: Exception) {
             // Only log as error if it's unexpected
             if (!isClosed) {
@@ -1098,13 +1127,48 @@ class TCPConnection(
             if (totalRead == 0 && !isClosed) {
                 Log.e(LOG_TAG, "Downstream loop exiting with NO DATA for ${getDisplayKey()}")
             } else {
-                Log.d(LOG_TAG, "Downstream loop exiting after $totalRead bytes for ${getDisplayKey()}")
+                android.util.Log.i(LOG_TAG, "Downstream loop exiting after $totalRead bytes for ${getDisplayKey()}")
             }
 
             // Only close if not already closing
             if (!isClosed) {
                 closeConnection()
             }
+        }
+    }
+
+    private object LogNoiseLimiter {
+        private data class Entry(var lastTs: Long, var suppressed: Int, var lastMsgHash: Int)
+        private val map = java.util.concurrent.ConcurrentHashMap<String, Entry>()
+        private fun now() = android.os.SystemClock.uptimeMillis()
+
+        /**
+         * Throttled, de-duplicated log.
+         * @param key stable key (e.g., "cs:$fiveTuple", "sc:$fiveTuple")
+         * @param level 'V','D','I','W','E'
+         */
+        fun log(tag: String, key: String, level: Char, intervalMs: Long = 800, build: () -> String) {
+            val msg = build()
+            val h = msg.hashCode()
+            val e = map.getOrPut(key) { Entry(0L, 0, 0) }
+            val t = now()
+            val isSame = e.lastMsgHash == h
+            val elapsed = t - e.lastTs
+            if (isSame && elapsed < intervalMs) {
+                e.suppressed += 1
+                return
+            }
+            val finalMsg = if (e.suppressed > 0) "$msg (suppressed ${e.suppressed} similar)" else msg
+            when (level) {
+                'V' -> android.util.Log.v(tag, finalMsg)
+                'D' -> android.util.Log.d(tag, finalMsg)
+                'I' -> android.util.Log.i(tag, finalMsg)
+                'W' -> android.util.Log.w(tag, finalMsg)
+                else -> android.util.Log.e(tag, finalMsg)
+            }
+            e.lastTs = t
+            e.lastMsgHash = h
+            e.suppressed = 0
         }
     }
 
