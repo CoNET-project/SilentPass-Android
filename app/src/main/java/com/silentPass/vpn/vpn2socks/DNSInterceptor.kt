@@ -1,9 +1,18 @@
 package com.silentPass.vpn.vpn2socks
 
 import android.util.Log
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -14,6 +23,8 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import javax.net.SocketFactory
 import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 class DNSInterceptor private constructor() {
 
@@ -28,83 +39,291 @@ class DNSInterceptor private constructor() {
             }
         }
 
+
         @Volatile
         private var INSTANCE: DNSInterceptor? = null
-		private val initGate = java.util.concurrent.CountDownLatch(1)
-		private val initDone = java.util.concurrent.atomic.AtomicBoolean(false)
-		private val lastInitWarnAt = java.util.concurrent.atomic.AtomicLong(0L)
-		fun signalReady() {
-			if (initDone.compareAndSet(false, true)) initGate.countDown()
-		}
+        private val initGate = java.util.concurrent.CountDownLatch(1)
+        private val initDone = java.util.concurrent.atomic.AtomicBoolean(false)
+        private val lastInitWarnAt = java.util.concurrent.atomic.AtomicLong(0L)
 
-		fun awaitReady(timeoutMs: Long): Boolean {
+        fun signalReady() {
+            if (initDone.compareAndSet(false, true)) initGate.countDown()
+        }
+
+        fun awaitReady(timeoutMs: Long): Boolean {
             if (initDone.get()) return true
             return try {
                 initGate.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
             } catch (_: InterruptedException) {
                 false
             }
-		}
-		fun throttledInitWarn(msg: String) {
+        }
+
+        fun throttledInitWarn(msg: String) {
             val now = System.currentTimeMillis()
             val prev = lastInitWarnAt.get()
             if (now - prev >= 1000L && lastInitWarnAt.compareAndSet(prev, now)) {
                 android.util.Log.w("DNSInterceptor", msg)
             }
-		}
+        }
 	}
 
     @Volatile
     private var initialized = false
 
     private val LOG_TAG = "DNSInterceptor"
-    private val bypassCache = HashMap<String, Boolean>()
+    private val bypassCache = ConcurrentHashMap<String, Boolean>()
 
     // DNS 查询缓存相关
+    // Enhanced DNS cache with HTTP/2 support
     data class DNSCacheEntry(
         val response: ByteArray,
         val timestamp: Long,
-        val ttl: Long = 300000L // 默认 5 分钟 TTL (毫秒)
+        val ttl: Long = 300000L,
+        val hits: AtomicLong = AtomicLong(0)
     ) {
         fun isExpired(): Boolean {
             return System.currentTimeMillis() - timestamp > ttl
         }
     }
 
-    private val dnsCache = HashMap<String, DNSCacheEntry>()
+
+
+
+    private val dnsCache = ConcurrentHashMap<String, DNSCacheEntry>()
     private val dnsCacheMutex = Mutex()
-    private val MAX_CACHE_SIZE = 1000 // 最大缓存条目数
+    private val MAX_CACHE_SIZE = 1000
+
+    // DNS query channel for batch processing
+    data class DnsQuery(
+        val query: ByteArray,
+        val callback: CompletableDeferred<ByteArray?>
+    )
+
+    private val queryChannel = Channel<DnsQuery>(Channel.UNLIMITED)
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    // HTTP/2 connection pool configuration
+    private val connectionPool = ConnectionPool(
+        maxIdleConnections = 5,
+        keepAliveDuration = 5L,
+        TimeUnit.MINUTES
+    )
+
+    // Enhanced OkHttp client with HTTP/2 support
+    private val httpClient = OkHttpClient.Builder()
+        .connectionPool(connectionPool)
+        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
+        .writeTimeout(5, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
+        .followRedirects(false)
+        .socketFactory(ProtectedSocketFactory())
+        .build()
 
     init {
-
         val instanceId = System.identityHashCode(this)
         Log.d(LOG_TAG, "DNSInterceptor instance created: $instanceId")
 
-        // Mark as initialized immediately
+        // Start worker coroutines for parallel processing
+        repeat(10) {
+            scope.launch {
+                processQueries()
+            }
+        }
+
+        // Warmup connections
+        scope.launch {
+            warmupConnections()
+        }
+
+        // Mark as initialized
         initialized = true
         signalReady()
 
-        // Only try socket protection if we're using DoH
+        // Verify socket protection
         Thread {
-            // Give VPN time to establish
             Thread.sleep(500)
-
-            // Try once to verify socket protection is working
             try {
                 val testSocket = Socket()
                 val protected = Vpn2SocksService.protectSocket(testSocket)
                 testSocket.close()
-
-                if (protected) {
-                    Log.d(LOG_TAG, "Socket protection verified")
-                } else {
-                    Log.d(LOG_TAG, "Socket protection not available (may be using SOCKS)")
-                }
+                Log.d(LOG_TAG, "Socket protection ${if (protected) "verified" else "not available"}")
             } catch (e: Exception) {
                 Log.d(LOG_TAG, "Socket protection check failed: ${e.message}")
             }
         }.start()
     }
+
+    // Process DNS queries from channel
+    private suspend fun processQueries() {
+        for (query in queryChannel) {
+            try {
+                val result = performDoHQuery(query.query)
+                query.callback.complete(result)
+            } catch (e: Exception) {
+                Log.e(LOG_TAG, "Query failed: ${e.message}")
+                query.callback.complete(null)
+            }
+        }
+    }
+
+    // Warmup HTTP/2 connections
+    private suspend fun warmupConnections() {
+        val providers = listOf(
+            "https://1.1.1.1/dns-query",
+            "https://8.8.8.8/dns-query"
+        )
+
+        providers.forEach { provider ->
+            scope.launch {
+                try {
+                    val testQuery = createDnsQuery("example.com")
+                    performDoHQuery(testQuery)
+                    Log.d(LOG_TAG, "Warmed up connection to $provider")
+                } catch (e: Exception) {
+                    Log.d(LOG_TAG, "Warmup failed for $provider")
+                }
+            }
+        }
+    }
+
+    // Enhanced DoH query with HTTP/2 multiplexing
+    private suspend fun performDoHQuery(query: ByteArray): ByteArray? {
+        val cacheKey = generateCacheKey(query)
+        val originalId = if (query.size >= 2) {
+            ((query[0].toInt() and 0xff) shl 8) or (query[1].toInt() and 0xff)
+        } else {
+            0
+        }
+
+        // Check cache first
+        dnsCacheMutex.withLock {
+            dnsCache[cacheKey]?.let { entry ->
+                if (!entry.isExpired()) {
+                    entry.hits.incrementAndGet()
+                    Log.d(LOG_TAG, "DNS cache hit (hits: ${entry.hits.get()})")
+                    return updateTransactionId(entry.response, originalId)
+                } else {
+                    dnsCache.remove(cacheKey)
+                }
+            }
+        }
+
+        // Clean cache if needed
+        if (dnsCache.size > MAX_CACHE_SIZE / 2) {
+            cleanupExpiredCache()
+        }
+
+        // Try DoH providers
+        val providers = listOf(
+            "https://1.1.1.1/dns-query",
+            "https://cloudflare-dns.com/dns-query",
+            "https://8.8.8.8/dns-query",
+            "https://dns.google/dns-query"
+        )
+
+        for (provider in providers) {
+            try {
+                val requestBody = query.toRequestBody("application/dns-message".toMediaType())
+                val request = Request.Builder()
+                    .url(provider)
+                    .post(requestBody)
+                    .addHeader("Accept", "application/dns-message")
+                    .addHeader("Content-Type", "application/dns-message")
+                    .build()
+
+                httpClient.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) {
+                        val responseBytes = response.body?.bytes()
+                        if (responseBytes != null) {
+                            Log.d(LOG_TAG, "DoH successful from $provider")
+
+                            // Cache the response
+                            val ttl = extractTTLFromResponse(responseBytes)
+                            dnsCacheMutex.withLock {
+                                dnsCache[cacheKey] = DNSCacheEntry(
+                                    response = responseBytes,
+                                    timestamp = System.currentTimeMillis(),
+                                    ttl = ttl
+                                )
+                            }
+
+                            return responseBytes
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(LOG_TAG, "DoH error for $provider: ${e.message}")
+            }
+        }
+
+        return null
+    }
+
+    // Batch DNS prefetch for common domains
+    fun prefetchDomains(domains: List<String>) {
+        scope.launch {
+            domains.chunked(5).forEach { batch ->
+                batch.map { domain ->
+                    async {
+                        try {
+                            val query = createDnsQuery(domain)
+                            val deferred = CompletableDeferred<ByteArray?>()
+                            queryChannel.send(DnsQuery(query, deferred))
+                            deferred.await()
+                            Log.d(LOG_TAG, "Prefetched: $domain")
+                        } catch (e: Exception) {
+                            Log.d(LOG_TAG, "Prefetch failed: $domain")
+                        }
+                    }
+                }.awaitAll()
+            }
+        }
+    }
+
+
+
+    // Main query handler with optimizations
+    private suspend fun queryOverUpstreams(query: ByteArray): ByteArray? {
+        // Use channel for batching
+        val deferred = CompletableDeferred<ByteArray?>()
+        queryChannel.send(DnsQuery(query, deferred))
+
+        val result = withTimeoutOrNull(5000) {
+            deferred.await()
+        }
+
+        if (result != null) {
+            return result
+        }
+
+        // Fallback to TCP DNS
+        Log.w(LOG_TAG, "DoH failed, falling back to TCP DNS")
+        return queryViaTraditionalTCP(query)
+    }
+
+    // Cleanup expired cache with LRU eviction
+    private suspend fun cleanupExpiredCache() {
+        dnsCacheMutex.withLock {
+            // Remove expired entries
+            val expired = dnsCache.entries.filter { it.value.isExpired() }
+            expired.forEach { dnsCache.remove(it.key) }
+
+            // LRU eviction if still too large
+            if (dnsCache.size > MAX_CACHE_SIZE) {
+                val sorted = dnsCache.entries
+                    .sortedBy { it.value.hits.get() }
+                    .take(100)
+
+                sorted.forEach { dnsCache.remove(it.key) }
+                Log.d(LOG_TAG, "Evicted ${sorted.size} least-used cache entries")
+            }
+        }
+    }
+
+
 
 
     // 生成缓存键：基于查询内容（跳过 ID 字段）
@@ -186,29 +405,6 @@ class DNSInterceptor private constructor() {
         return 300000L // 默认 5 分钟
     }
 
-    // 清理过期缓存条目
-    private suspend fun cleanupExpiredCache() {
-        dnsCacheMutex.withLock {
-            val expiredKeys = dnsCache.entries
-                .filter { it.value.isExpired() }
-                .map { it.key }
-
-            expiredKeys.forEach { dnsCache.remove(it) }
-
-            // 如果缓存太大，删除最老的条目
-            if (dnsCache.size > MAX_CACHE_SIZE) {
-                val sortedEntries = dnsCache.entries
-                    .sortedBy { it.value.timestamp }
-
-                val toRemove = sortedEntries.size - MAX_CACHE_SIZE
-                if (toRemove > 0) {
-                    sortedEntries.take(toRemove).forEach {
-                        dnsCache.remove(it.key)
-                    }
-                }
-            }
-        }
-    }
 
     // 更新响应中的 Transaction ID
     private fun updateTransactionId(response: ByteArray, newId: Int): ByteArray {
@@ -663,12 +859,7 @@ class DNSInterceptor private constructor() {
         setOf(IPv4Address.parse("198.18.0.0")!!.raw, IPv4Address.parse("198.19.255.255")!!.raw)
     )
 
-    // OkHttp 客户端，使用自定义 SocketFactory
-    private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(5, TimeUnit.SECONDS)
-        .socketFactory(ProtectedSocketFactory())
-        .build()
+
 
     // 自定义 SocketFactory 确保 socket 被保护
     inner class ProtectedSocketFactory : SocketFactory() {
@@ -734,20 +925,6 @@ class DNSInterceptor private constructor() {
     private val protectedQueries = AtomicInteger(0)
 
 
-
-    // 主查询方法：优先使用 DoH（带缓存）
-    private suspend fun queryOverUpstreams(query: ByteArray): ByteArray? {
-        // 首先尝试 DoH（内部会先检查缓存）
-        val dohResult = queryViaDoH(query)
-        if (dohResult != null) {
-            Log.d(LOG_TAG, "DoH query successful (possibly from cache)")
-            return dohResult
-        }
-
-        // DoH 失败，尝试 TCP DNS（作为备用）
-        Log.w(LOG_TAG, "DoH failed, falling back to TCP DNS")
-        return queryViaTraditionalTCP(query)
-    }
 
     // DNS-over-HTTPS 实现（带缓存）
     private suspend fun queryViaDoH(query: ByteArray): ByteArray? {
@@ -1174,5 +1351,12 @@ class DNSInterceptor private constructor() {
         require(ip.size == 4)
         out.write(ip)
         return out.toByteArray()
+    }
+
+    // Add proper cleanup
+    fun close() {
+        scope.cancel()
+        httpClient.dispatcher.executorService.shutdown()
+        httpClient.connectionPool.evictAll()
     }
 }

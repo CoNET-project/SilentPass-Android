@@ -35,14 +35,14 @@ class TCPConnection(
         // MSS constants for different connection types
         private const val MSS_STANDARD = 1460     // Standard Ethernet
         private const val MSS_SOCKS = 1420        // SOCKS proxy
-        private const val MSS_VPN = 1380          // VPN tunnel
+        private const val MSS_VPN = 1360          // VPN tunnel
 
         // Multipliers for CWND calculations
         private const val INITIAL_CWND_MULTIPLIER = 10
         private const val MIN_CWND_MULTIPLIER = 2
 
         // Other constants
-        private const val INITIAL_RTO = 1000L  // 1 second
+        private const val INITIAL_RTO = 3000L  // 1 second
         private const val MIN_RTO = 200L
         private const val MAX_RTO = 60000L
         private const val SACK_PERMITTED = 4
@@ -64,9 +64,9 @@ class TCPConnection(
     private val MIN_CWND = MIN_CWND_MULTIPLIER * mss
     private fun calculateOptimalMSS(): Int {
         return when {
-            bypassDirect -> MSS_STANDARD        // Direct connection uses standard value
-            socksEndpoint != null -> MSS_SOCKS  // SOCKS proxy needs some overhead
-            else -> MSS_VPN                     // VPN tunnel uses conservative value
+            bypassDirect -> MSS_STANDARD  // 保持标准值
+            socksEndpoint != null -> MSS_SOCKS  // 降低SOCKS MSS
+            else -> MSS_VPN  // 进一步降低VPN MSS
         }
     }
 
@@ -304,9 +304,9 @@ class TCPConnection(
                 // 动态决定是否flush
                 val shouldFlush = when {
                     buffer.size() >= mtu - 100 -> true
-                    buffer.size() >= 8192 -> true  // Reduced from 16KB
+                    buffer.size() >= 4096 -> true  // Reduced from 16KB
                     pendingWrites.size >= 2 -> true
-                    timeSinceLastWrite > 2 && buffer.size() > 0 -> true  // Reduced from 5ms
+                    timeSinceLastWrite > 1 && buffer.size() > 0 -> true  // Reduced from 5ms
                     data.size > 1000 -> true
                     else -> false
                 }
@@ -417,8 +417,8 @@ class TCPConnection(
         while (!isClosed) {
             val checkInterval = when (phase) {
                 Phase.SYN, Phase.HANDSHAKE_ACKED, Phase.SOCKS_PRIMED -> 3000L  // Less frequent during setup
-                Phase.STREAMING -> 1000L  // Normal monitoring during data transfer
-                else -> 5000L
+                Phase.STREAMING -> 5000L  // Normal monitoring during data transfer
+                else -> 10000L
             }
             delay(checkInterval)
 
@@ -1028,7 +1028,7 @@ class TCPConnection(
 
     private suspend fun downstreamLoop(ip: IPv4Packet, tcp: TCPSegment) = withContext(Dispatchers.IO) {
         val reader = upstreamReader ?: return@withContext
-        val buffer = ByteArray(32 * 1024)
+        val buffer = ByteArray(64 * 1024)
         var totalRead = 0
         var consecutiveTimeouts = 0
         val maxConsecutiveTimeouts = 30  // Increase from 10 to 30 (60 seconds with 2s timeout)
@@ -1077,6 +1077,10 @@ class TCPConnection(
 
                 totalRead += n
                 Log.d(LOG_TAG, "Server->Client: $n bytes (total: $totalRead) for ${getDisplayKey()}")
+
+
+
+
                 sendDataToClient(ip, tcp, buffer.copyOf(n))
             }
         } catch (e: CancellationException) {
@@ -1277,7 +1281,7 @@ class TCPConnection(
 
 
 
-    private fun closeConnection() {
+    fun closeConnection() {
         // Already closing/closed, just return
         if (!closedOnce.compareAndSet(false, true)) {
             Log.d(LOG_TAG, "Connection already closing/closed for ${getDisplayKey()}")

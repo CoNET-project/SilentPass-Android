@@ -4,6 +4,7 @@ import android.util.Log
 import android.os.SystemClock
 import androidx.multidex.BuildConfig
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -19,18 +20,21 @@ class ConnectionManager(
     private val verbose = try { BuildConfig.DEBUG } catch (_: Throwable) { true }
     private val LOG_TAG = "ConnectionManager"
 
+    private val connectionPool = Channel<TCPConnection>(Channel.UNLIMITED)
+
+    // Speedtest domain cache for optimization
+    private val speedtestDomains = setOf(
+        "www.speedtest.net",
+        "c.speedtest.net",
+        "speedtest.net",
+        "*.speedtest.net",
+        "*.ooklaserver.net"
+    )
+
     // ====== 通用日志节流（200ms）======
-    private val logWindowMs = 200L
-    private val lastLogAt = ConcurrentHashMap<String, Long>()
+
+
     private fun log(msg: String) { Log.d(LOG_TAG, msg) }
-    private fun logThrottled(key: String, line: String) {
-        val now = SystemClock.elapsedRealtime()
-        val last = lastLogAt[key]
-        if (last == null || now - last >= logWindowMs) {
-            lastLogAt[key] = now
-            Log.d(LOG_TAG, line)
-        }
-    }
 
     // ====== DNS 拦截日志合并器（按 srcIP->dstIP:53 聚合）======
     private data class DnsAgg(
@@ -38,56 +42,8 @@ class ConnectionManager(
         val count: AtomicInteger = AtomicInteger(0),
         val samplePorts: MutableList<Int> = ArrayList(4)
     )
-    private val dnsAggMap = ConcurrentHashMap<String, DnsAgg>() // key: "$src->$dst:53"
 
-    private fun onDnsInterceptLog(srcIp: String, dstIp: String, srcPort: Int) {
-        val key = "$srcIp->$dstIp:53"
-        val now = SystemClock.elapsedRealtime()
-        val rec = dnsAggMap.compute(key) { _, old ->
-            val r = old ?: DnsAgg(windowStartMs = now)
-            // 同一窗口内累计
-            if (now - r.windowStartMs < logWindowMs) {
-                r.count.incrementAndGet()
-                if (r.samplePorts.size < 3) r.samplePorts.add(srcPort)
-                r
-            } else {
-                // 窗口到期，先输出上一窗口汇总
-                val prevCount = r.count.get()
-                if (prevCount > 0) {
-                    val portsTxt = if (r.samplePorts.isNotEmpty())
-                        r.samplePorts.joinToString(",")
-                    else "-"
-                    Log.d(LOG_TAG, "Intercepted $prevCount DNS queries to $dstIp:53 from ports [$portsTxt] (last ${logWindowMs}ms)")
-                }
-                // 重置窗口，记录当前这次
-                r.windowStartMs = now
-                r.count.set(1)
-                r.samplePorts.clear()
-                r.samplePorts.add(srcPort)
-                r
-            }
-        }
-        // 为避免“尾窗”丢失，安排一个延迟 flush
-        scope.launch {
-            delay(logWindowMs + 5)
-            flushDnsAggIfIdle(key)
-        }
-    }
 
-    private fun flushDnsAggIfIdle(key: String) {
-        val now = SystemClock.elapsedRealtime()
-        val rec = dnsAggMap[key] ?: return
-        if (now - rec.windowStartMs >= logWindowMs) {
-            val c = rec.count.getAndSet(0)
-            if (c > 0) {
-                val portsTxt = if (rec.samplePorts.isNotEmpty())
-                    rec.samplePorts.joinToString(",")
-                else "-"
-                Log.d(LOG_TAG, "Intercepted $c DNS queries to ${key.substringAfter("->")} from ports [$portsTxt] (last ${logWindowMs}ms)")
-                rec.samplePorts.clear()
-            }
-        }
-    }
 
     fun onPacket(pkt: TunPacketIO.TunPacket) {
         val b = pkt.bytes
@@ -149,43 +105,71 @@ class ConnectionManager(
 
     init {
         scope.launch {
-            while (isActive) {
-                delay(30_000)
+            val domainsToPrefetch = listOf(
+                // Google services
+                "www.google.com",
+                "apis.google.com",
+                "www.gstatic.com",
+                "ssl.gstatic.com",
+                "fonts.googleapis.com",
+                "ajax.googleapis.com",
+                // Other common domains
+                "www.speedtest.net",
+                "c.speedtest.net",
+                "www.youtube.com",
+                "www.facebook.com",
+                "www.twitter.com",
+                "www.instagram.com",
+                "www.reddit.com",
+                "www.amazon.com",
+                "www.netflix.com"
+            )
 
-                // 使用 filter 和计数
-                val closedConnections = tcpConns.filter { it.value.isClosed() }
-                val closedCount = closedConnections.size
+            dns.prefetchDomains(domainsToPrefetch)
+            Log.d(LOG_TAG, "DNS prefetch initiated for ${domainsToPrefetch.size} domains")
+        }
 
-                closedConnections.forEach { (key, _) ->
-                    tcpConns.remove(key)
-                }
+        // Start connection cleanup coroutine
+        scope.launch {
+            connectionCleanupLoop()
+        }
 
-                if (closedCount > 0) {
-                    Log.d(LOG_TAG, "Cleaned up $closedCount closed connections")
-                }
-
-                // 强制清理socket池
-                SocketPool.cleanup()
-
-                // 清理DNS聚合窗口
-                dnsAggMap.keys.forEach { flushDnsAggIfIdle(it) }
-
-                // 记录状态
-                Log.d(LOG_TAG, "Active connections: ${tcpConns.size}")
-            }
+        // Start metrics collection
+        scope.launch {
+            metricsCollectionLoop()
         }
     }
+
+    // Connection metrics
+    private data class ConnectionMetrics(
+        val activeConnections: AtomicInteger = AtomicInteger(0),
+        val totalConnections: AtomicInteger = AtomicInteger(0),
+        val failedConnections: AtomicInteger = AtomicInteger(0),
+        val bytesTransferred: AtomicInteger = AtomicInteger(0)
+    )
+    private val metrics = ConnectionMetrics()
+
+    private val logWindowMs = 200L
+    private val lastLogAt = ConcurrentHashMap<String, Long>()
+
+    private val dnsAggMap = ConcurrentHashMap<String, DnsAgg>()
 
     private fun handleUDP(ip: IPv4Packet) {
         val udp = UDPDatagram(ip.payload)
 
-        // 仅拦截 DNS，其他 UDP 返回 ICMP Port Unreachable
+        // DNS interception with optimization
         if (udp.dstPort == 53) {
-            // 合并节流：把同窗内多条端口日志汇总为一条
             onDnsInterceptLog(ip.src.toString(), ip.dst.toString(), udp.srcPort)
 
             scope.launch {
                 try {
+                    // Check if this is a speedtest domain for priority handling
+                    val isSpeedtest = checkIfSpeedtestQuery(udp.payload)
+
+                    if (isSpeedtest) {
+                        Log.d(LOG_TAG, "Priority DNS query for Speedtest domain")
+                    }
+
                     val res = dns.handleQuery(udp.payload)
                     if (res != null) {
                         val (resp, _) = res
@@ -198,7 +182,7 @@ class ConnectionManager(
                         )
                         packetWriter(listOf(out), listOf(PROTO_IPV4))
                     } else {
-                        Log.e(LOG_TAG, "DNS query returned null - upstream DNS likely failed")
+                        Log.e(LOG_TAG, "DNS query returned null")
                     }
                 } catch (t: Throwable) {
                     Log.e(LOG_TAG, "DNS handling failed: ${t.message}", t)
@@ -210,8 +194,25 @@ class ConnectionManager(
         }
     }
 
+    private fun checkIfSpeedtestQuery(payload: ByteArray): Boolean {
+        // Quick check for speedtest domains in DNS query
+        try {
+            val query = String(payload).lowercase()
+            return speedtestDomains.any { domain ->
+                query.contains(domain.replace("*.", ""))
+            }
+        } catch (e: Exception) {
+            return false
+        }
+    }
+
     private fun handleICMP(ip: IPv4Packet) {
-        // 暂无处理
+        // Implement ICMP echo reply for better connectivity checks
+        val icmp = ip.payload
+        if (icmp.size >= 8 && icmp[0] == 8.toByte()) { // Echo Request
+            val reply = IpBuilders.icmpEchoReply(ip)
+            packetWriter(listOf(reply), listOf(PROTO_IPV4))
+        }
     }
 
     private fun handleTCP(ip: IPv4Packet) {
@@ -220,9 +221,10 @@ class ConnectionManager(
 
         if (tcp.isSYN && !tcp.isACK) {
             Log.d(LOG_TAG, "SYN ${ip.src}:${tcp.srcPort} -> ${ip.dst}:${tcp.dstPort}")
+            metrics.totalConnections.incrementAndGet()
         }
 
-        // 阻断 DoT (port 853) — 直接 RST
+        // Block DoT (port 853)
         if (tcp.isSYN && !tcp.isACK && tcp.dstPort == 853) {
             val rst = IpBuilders.tcpPayloadFromServer(
                 src = ip.dst, dst = ip.src,
@@ -237,39 +239,46 @@ class ConnectionManager(
             return
         }
 
-        // 是否为"假段"范围的 IP（198.18.0.0/15）
+        // Determine routing based on IP and domain
         val v = ip.dst.raw
         val firstOctet = (v ushr 24) and 0xff
         val secondOctet = (v ushr 16) and 0xff
         val isFakeByRange = (firstOctet == 198) && (secondOctet == 18 || secondOctet == 19)
 
-        // 通过 fake DNS 是否解析到域名
         val domain = dns.lookupDomain(ip.dst)
         val hasDomainMapping = (domain != null)
-
-        // 是否为直连白名单域名
         val isBypassDomain = domain?.let { dns.shouldBypass(it) } ?: false
 
-        // 路由判定
+        // Check if it's a speedtest domain for optimization
+        val isSpeedtest = domain?.let { d ->
+            speedtestDomains.any { pattern ->
+                if (pattern.startsWith("*.")) {
+                    d.endsWith(pattern.substring(2))
+                } else {
+                    d == pattern || d.endsWith(".$pattern")
+                }
+            }
+        } ?: false
+
         val bypassDirect = when {
             isBypassDomain -> true
+            isSpeedtest -> true  // Direct connection for speedtest
             isFakeByRange -> false
             hasDomainMapping && !isBypassDomain -> false
             else -> true
         }
 
         scope.launch {
-            // 连接判定日志：按 key 节流
             if (verbose) {
                 logThrottled(
                     key,
-                    "TCP connection key: $key, isFakeRange=$isFakeByRange, domain=$domain, isBypassDomain=$isBypassDomain, bypassDirect=$bypassDirect"
+                    "TCP: $key, domain=$domain, bypass=$bypassDirect, speedtest=$isSpeedtest"
                 )
             }
 
-            // 使用getOrCreateConnection方法或直接在这里创建
+            // Get or create connection with optimization for speedtest
             val conn = tcpConns.getOrPut(key) {
-                TCPConnection(
+                val newConn = TCPConnection(
                     key = key,
                     mtu = mtu,
                     packetWriter = packetWriter,
@@ -277,9 +286,129 @@ class ConnectionManager(
                     socksEndpoint = socksEndpoint,
                     bypassDirect = bypassDirect
                 )
+
+                if (isSpeedtest) {
+                    Log.d(LOG_TAG, "Created optimized connection for Speedtest")
+                }
+
+                metrics.activeConnections.incrementAndGet()
+                newConn
             }
+
             conn.onTcp(ip, tcp)
         }
+    }
+
+    private suspend fun connectionCleanupLoop() {
+        while (scope.isActive) {
+            delay(30_000)
+
+            val closedConnections = tcpConns.filter { it.value.isClosed() }
+            val closedCount = closedConnections.size
+
+            closedConnections.forEach { (key, _) ->
+                tcpConns.remove(key)
+                metrics.activeConnections.decrementAndGet()
+            }
+
+            if (closedCount > 0) {
+                Log.d(LOG_TAG, "Cleaned up $closedCount closed connections")
+            }
+
+            // Force cleanup of socket pool
+            SocketPool.cleanup()
+
+            // Clean DNS aggregation windows
+            dnsAggMap.keys.forEach { flushDnsAggIfIdle(it) }
+
+            // Log current status
+            Log.d(LOG_TAG, "Active: ${metrics.activeConnections.get()}, " +
+                    "Total: ${metrics.totalConnections.get()}, " +
+                    "Failed: ${metrics.failedConnections.get()}")
+        }
+    }
+
+    private suspend fun metricsCollectionLoop() {
+        while (scope.isActive) {
+            delay(60_000) // Every minute
+
+            val activeConns = metrics.activeConnections.get()
+            val totalConns = metrics.totalConnections.get()
+            val failedConns = metrics.failedConnections.get()
+
+            if (totalConns > 0) {
+                val successRate = ((totalConns - failedConns).toFloat() / totalConns * 100).toInt()
+                Log.i(LOG_TAG, "Connection stats - Active: $activeConns, Success rate: $successRate%")
+            }
+        }
+    }
+
+    private fun onDnsInterceptLog(srcIp: String, dstIp: String, srcPort: Int) {
+        val key = "$srcIp->$dstIp:53"
+        val now = SystemClock.elapsedRealtime()
+
+        dnsAggMap.compute(key) { _, old ->
+            val r = old ?: DnsAgg(windowStartMs = now)
+
+            if (now - r.windowStartMs < logWindowMs) {
+                r.count.incrementAndGet()
+                if (r.samplePorts.size < 3) r.samplePorts.add(srcPort)
+                r
+            } else {
+                val prevCount = r.count.get()
+                if (prevCount > 0) {
+                    val portsTxt = r.samplePorts.joinToString(",").ifEmpty { "-" }
+                    Log.d(LOG_TAG, "DNS: $prevCount queries to $dstIp:53 from [$portsTxt]")
+                }
+
+                r.windowStartMs = now
+                r.count.set(1)
+                r.samplePorts.clear()
+                r.samplePorts.add(srcPort)
+                r
+            }
+        }
+
+        scope.launch {
+            delay(logWindowMs + 5)
+            flushDnsAggIfIdle(key)
+        }
+    }
+
+    private fun flushDnsAggIfIdle(key: String) {
+        val now = SystemClock.elapsedRealtime()
+        val rec = dnsAggMap[key] ?: return
+
+        if (now - rec.windowStartMs >= logWindowMs) {
+            val c = rec.count.getAndSet(0)
+            if (c > 0) {
+                val portsTxt = rec.samplePorts.joinToString(",").ifEmpty { "-" }
+                Log.d(LOG_TAG, "DNS: $c queries to ${key.substringAfter("->")} from [$portsTxt]")
+                rec.samplePorts.clear()
+            }
+        }
+    }
+
+    private fun logThrottled(key: String, line: String) {
+        val now = SystemClock.elapsedRealtime()
+        val last = lastLogAt[key]
+        if (last == null || now - last >= logWindowMs) {
+            lastLogAt[key] = now
+            Log.d(LOG_TAG, line)
+        }
+    }
+
+    fun shutdown() {
+        scope.cancel()
+        tcpConns.values.forEach {
+            try {
+                it.closeConnection()
+            } catch (e: Exception) {
+                Log.w(LOG_TAG, "Error closing connection: ${e.message}")
+            }
+        }
+        tcpConns.clear()
+        dns.close()
     }
 
     companion object {

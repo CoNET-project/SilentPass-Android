@@ -101,6 +101,63 @@ object IpBuilders {
         return arr
     }
 
+    // 新增：ICMP Echo Reply 方法
+    fun icmpEchoReply(ip: IPv4Packet): ByteArray {
+        // Extract ICMP payload from the original packet
+        val icmpData = ip.payload
+        if (icmpData.size < 8) {
+            // Invalid ICMP packet
+            return ByteArray(0)
+        }
+
+        // Check if it's an echo request (type 8)
+        if (icmpData[0] != 8.toByte()) {
+            return ByteArray(0)
+        }
+
+        // Build echo reply
+        val icmpReply = icmpData.copyOf()
+        icmpReply[0] = 0 // Type 0 = Echo Reply
+        // Code remains 0
+        // Clear checksum
+        icmpReply[2] = 0
+        icmpReply[3] = 0
+
+        // Calculate new ICMP checksum
+        val csum = ipChecksum(icmpReply)
+        icmpReply[2] = (csum.toInt() ushr 8).toByte()
+        icmpReply[3] = (csum.toInt() and 0xff).toByte()
+
+        // Wrap in IPv4 packet
+        val ipHdr = 20
+        val total = ipHdr + icmpReply.size
+        val bb = ByteBuffer.allocate(total)
+
+        // IPv4 header
+        bb.put(0x45.toByte()) // Version 4, IHL 5
+        bb.put(0) // TOS
+        bb.putShort(total.toShort()) // Total length
+        bb.putShort(0) // ID
+        bb.putShort(0x4000.toShort()) // Flags (Don't Fragment) + Fragment offset
+        bb.put(64.toByte()) // TTL
+        bb.put(1.toByte()) // Protocol = ICMP
+        bb.putShort(0) // Checksum (will be filled)
+        bb.putInt(ip.dst.raw) // Source (swap)
+        bb.putInt(ip.src.raw) // Destination (swap)
+
+        // ICMP payload
+        bb.put(icmpReply)
+
+        val arr = bb.array()
+
+        // Calculate IP checksum
+        val ipCsum = ipChecksum(arr.copyOfRange(0, ipHdr))
+        arr[10] = (ipCsum.toInt() ushr 8).toByte()
+        arr[11] = (ipCsum.toInt() and 0xff).toByte()
+
+        return arr
+    }
+
     // 原始方法保持兼容性
     fun tcpPayloadFromServer(src: IPv4Address, dst: IPv4Address, srcPort: Int, dstPort: Int, payload: ByteArray,
                              seq: Int, ack: Int, flags: Int = 0x18, window: Int = 65535): ByteArray {

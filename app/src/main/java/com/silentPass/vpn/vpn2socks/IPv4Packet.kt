@@ -8,6 +8,8 @@ class IPv4Packet(val raw: ByteArray) {
     val payload: ByteArray
 
     init {
+
+
         require(raw.size >= 20) { "IPv4: totalLen < 20" }
         val version = (raw[0].toInt() ushr 4) and 0x0f
         require(version == 4) { "Not IPv4: version=$version" }
