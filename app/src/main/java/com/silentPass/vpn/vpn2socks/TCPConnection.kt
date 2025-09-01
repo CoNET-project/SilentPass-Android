@@ -942,43 +942,31 @@ class TCPConnection(
     @Volatile private var canWrite = true  // 新增：控制是否允许写入
     private fun isSocketHealthy(): Boolean {
         return try {
-
             val socket = upstream
             val currentPhase = phase
 
-            // If we don't have a socket yet
             if (socket == null) {
-                // Only consider unhealthy if we're in streaming phase without a socket
                 return currentPhase != Phase.STREAMING &&
                         currentPhase != Phase.HALF_CLOSED_LOCAL &&
                         currentPhase != Phase.HALF_CLOSED_REMOTE
             }
 
-            // Now we know socket is not null, check its health
             val isConnected = socket.isConnected && !socket.isClosed
             val canReadFromSocket = !socket.isInputShutdown
             val canWriteToSocket = !socket.isOutputShutdown && canWrite
 
-
-
-            // 检查输入输出状态（半关闭状态也算健康）
-            val canRead = !socket.isInputShutdown
-            val canWrite = !socket.isOutputShutdown
-
-            // 只要连接还在，且至少能读或写，就认为是健康的
-            val healthy = isConnected && (canRead || canWrite)
+            // Remove duplicate declarations - just use the above variables
+            val healthy = isConnected && (canReadFromSocket || canWriteToSocket)
 
             if (!healthy) {
-                // 详细日志帮助调试
                 Log.d(LOG_TAG, "Socket state: closed=${socket.isClosed}, " +
                         "connected=${socket.isConnected}, " +
                         "inputShutdown=${socket.isInputShutdown}, " +
                         "outputShutdown=${socket.isOutputShutdown}, " +
-                        "healthy=$healthy (canRead=$canRead, canWrite=$canWrite)")
+                        "healthy=$healthy (canRead=$canReadFromSocket, canWrite=$canWriteToSocket)")
             }
 
-            // 只有在真正能用的时候才算健康
-            isConnected && (canReadFromSocket || canWriteToSocket)
+            healthy
         } catch (e: Exception) {
             Log.e(LOG_TAG, "Error checking socket health: ${e.message}")
             false
@@ -1017,14 +1005,24 @@ class TCPConnection(
                 } catch (e: SocketTimeoutException) {
                     consecutiveTimeouts++
                     if (consecutiveTimeouts > maxConsecutiveTimeouts) {
-                        Log.w(LOG_TAG, "Too many consecutive timeouts (${consecutiveTimeouts * 2}s)")
-                        break
-                    }
-                    // Add exponential backoff for timeouts
-                    if (consecutiveTimeouts > 5) {
-                        delay(100L * consecutiveTimeouts.coerceAtMost(10))
+                        // Only close if we've received some data
+                        if (totalRead > 0) {
+                            Log.d(LOG_TAG, "Closing after timeouts with $totalRead bytes received")
+                            break
+                        } else {
+                            Log.w(LOG_TAG, "No data received after ${consecutiveTimeouts * 2}s, closing")
+                            break
+                        }
                     }
                     continue
+                } catch (e: IOException) {
+                    // Differentiate between expected and unexpected closures
+                    if (totalRead > 0) {
+                        Log.d(LOG_TAG, "Connection closed after $totalRead bytes: ${e.message}")
+                    } else {
+                        Log.e(LOG_TAG, "Connection failed with no data: ${e.message}")
+                    }
+                    break
                 }
 
                 consecutiveTimeouts = 0  // Reset on successful read
@@ -1101,9 +1099,9 @@ class TCPConnection(
         val writer = upstreamWriter ?: return@withContext
         var totalFlushed = 0
 
-        // Wait for socket to be ready if just established
-        if (totalFlushed == 0 && phase == Phase.SOCKS_PRIMED) {
-            delay(50)  // Small delay for socket stabilization
+        // Enhanced warmup for SOCKS connections
+        if (totalFlushed == 0 && phase == Phase.SOCKS_PRIMED && !bypassDirect) {
+            delay(100)  // Longer delay for SOCKS proxy stabilization
         }
 
         while (canWrite && !outputShutdown) {  // 检查写入状态
