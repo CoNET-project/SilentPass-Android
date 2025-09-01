@@ -26,7 +26,7 @@ class TCPConnection(
     private val mtu: Int,
     private val packetWriter: (List<ByteArray>, List<Int>) -> Unit,
     private val dns: DNSInterceptor,
-    private val socksEndpoint: SocksEndpoint?,
+    private val socksEndpoint: SocksEndpoint,
     private val bypassDirect: Boolean
 ) {
     companion object {
@@ -674,7 +674,7 @@ class TCPConnection(
 
         // Small gap - wait briefly
         if (gap <= mss) {  // Changed MSS to mss
-            delay(5)
+
             if (segSeq == clientNextSeq) {
                 handleInOrderPacket(ip, tcp, segEnd)
                 return
