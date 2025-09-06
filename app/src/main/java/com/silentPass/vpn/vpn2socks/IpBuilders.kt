@@ -236,7 +236,8 @@ object IpBuilders {
         seq: Int, ack: Int,
         window: Int = 65535,
         mss: Int = 1460,
-        sackPermitted: Boolean = true
+        sackPermitted: Boolean = true,
+        windowScale: Int? = null
     ): ByteArray {
         val options = mutableListOf<Byte>()
 
@@ -246,16 +247,23 @@ object IpBuilders {
         options.add((mss shr 8).toByte())
         options.add((mss and 0xFF).toByte())
 
+        // NOP for alignment (常见做法：MSS 后跟一个 NOP)
+        options.add(1) // NOP
+
         // SACK-Permitted option (kind=4, length=2)
         if (sackPermitted) {
             options.add(4)
             options.add(2)
         }
 
-        // NOP padding for alignment if needed
-        while (options.size % 4 != 0) {
-            options.add(1) // NOP
+        // NOP + Window Scale (kind=3, len=3, shift)
+        if (windowScale != null) {
+            options.add(1)       // NOP for alignment
+            options.add(3); options.add(3); options.add((windowScale and 0xFF).toByte())
         }
+
+        // pad to 4-byte boundary
+        while (options.size % 4 != 0) options.add(1) // NOP
 
         return tcpPayloadFromServerWithOptions(
             src, dst, srcPort, dstPort,

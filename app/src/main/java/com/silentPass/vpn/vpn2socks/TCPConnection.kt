@@ -42,16 +42,22 @@ class TCPConnection(
         private const val MIN_CWND_MULTIPLIER = 2
 
         // Other constants
-        private const val INITIAL_RTO = 3000L  // 1 second
+        private const val INITIAL_RTO = 1000L  // 1 second
         private const val MIN_RTO = 200L
         private const val MAX_RTO = 60000L
         private const val SACK_PERMITTED = 4
         private const val SACK_OPTION = 5
 
+        @Volatile private var deferredHalfClose = false
+
+        // --- RFC 7323 Window Scale ---
+        private const val WSCALE_KIND = 3
+        private const val DEFAULT_WND_SCALE = 7
+
         // Buffering and window limits
-        private const val MAX_PENDING_BYTES = 256 * 1024
+        private const val MAX_PENDING_BYTES = 2 * 1024 * 1024
         private const val MIN_ADV_WINDOW = 1024
-        private const val MAX_ADV_WINDOW = 65535
+        private const val MAX_ADV_WINDOW = 4 * 1024 * 1024
 
         // Delayed ACK timers
         private const val DELAYED_ACK_MS = 40L
@@ -110,6 +116,14 @@ class TCPConnection(
     // SACK support flag (set during handshake)
     @Volatile private var peerSupportsSack = false
     @Volatile private var weSupportSack = true  // We always support SACK
+
+    // --- Window Scaling state ---
+    @Volatile private var wscaleActive = false         // 双端均宣告后为 true
+    @Volatile private var ourWndScale = DEFAULT_WND_SCALE
+    @Volatile private var clientWndScale = 0           // 客户端在 SYN 中宣告的 WSCALE
+    @Volatile private var peerAdvertisedWnd = 65535    // 已按 clientWndScale 放大后的字节窗口
+    @Volatile private var lastAckFromClient: Long = 0L // 最近一次客户端 ACK 序号（用于计算未确认字节）
+
 
     // =============== Congestion Control ===============
     private inner class CongestionControl {
@@ -241,7 +255,7 @@ class TCPConnection(
         return option.toByteArray()
     }
 
-    // Parse TCP options from SYN to check for SACK-Permitted
+    // Parse TCP options from SYN: SACK-Permitted & Window Scale
     private fun parseTcpOptions(tcp: TCPSegment) {
         val dataOffset = (tcp.raw[12].toInt() and 0xF0) shr 4
         val optionsLength = (dataOffset * 4) - 20
@@ -269,6 +283,21 @@ class TCPConnection(
                         i++
                     }
                 }
+
+                WSCALE_KIND -> { // Window Scale
+                    if (i + 2 < optionsLength) {
+                        val length = tcp.raw[optionsStart + i + 1].toInt() and 0xFF
+                        if (length == 3) {
+                            val valShift = tcp.raw[optionsStart + i + 2].toInt() and 0xFF
+                            clientWndScale = (valShift.coerceIn(0, 14)) // RFC：0..14
+                            Log.d(LOG_TAG, "Peer Window-Scale=$clientWndScale for ${getDisplayKey()}")
+                        }
+                        i += length
+                    } else {
+                        i++
+                    }
+                }
+                
                 else -> {
                     // Other options
                     if (i + 1 < optionsLength) {
@@ -527,6 +556,7 @@ class TCPConnection(
             // Measure RTT if this is an ACK
             if (tcp.isACK) {
                 measureRtt(tcp)
+                updatePeerWindowFromAck(tcp) // 同步对端窗口与最近ACK
             }
 
             if (tcp.payload.isNotEmpty()) {
@@ -553,6 +583,27 @@ class TCPConnection(
         }
     }
 
+    private fun updatePeerWindowFromAck(tcp: TCPSegment) {
+        lastAckFromClient = tcp.ack.toLong() and 0xFFFFFFFFL
+        // TCP 头 14..15 字节为 16-bit 的 window 字段
+        if (tcp.raw.size >= 16) {
+            val rawWin = ((tcp.raw[14].toInt() and 0xFF) shl 8) or (tcp.raw[15].toInt() and 0xFF)
+            val scaled = rawWin shl clientWndScale   // 按对端 WSCALE 放大
+            peerAdvertisedWnd = if (scaled > 0) scaled else 0
+        } else {
+            // 头长度异常时保持上一次窗口，避免崩溃
+        }
+    }
+
+    private fun calcAdvertisedWindowField(): Int {
+        val advBytes = calcAdvertisedWindow() // 真实可用字节数（0..MAX_ADV_WINDOW）
+        val shift = if (wscaleActive) ourWndScale else 0
+        var field = advBytes ushr shift
+        if (field <= 0) field = 1
+        if (field > 65535) field = 65535
+        return field
+    }
+
     private suspend fun handleSyn(ip: IPv4Packet, tcp: TCPSegment) {
         val domain = dns.lookupDomain(ip.dst)
         resolvedDomain = domain
@@ -561,10 +612,13 @@ class TCPConnection(
         clientNextSeq = (clientSeq0!! + 1L) and 0xFFFFFFFFL
 
         parseTcpOptions(tcp)
+        // 若客户端在 SYN 中提供了 WSCALE，我们就激活窗口缩放并在 SYN-ACK 中宣告
+        wscaleActive = true // 你也可以只在 clientWndScale>0 时启用；这里总是回宣告
+        if (!wscaleActive) ourWndScale = 0          // 保险：未启用时右移量为 0
 
         scope.launch { establishUpstream(ip, tcp, domain) }
 
-        // Send SYN-ACK with dynamic MSS
+        // Send SYN-ACK with dynamic MSS (+ Window-Scale if启用)
         val synAck = IpBuilders.tcpSynAckWithOptions(
             src = ip.dst,
             dst = ip.src,
@@ -572,9 +626,10 @@ class TCPConnection(
             dstPort = tcp.srcPort,
             seq = serverSeq.toInt(),
             ack = clientNextSeq.toInt(),
-            window = calcAdvertisedWindow(),
+            window = calcAdvertisedWindowField(), // 写入16bit字段（右移 ourWndScale）
             mss = mss,  // Use dynamic mss instead of MSS
-            sackPermitted = weSupportSack
+            sackPermitted = weSupportSack,
+            windowScale = if (wscaleActive) ourWndScale else null
         )
 
         packetWriter(listOf(synAck), listOf(ConnectionManager.PROTO_IPV4))
@@ -592,6 +647,9 @@ class TCPConnection(
             }
             android.util.Log.i(LOG_TAG, "3-way handshake established for ${getDisplayKey()} (SACK enabled: $peerSupportsSack)")
 
+
+            // 初始化对端通告窗口（SYN 之后的第一个 ACK 的窗口字段开始生效）
+            updatePeerWindowFromAck(tcp)
             flushPreHandshakeBuffer()
             tryStartDownstream(ip, tcp)
 
@@ -849,7 +907,7 @@ class TCPConnection(
             seq = serverSeq.toInt(),
             ack = clientNextSeq.toInt(),
             flags = 0x10, // ACK
-            window = calcAdvertisedWindow(),
+            window = calcAdvertisedWindowField(),
             tcpOptions = tcpOptions
         )
 
@@ -887,11 +945,13 @@ class TCPConnection(
     }
 
     private fun calcAdvertisedWindow(): Int {
+        
         // 直接使用缓存的大小，避免遍历
         val pendingBytes = pendingSize.get()
         val oooBytes = oooBufferSize.get()
         val used = min(MAX_PENDING_BYTES, pendingBytes + oooBytes)
         val free = (MAX_PENDING_BYTES - used).coerceAtLeast(0)
+        // 注：返回真实字节窗口；写入 TCP 头前会在 calcAdvertisedWindowField() 内按 ourWndScale 右移
         return free.coerceIn(MIN_ADV_WINDOW, MAX_ADV_WINDOW)
     }
 
@@ -946,6 +1006,14 @@ class TCPConnection(
         var pooledSocket = false  // 标记是否从池中获取
 
         try {
+
+            // Soft-wait up to 800ms for control-plane/overlay readiness (avoid blackhole on first flow)
+            try {
+                if (!Vpn2SocksService.OverlayGate.awaitReady(800)) {
+                    Log.d(LOG_TAG, "Overlay not ready within 800ms (soft wait); proceeding")
+                }
+            } catch (_: Throwable) {}
+
             val port = syn.dstPort
             val hostForDial = domain ?: ip.dst.toString()
 
@@ -1008,28 +1076,22 @@ class TCPConnection(
         return try {
             val socket = upstream
             val currentPhase = phase
-
             if (socket == null) {
                 return currentPhase != Phase.STREAMING &&
-                        currentPhase != Phase.HALF_CLOSED_LOCAL &&
-                        currentPhase != Phase.HALF_CLOSED_REMOTE
+                    currentPhase != Phase.HALF_CLOSED_LOCAL &&
+                    currentPhase != Phase.HALF_CLOSED_REMOTE
             }
-
             val isConnected = socket.isConnected && !socket.isClosed
             val canReadFromSocket = !socket.isInputShutdown
-            val canWriteToSocket = !socket.isOutputShutdown && canWrite
-
-            // Remove duplicate declarations - just use the above variables
-            val healthy = isConnected && (canReadFromSocket || canWriteToSocket)
+            // “读优先”：只要还连着且能读，就继续 downstream
+            val healthy = isConnected && canReadFromSocket
 
             if (!healthy) {
                 Log.d(LOG_TAG, "Socket state: closed=${socket.isClosed}, " +
                         "connected=${socket.isConnected}, " +
                         "inputShutdown=${socket.isInputShutdown}, " +
-                        "outputShutdown=${socket.isOutputShutdown}, " +
-                        "healthy=$healthy (canRead=$canReadFromSocket, canWrite=$canWriteToSocket)")
-            }
-
+                        "outputShutdown=${socket.isOutputShutdown}, healthy=$healthy")
+                }
             healthy
         } catch (e: Exception) {
             Log.e(LOG_TAG, "Error checking socket health: ${e.message}")
@@ -1059,6 +1121,7 @@ class TCPConnection(
         var totalRead = 0
         var consecutiveTimeouts = 0
         val maxConsecutiveTimeouts = 30  // Increase from 10 to 30 (60 seconds with 2s timeout)
+        var firstResponseSeen = false
 
         try {
             android.util.Log.i(LOG_TAG, "Downstream loop started for ${getDisplayKey()}")
@@ -1068,6 +1131,13 @@ class TCPConnection(
                     reader.read(buffer)
                 } catch (e: SocketTimeoutException) {
                     consecutiveTimeouts++
+
+                    // 首字节看门狗：完全没有回包的连接，≤4s 触发快速重试
+                    if (!firstResponseSeen && consecutiveTimeouts >= 2) {
+                        Log.w(LOG_TAG, "No server data within ~${consecutiveTimeouts * 2}s on fresh flow; triggering retry for ${getDisplayKey()}")
+                        break
+                    }
+
                     if (consecutiveTimeouts > maxConsecutiveTimeouts) {
                         // Only close if we've received some data
                         if (totalRead > 0) {
@@ -1103,6 +1173,9 @@ class TCPConnection(
                 }
 
                 totalRead += n
+
+                if (!firstResponseSeen) firstResponseSeen = true
+
                 LogNoiseLimiter.log(LOG_TAG, "sc:${getDisplayKey()}", 'V', 900) {
                     "Server->Client: $n bytes (total: $totalRead) for ${getDisplayKey()}"
                 }
@@ -1176,26 +1249,37 @@ class TCPConnection(
         val mss = (mtu - 40).coerceAtLeast(536)
         var offset = 0
 
+
+
         while (offset < data.size && !isClosed) {
             val chunkSize = min(mss, data.size - offset)
-            val chunk = data.copyOfRange(offset, offset + chunkSize)
 
             // Track send time for RTT measurement
             sentTimeMap[serverSeq] = System.currentTimeMillis()
 
+            // 发送前做一个简单的对端窗口检查（可选，防止超窗）
+            val unacked = ((serverSeq - lastAckFromClient) and 0xFFFFFFFFL).toInt()
+            val allowed = (peerAdvertisedWnd - unacked).coerceAtLeast(0)
+            val realChunk = if (allowed in 1 until chunkSize) allowed else chunkSize
+
+            // 直接从源缓冲切片，避免重复拷贝
+            val payloadSlice = data.copyOfRange(offset, offset + realChunk)
+
             val packet = IpBuilders.tcpPayloadFromServer(
                 src = ip.dst, dst = ip.src,
                 srcPort = tcp.dstPort, dstPort = tcp.srcPort,
-                payload = chunk,
+                payload = payloadSlice,
                 seq = serverSeq.toInt(),
                 ack = clientNextSeq.toInt(),
                 flags = 0x18, // PSH | ACK
-                window = calcAdvertisedWindow()
+                window = calcAdvertisedWindowField()
             )
 
             packetWriter(listOf(packet), listOf(ConnectionManager.PROTO_IPV4))
-            serverSeq = (serverSeq + chunkSize) and 0xFFFFFFFFL
-            offset += chunkSize
+
+            // 按实际发送的 realChunk 递增序列号
+            serverSeq = (serverSeq + realChunk) and 0xFFFFFFFFL
+            offset += realChunk
         }
     }
 
@@ -1207,7 +1291,7 @@ class TCPConnection(
             seq = serverSeq.toInt(),
             ack = clientNextSeq.toInt(),
             flags = 0x11, // FIN | ACK
-            window = calcAdvertisedWindow()
+            window = calcAdvertisedWindowField()
         )
         packetWriter(listOf(finPacket), listOf(ConnectionManager.PROTO_IPV4))
         Log.d(LOG_TAG, "Sent FIN|ACK to client for ${getDisplayKey()}")
@@ -1317,22 +1401,15 @@ class TCPConnection(
             Log.w(LOG_TAG, "Cleanup failed: ${e.message}")
         }
 
-        val shouldShutdown = stateLock.withLock {
-            pendingShutdown && pending.isEmpty() && canWrite && !outputShutdown
+        val shouldDeferHalfClose = stateLock.withLock {
+            pendingShutdown && pending.isEmpty() && !outputShutdown
         }
-
-        if (shouldShutdown) {
+        if (shouldDeferHalfClose) {
             writeLock.withLock {
-                if (!outputShutdown) {
-                    try {
-                        canWrite = false  // 先禁止写入
-                        outputShutdown = true
-                        upstream?.shutdownOutput()
-                        Log.d(LOG_TAG, "Upstream output shutdown")
-                    } catch (e: Exception) {
-                        Log.w(LOG_TAG, "Shutdown failed: ${e.message}")
-                    }
-                }
+                // 不主动半关，延迟到服务端 FIN 或最终 closeConnection() 再处理
+                deferredHalfClose = true
+                canWrite = false
+                Log.d(LOG_TAG, "Deferring upstream half-close (client half-closed & no pending)")
             }
         }
     }
@@ -1384,9 +1461,8 @@ class TCPConnection(
                 upstream?.let { socket ->
                     kotlin.runCatching {
                         if (!socket.isClosed) {
-                            if (!outputShutdown && !socket.isOutputShutdown) {
-                                socket.shutdownOutput()
-                            }
+
+                            if (deferredHalfClose && !socket.isOutputShutdown) { socket.shutdownOutput() }
 
                             if (bypassDirect && socket.isConnected) {
                                 SocketPool.release(socket)

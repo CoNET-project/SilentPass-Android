@@ -24,8 +24,13 @@ class ConnectionManager(
 
     // Speedtest domain cache for optimization
     private val speedtestDomains = setOf(
-		""
+        "speedtest.net",
+        "*.speedtest.net",
+        "c.speedtest.net",
+        "*.ooklaserver.net"
     )
+
+    private val ipv6DropCount = AtomicInteger(0)
 
     // ====== 通用日志节流（200ms）======
 
@@ -46,7 +51,13 @@ class ConnectionManager(
         if (b.isEmpty()) return
 
         val version = (b[0].toInt() ushr 4) and 0x0f
-        if (version != 4) return
+        if (version != 4) {
+            ipv6DropCount.incrementAndGet()
+            if ((ipv6DropCount.get() % 100) == 1) {
+                Log.d(LOG_TAG, "IPv6 packet dropped (sample) count=${ipv6DropCount.get()}")
+            }
+            return
+        }
         if (b.size < 20) return
 
         val ip = IPv4Packet(b)
@@ -56,6 +67,7 @@ class ConnectionManager(
             17 -> handleUDP(ip)
             else -> { /* drop */ }
         }
+
     }
 
     private fun cleanupClosedConnections() {

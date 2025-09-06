@@ -48,6 +48,28 @@ class Vpn2SocksService : VpnService() {
             }
         }
 
+        // ---- Cold-start / overlay readiness gate ----
+        object OverlayGate {
+            private val ref = java.util.concurrent.atomic.AtomicReference(
+                java.util.concurrent.CountDownLatch(1)
+            )
+            @Volatile private var ready = false
+            fun reset() {
+                ready = false
+                ref.set(java.util.concurrent.CountDownLatch(1))
+            }
+            fun signalReady() {
+                if (!ready) {
+                    ready = true
+                    ref.get().countDown()
+                }
+            }
+            fun awaitReady(timeoutMs: Long): Boolean {
+                if (ready) return true
+                return ref.get().await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+            }
+        }
+
         @JvmStatic
         fun protectDatagram(sock: java.net.DatagramSocket): Boolean {
             return try {
@@ -128,6 +150,9 @@ class Vpn2SocksService : VpnService() {
             return
         }
 
+        // Reset readiness gate for this new tunnel session
+        OverlayGate.reset()
+
         val builder = Builder()
             .setSession("SilentPass VPN")
             .addAddress("172.16.0.1", 32)
@@ -167,7 +192,8 @@ class Vpn2SocksService : VpnService() {
         )
 
         Log.d("Vpn2SocksService", "VPN service initialized with single DNSInterceptor instance")
-
+        // Signal that overlay/control-plane is ready for the first upstream
+        OverlayGate.signalReady()
         scope.launch { packetPump() }
     }
 

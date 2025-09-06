@@ -26,7 +26,12 @@ import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
+
+private const val TYPE_AAAA = 28
+private const val TYPE_HTTPS = 65
+
 class DNSInterceptor private constructor() {
+
 
 	companion object {
 
@@ -87,7 +92,25 @@ class DNSInterceptor private constructor() {
         }
     }
 
+    private fun buildNoDataResponse(id: Int, query: ByteArray): ByteArray {
+        val resp = query.copyOf()
 
+        // 写入新的 Transaction ID
+        resp[0] = ((id shr 8) and 0xff).toByte()
+        resp[1] = (id and 0xff).toByte()
+
+        // Flags: 标准响应、无错误 (QR=1, RCODE=0)
+        resp[2] = (resp[2].toInt() or 0x80).toByte()   // 置 QR=1
+        resp[3] = (resp[3].toInt() and 0xF0).toByte()  // 清 RCODE
+
+        // QDCOUNT 原样（=1），ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
+        resp[6] = 0; resp[7] = 0  // ANCOUNT = 0
+        resp[8] = 0; resp[9] = 0  // NSCOUNT = 0
+        resp[10] = 0; resp[11] = 0 // ARCOUNT = 0
+
+        // 问题区（Question Section）已包含在 query 里，无需改动
+        return resp
+    }
 
 
     private val dnsCache = ConcurrentHashMap<String, DNSCacheEntry>()
@@ -109,6 +132,7 @@ class DNSInterceptor private constructor() {
         keepAliveDuration = 5L,
         TimeUnit.MINUTES
     )
+
 
     // Enhanced OkHttp client with HTTP/2 support
     private val httpClient = OkHttpClient.Builder()
@@ -1232,6 +1256,20 @@ class DNSInterceptor private constructor() {
             }
             return resp?.let { it to null }
         }
+
+        if (qtype == TYPE_AAAA) {
+            Log.d(LOG_TAG, "Blocked AAAA for $name -> returning NODATA")
+            val resp = buildNoDataResponse(id, query)  // 新增方法，见下
+            return resp to null
+        }
+
+        if (qtype == TYPE_HTTPS ) {
+            Log.d(LOG_TAG, "Strip HTTPS/SVCB for $name -> NODATA to avoid H3 fallback")
+            val resp = buildNoDataResponse(id, query)
+            return resp to null
+        }
+
+
 
         if (qtype != 1) {
             val resp = queryOverUpstreams(query)

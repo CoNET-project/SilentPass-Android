@@ -21,6 +21,11 @@ class SocksClient(private val endpoint: SocksEndpoint) {
             s.connect(InetSocketAddress(endpoint.host, endpoint.port), 5000)
         }
 
+        s.tcpNoDelay = true
+        s.keepAlive = true
+        s.receiveBufferSize = 256 * 1024
+        s.sendBufferSize   = 256 * 1024
+
         val out = s.getOutputStream()
         val inp = s.getInputStream()
 
