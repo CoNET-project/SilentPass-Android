@@ -77,16 +77,44 @@ class TCPConnection(
 	private fun tupleKeyForDedup(extra: String): String = getDisplayKey() + "|" + extra
 
 
-    private val mss: Int = calculateOptimalMSS()
+    @Volatile private var mss: Int = calculateOptimalMSS()
+    @Volatile private var mssFallbackSteps: Int = 0  // PMTU blackhole mitigation (max 3)
+
+
     // Dynamic CWND values based on instance MSS
     private val INITIAL_CWND = INITIAL_CWND_MULTIPLIER * mss
     private val MIN_CWND = MIN_CWND_MULTIPLIER * mss
+
     private fun calculateOptimalMSS(): Int {
-        return when {
-            bypassDirect -> MSS_STANDARD  // 保持标准值
-            socksEndpoint != null -> MSS_SOCKS  // 降低SOCKS MSS
-            else -> MSS_VPN  // 进一步降低VPN MSS
+        // 1) 基于实际 MTU 的保守基线（IPv4 20 + TCP 20）
+        val base = kotlin.math.min(MSS_STANDARD, (mtu - 40).coerceAtLeast(536))
+
+        // 2) 为隧道/封装预留余量（经验 80B），直连不预留
+        val headroom = if (bypassDirect) 0 else 80
+        val tunneled = (base - headroom).coerceAtLeast(536)
+
+        // 3) 与经验上限取最小（SOCKS/VPN 场景更保守）
+        val cap = if (bypassDirect) MSS_STANDARD else kotlin.math.min(MSS_SOCKS, MSS_VPN + 60) // 1420 vs ~1420
+
+        // 4) 夹在 [1200, cap] 区间内（HTTP/2/TLS 初期分片风险小）
+        val clamped = tunneled
+            .coerceAtMost(cap)
+            .coerceAtLeast(if (bypassDirect) 1200 else 1200)
+
+        return clamped
+    }
+
+    // 在出现疑似 PMTU 黑洞或重传异常时，逐级把 MSS 再降 40B（最多 3 次）
+    private fun maybeLowerMssOnBlackhole(): Boolean {
+        if (mssFallbackSteps >= 3) return false
+        val newMss = (mss - 40).coerceAtLeast(536)
+        if (newMss < mss) {
+            mss = newMss
+            mssFallbackSteps += 1
+            Log.w(LOG_TAG, "PMTU blackhole suspected -> lowering MSS to $mss (step=$mssFallbackSteps) for ${getDisplayKey()}")
+            return true
         }
+        return false
     }
 
     // =============== Connection Statistics ===============
@@ -173,6 +201,8 @@ class TCPConnection(
                 ssthresh = max(flightSize / 2, this@TCPConnection.MIN_CWND)  // Use instance value
                 cwnd = ssthresh + 3 * mss
                 Log.d(LOG_TAG, "Fast recovery triggered: ssthresh=$ssthresh, cwnd=$cwnd")
+                // 触发 3 重复 ACK：尝试降 MSS 一档
+                maybeLowerMssOnBlackhole()
             }
         }
 
@@ -181,11 +211,12 @@ class TCPConnection(
             cwnd = this@TCPConnection.MIN_CWND  // Use instance value
             duplicateAckCount.set(0)
             Log.d(LOG_TAG, "Timeout: ssthresh=$ssthresh, cwnd=$cwnd")
+
+            // 超时：更强烈的黑洞信号，降 MSS 一档
+            maybeLowerMssOnBlackhole()
         }
 
-        fun canSend(bytes: Int): Boolean {
-            return flightSize + bytes <= cwnd
-        }
+        fun canSend(bytes: Int): Boolean = (flightSize + bytes) <= cwnd
 
         fun onSend(bytes: Int) {
             flightSize += bytes
