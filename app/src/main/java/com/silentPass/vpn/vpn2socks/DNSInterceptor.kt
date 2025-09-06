@@ -702,87 +702,7 @@ class DNSInterceptor private constructor() {
         "openpgp.online",
         "comm100vue.com",
         "comm100.io",
-        // Apple Push 相关
-        "conet.network",
-        "apple.com",
-        "push.apple.com",
-        "icloud.com",
-        "push-apple.com.akadns.net",
-        "silentpass.io",
-        "courier.push.apple.com",
-        "gateway.push.apple.com",
-        "gateway.sandbox.push.apple.com",
-        "gateway.icloud.com",
-        "bag.itunes.apple.com",
-        "init.itunes.apple.com",
-        "xp.apple.com",
-        "gsa.apple.com",
-        "gsp-ssl.ls.apple.com",
-        "gsp-ssl.ls-apple.com.akadns.net",
-        "mesu.apple.com",
-        "gdmf.apple.com",
-        "deviceenrollment.apple.com",
-        "mdmenrollment.apple.com",
-        "iprofiles.apple.com",
-        "ppq.apple.com",
 
-        // 🔥 微信（WeChat）相关域名
-        "wechat.com",
-        "weixin.qq.com",
-        "weixin110.qq.com",
-        "tenpay.com",
-        "mm.taobao.com",
-        "wx.qq.com",
-        "web.wechat.com",
-        "webpush.weixin.qq.com",
-        "qpic.cn",
-        "qlogo.cn",
-        "wx.gtimg.com",
-        "minorshort.weixin.qq.com",
-        "log.weixin.qq.com",
-        "szshort.weixin.qq.com",
-        "szminorshort.weixin.qq.com",
-        "szextshort.weixin.qq.com",
-        "hkshort.weixin.qq.com",
-        "hkminorshort.weixin.qq.com",
-        "hkextshort.weixin.qq.com",
-        "hklong.weixin.qq.com",
-        "sgshort.wechat.com",
-        "sgminorshort.wechat.com",
-        "sglong.wechat.com",
-        "usshort.wechat.com",
-        "usminorshort.wechat.com",
-        "uslong.wechat.com",
-
-        // 微信支付
-        "pay.weixin.qq.com",
-        "payapp.weixin.qq.com",
-
-        // 微信文件传输
-        "file.wx.qq.com",
-        "support.weixin.qq.com",
-
-        // 微信 CDN
-        "mmbiz.qpic.cn",
-        "mmbiz.qlogo.cn",
-        "mmsns.qpic.cn",
-
-        // 腾讯推送服务
-        "dns.weixin.qq.com",
-        "short.weixin.qq.com",
-        "long.weixin.qq.com",
-
-        "doubleclick.net",
-        "pubmatic.com",
-        "adnxs.com",
-        "rubiconproject.com",
-
-        "adsrvr.org",
-        "criteo.com",
-
-        "taboola.com",
-        "yahoo.com",
-        "publicsuffix.org"
     )
 
     private val bypassPatterns = listOf(
@@ -793,7 +713,7 @@ class DNSInterceptor private constructor() {
         Regex(""".*\.adsrvr\.org$""")
     )
 
-    // 增加预取和批处理
+// 增加预取和批处理 ·       1   `
     private suspend fun prefetchDNS(domains: List<String>) {
         kotlinx.coroutines.coroutineScope {
             domains.chunked(5).forEach { batch ->
