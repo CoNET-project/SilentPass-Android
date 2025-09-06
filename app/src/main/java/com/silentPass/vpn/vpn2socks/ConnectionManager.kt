@@ -24,11 +24,7 @@ class ConnectionManager(
 
     // Speedtest domain cache for optimization
     private val speedtestDomains = setOf(
-        "www.speedtest.net",
-        "c.speedtest.net",
-        "speedtest.net",
-        "*.speedtest.net",
-        "*.ooklaserver.net"
+        "www.speedtest.net"
     )
 
     // ====== 通用日志节流（200ms）======
@@ -262,7 +258,6 @@ class ConnectionManager(
 
         val bypassDirect = when {
             isBypassDomain -> true
-            isSpeedtest -> true  // Direct connection for speedtest
             isFakeByRange -> false
             hasDomainMapping && !isBypassDomain -> false
             else -> true
@@ -286,10 +281,6 @@ class ConnectionManager(
                     socksEndpoint = socksEndpoint,
                     bypassDirect = bypassDirect
                 )
-
-                if (isSpeedtest) {
-                    Log.d(LOG_TAG, "Created optimized connection for Speedtest")
-                }
 
                 metrics.activeConnections.incrementAndGet()
                 newConn
