@@ -49,26 +49,6 @@ class Vpn2SocksService : VpnService() {
         }
 
         // ---- Cold-start / overlay readiness gate ----
-        object OverlayGate {
-            private val ref = java.util.concurrent.atomic.AtomicReference(
-                java.util.concurrent.CountDownLatch(1)
-            )
-            @Volatile private var ready = false
-            fun reset() {
-                ready = false
-                ref.set(java.util.concurrent.CountDownLatch(1))
-            }
-            fun signalReady() {
-                if (!ready) {
-                    ready = true
-                    ref.get().countDown()
-                }
-            }
-            fun awaitReady(timeoutMs: Long): Boolean {
-                if (ready) return true
-                return ref.get().await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
-            }
-        }
 
         @JvmStatic
         fun protectDatagram(sock: java.net.DatagramSocket): Boolean {

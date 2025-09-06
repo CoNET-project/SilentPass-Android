@@ -55,12 +55,12 @@ class TCPConnection(
         private const val DEFAULT_WND_SCALE = 7
 
         // Buffering and window limits
-        private const val MAX_PENDING_BYTES = 2 * 1024 * 1024
+        private const val MAX_PENDING_BYTES = 4 * 1024 * 1024
         private const val MIN_ADV_WINDOW = 1024
         private const val MAX_ADV_WINDOW = 4 * 1024 * 1024
 
         // Delayed ACK timers
-        private const val DELAYED_ACK_MS = 40L
+        private const val DELAYED_ACK_MS = 25L
         private const val MAX_PENDING_ACKS = 2
     }
 
@@ -1009,7 +1009,7 @@ class TCPConnection(
 
             // Soft-wait up to 800ms for control-plane/overlay readiness (avoid blackhole on first flow)
             try {
-                if (!Vpn2SocksService.OverlayGate.awaitReady(800)) {
+                if (!OverlayGate.awaitReady(800)) {
                     Log.d(LOG_TAG, "Overlay not ready within 800ms (soft wait); proceeding")
                 }
             } catch (_: Throwable) {}
