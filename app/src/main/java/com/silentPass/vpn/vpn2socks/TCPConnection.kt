@@ -383,6 +383,7 @@ class TCPConnection(
     @Volatile private var phase: Phase = Phase.SYN
     @Volatile private var handshakeAcked = false
     @Volatile private var socksPrimed = false
+    @Volatile private var warmupDone = false
 
     // =============== TCP Sequence State ===============
     private var clientSeq0: Long? = null
@@ -432,6 +433,8 @@ class TCPConnection(
     @Volatile private var lastAckTime = 0L
     @Volatile private var pendingAckCount = 0
     private var ackFlushJob: Job? = null
+
+    private var quickAckUntilMs: Long = 0L
 
     fun isClosed(): Boolean = isClosed
 
@@ -647,6 +650,8 @@ class TCPConnection(
             }
             android.util.Log.i(LOG_TAG, "3-way handshake established for ${getDisplayKey()} (SACK enabled: $peerSupportsSack)")
 
+            // 在握手完成后的短时窗口内优先快速 ACK，帮对端更快拉大 cwnd
+            quickAckUntilMs = System.currentTimeMillis() + 1500
 
             // 初始化对端通告窗口（SYN 之后的第一个 ACK 的窗口字段开始生效）
             updatePeerWindowFromAck(tcp)
@@ -927,8 +932,11 @@ class TCPConnection(
             outOfOrderSegments.isNotEmpty()
         }
 
-        val shouldSendImmediate = immediate ||
-                (peerSupportsSack && hasOutOfOrder)
+        // Quick-ACK 条件：显式要求 / 有乱序要发 SACK / 仍在快速阶段 / 小包（< MSS/2）
+        val quickPhase = now < quickAckUntilMs
+        val smallPayload = tcp.payload.size < (mss / 2)
+        val shouldSendImmediate = immediate || (peerSupportsSack && hasOutOfOrder) || quickPhase || smallPayload
+
 
 
         if (!shouldSendImmediate) {
@@ -1036,6 +1044,14 @@ class TCPConnection(
                 }
             }
 
+
+            // 放大缓冲 & 放宽 read 超时（上传起步更稳）
+            try {
+                socket.keepAlive = true
+                socket.receiveBufferSize = 512 * 1024
+                socket.sendBufferSize    = 512 * 1024
+                socket.soTimeout         = 8000
+            } catch (_: Throwable) {}
 
             upstream = socket
             upstreamWriter = socket.getOutputStream()
@@ -1301,9 +1317,11 @@ class TCPConnection(
         val writer = upstreamWriter ?: return@withContext
         var totalFlushed = 0
 
-        // Enhanced warmup for SOCKS connections
-        if (totalFlushed == 0 && phase == Phase.SOCKS_PRIMED && !bypassDirect) {
-            delay(100)  // Longer delay for SOCKS proxy stabilization
+        // Enhanced warmup for SOCKS connections — run ONCE only, very short
+        if (!warmupDone && totalFlushed == 0 && phase == Phase.SOCKS_PRIMED && !bypassDirect) {
+            // 可按需去掉 delay，或保持 5~10ms 的极短预热
+            // delay(5)
+            warmupDone = true
         }
 
         while (canWrite && !outputShutdown) {  // 检查写入状态
