@@ -56,11 +56,12 @@ class TCPConnection(
 
         // Buffering and window limits
         private const val MAX_PENDING_BYTES = 4 * 1024 * 1024
-        private const val MIN_ADV_WINDOW = 1024
+        private const val MIN_ADV_WINDOW = 128 * 1024
+        
         private const val MAX_ADV_WINDOW = 4 * 1024 * 1024
 
         // Delayed ACK timers
-        private const val DELAYED_ACK_MS = 25L
+        private const val DELAYED_ACK_MS = 8L
         private const val MAX_PENDING_ACKS = 2
     }
 
@@ -82,11 +83,9 @@ class TCPConnection(
     private val INITIAL_CWND = INITIAL_CWND_MULTIPLIER * mss
     private val MIN_CWND = MIN_CWND_MULTIPLIER * mss
     private fun calculateOptimalMSS(): Int {
-        return when {
-            bypassDirect -> MSS_STANDARD  // 保持标准值
-            socksEndpoint != null -> MSS_SOCKS  // 降低SOCKS MSS
-            else -> MSS_VPN  // 进一步降低VPN MSS
-        }
+       // MSS 只与“本条连接”的 MTU 有关；上游是否 SOCKS 与此无关
+        val base = (mtu - 40).coerceAtLeast(536)        // 536 是典型下限
+       return base.coerceAtMost(1460)                  // 1500 MTU 下的上限
     }
 
     // =============== Connection Statistics ===============
@@ -343,13 +342,13 @@ class TCPConnection(
                 val now = System.currentTimeMillis()
                 val timeSinceLastWrite = now - lastWriteTime
 
-                // 动态决定是否flush
+                // 形成更大批次，降低过度刷新频率，减少碎片小包
                 val shouldFlush = when {
-                    buffer.size() >= mtu - 100 -> true
-                    buffer.size() >= 4096 -> true  // Reduced from 16KB
-                    pendingWrites.size >= 2 -> true
-                    timeSinceLastWrite > 1 && buffer.size() > 0 -> true  // Reduced from 5ms
-                    data.size > 1000 -> true
+                    buffer.size() >= mtu - 100 -> true                 // 接近 MTU
+                    buffer.size() >= (64 * 1024) -> true               // 达到 64KB
+                    pendingWrites.size >= 8 -> true                    // 合并 8 份以上
+                    timeSinceLastWrite > 3 && buffer.size() > 0 -> true// 空闲 >3ms
+                    data.size > 1000 -> true                           // 大单次写
                     else -> false
                 }
 
@@ -1053,9 +1052,18 @@ class TCPConnection(
                 socket.soTimeout         = 8000
             } catch (_: Throwable) {}
 
+            // 放大缓冲 & 放宽 read 超时（上传起步更稳）
+            try {
+                socket.keepAlive = true
+                socket.receiveBufferSize = 1 * 1024 * 1024
+                socket.sendBufferSize    = 1 * 1024 * 1024
+                socket.soTimeout         = 8000
+            } catch (_: Throwable) {}
+
             upstream = socket
-            upstreamWriter = socket.getOutputStream()
-            upstreamReader = socket.getInputStream()
+            // 使用 Buffered 流，减少 JVM→内核的 write/read 次数
+            upstreamWriter = java.io.BufferedOutputStream(socket.getOutputStream(), 64 * 1024)
+            upstreamReader = java.io.BufferedInputStream(socket.getInputStream(),  64 * 1024)
 
 
             // Only then update phase
@@ -1138,6 +1146,8 @@ class TCPConnection(
         var consecutiveTimeouts = 0
         val maxConsecutiveTimeouts = 30  // Increase from 10 to 30 (60 seconds with 2s timeout)
         var firstResponseSeen = false
+        val firstResponseDeadline = android.os.SystemClock.elapsedRealtime() + 12_000
+
 
         try {
             android.util.Log.i(LOG_TAG, "Downstream loop started for ${getDisplayKey()}")
@@ -1148,9 +1158,10 @@ class TCPConnection(
                 } catch (e: SocketTimeoutException) {
                     consecutiveTimeouts++
 
-                    // 首字节看门狗：完全没有回包的连接，≤4s 触发快速重试
-                    if (!firstResponseSeen && consecutiveTimeouts >= 2) {
-                        Log.w(LOG_TAG, "No server data within ~${consecutiveTimeouts * 2}s on fresh flow; triggering retry for ${getDisplayKey()}")
+                    // 首包宽限：直到 12s 再考虑放弃
+                    if (!firstResponseSeen && android.os.SystemClock.elapsedRealtime() >= firstResponseDeadline) {
+                        val waitedMs = 12_000
+                        Log.w(LOG_TAG, "No server data within ~${waitedMs}ms on fresh flow; giving up for ${getDisplayKey()}")
                         break
                     }
 
@@ -1160,7 +1171,9 @@ class TCPConnection(
                             Log.d(LOG_TAG, "Closing after timeouts with $totalRead bytes received")
                             break
                         } else {
-                            Log.w(LOG_TAG, "No data received after ${consecutiveTimeouts * 2}s, closing")
+                            val soMs = upstream?.soTimeout ?: 2000
+                            val waitedMs = consecutiveTimeouts * soMs
+                            Log.w(LOG_TAG, "No data received after ~${waitedMs}ms (soTimeout=${soMs}ms), closing")
                             break
                         }
                     }
@@ -1358,8 +1371,8 @@ class TCPConnection(
                                 return@offer false
                             }
 
+                            // 只 write，不每次 flush，交由合并/缓冲策略决定何时落到内核
                             writer.write(data)
-                            writer.flush()
                             totalFlushed += data.size
                             true
                         } catch (e: IOException) {

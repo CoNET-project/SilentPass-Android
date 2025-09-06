@@ -625,7 +625,6 @@ class DNSInterceptor private constructor() {
         "voicefive.com",
         "buysellads.com",
         "carbonads.com",
-        "cdn.ampproject.org",
 
         // 更多跟踪器
         "mixpanel.com",
