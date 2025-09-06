@@ -36,33 +36,69 @@ class SocketServerService : Service() {
     private var layerMinus: LayerMinus? = null
     private var serverSocket: ServerSocket? = null
     private val LOG_TAG = "SocketServerService"
-    private fun forwardTraffic(input: InputStream, output: OutputStream) {
-        Thread {
+    private fun forwardTraffic(input: InputStream, output: OutputStream): Thread {
+        return Thread {
             try {
-                val buffer = ByteArray(4096)
-                var bytes: Int
+                val buffer = ByteArray(8192) // Larger buffer for better performance
+                var totalBytes = 0L
+
                 while (true) {
-                    bytes = input.read(buffer)
+                    val bytes = try {
+                        input.read(buffer)
+                    } catch (e: java.net.SocketTimeoutException) {
+                        // Timeout is ok, continue
+                        continue
+                    } catch (e: java.net.SocketException) {
+                        if (e.message?.contains("reset") == true ||
+                            e.message?.contains("closed") == true ||
+                            e.message?.contains("Broken pipe") == true) {
+                            // Expected socket closure
+                            Log.d(LOG_TAG, "Socket closed after $totalBytes bytes (normal)")
+                            break
+                        } else {
+                            throw e
+                        }
+                    }
+
                     if (bytes == -1) {
-                        // 正常的 EOF，不是错误
-                        Log.d(LOG_TAG, "forwardTraffic: EOF reached, closing gracefully")
+                        Log.d(LOG_TAG, "EOF reached after forwarding $totalBytes bytes")
                         break
                     }
-                    output.write(buffer, 0, bytes)
-                    output.flush()
+
+                    if (bytes > 0) {
+                        try {
+                            output.write(buffer, 0, bytes)
+                            output.flush()
+                            totalBytes += bytes
+                        } catch (e: java.net.SocketException) {
+                            if (e.message?.contains("reset") == true ||
+                                e.message?.contains("closed") == true ||
+                                e.message?.contains("Broken pipe") == true) {
+                                Log.d(LOG_TAG, "Output socket closed after $totalBytes bytes")
+                                break
+                            } else {
+                                throw e
+                            }
+                        }
+                    }
                 }
-            } catch (e: java.net.SocketException) {
-                // Socket 关闭是正常的，不需要记录为错误
-                Log.d(LOG_TAG, "forwardTraffic: Socket closed (normal)")
             } catch (e: Exception) {
-                Log.e(LOG_TAG, "forwardTraffic: Unexpected error", e)
+                if (e !is java.io.IOException ||
+                    (!e.message.isNullOrEmpty() &&
+                            !e.message!!.contains("Stream closed") &&
+                            !e.message!!.contains("Socket closed"))) {
+                    Log.e(LOG_TAG, "Unexpected error in forwardTraffic", e)
+                }
             } finally {
+                // Gracefully close streams
                 try {
                     input.close()
+                } catch (_: Exception) {}
+                try {
                     output.close()
                 } catch (_: Exception) {}
             }
-        }.start()
+        }.apply { start() }
     }
     //      curl local proxy test command
     //      curl -v -x socks5://127.0.0.1:8888 --resolve "www.google.com:53:8.8.8.8" www.google.com
@@ -187,8 +223,10 @@ class SocketServerService : Service() {
                         return@Thread
                     }
                 } else {
-                    serverSocket = Socket(host, port)
-                    if (serverSocket == null) {
+                    serverSocket = try {
+                        Socket(host, port)
+                    } catch (e: Exception) {
+                        Log.e(LOG_TAG, "Failed to connect to $host:$port", e)
                         client.close()
                         return@Thread
                     }
@@ -260,20 +298,21 @@ class SocketServerService : Service() {
                     forwardTraffic(serverInput, clientOutput)
                     forwardTraffic(client.getInputStream(), serverSocket.getOutputStream())
                 } else {
-                    var targetSocket = Socket(host, port)
+                    var targetSocket = try {
+                        Socket(host, port)
+                    } catch (e: Exception) {
+                        Log.e(LOG_TAG, "Failed to connect to $host:$port", e)
+                        client.close()
+                        return@Thread
+                    }
 
 
-                if (targetSocket == null) {
-                    client.close()
-                    return@Thread
-                }
-
-                forwardTraffic(client.getInputStream(), targetSocket.getOutputStream())
-                forwardTraffic(targetSocket.getInputStream(), client.getOutputStream())
-                Log.d(
-                    LOG_TAG,
-                    "Forwarding ${host}:${port} via Local CONNECTING"
-                )
+                    forwardTraffic(client.getInputStream(), targetSocket.getOutputStream())
+                    forwardTraffic(targetSocket.getInputStream(), client.getOutputStream())
+                    Log.d(
+                        LOG_TAG,
+                        "Forwarding ${host}:${port} via Local CONNECTING"
+                    )
                     }
 
             } catch (e: Exception) {
@@ -453,6 +492,7 @@ class SocketServerService : Service() {
     private fun handleSocks5(client: Socket, input: InputStream, output: OutputStream) {
         Thread {
             try {
+                // Authentication phase
                 input.read() // version
                 val nMethods = input.read()
                 val methods = ByteArray(nMethods)
@@ -462,6 +502,7 @@ class SocketServerService : Service() {
                 output.write(byteArrayOf(0x05, 0x00))
                 output.flush()
 
+                // Request phase
                 val version = input.read()
                 val cmd = input.read()
                 input.read() // RSV
@@ -473,20 +514,12 @@ class SocketServerService : Service() {
                         input.read(ip)
                         ip.joinToString(".") { (it.toInt() and 0xFF).toString() }
                     }
-
                     0x03 -> { // Domain name
                         val len = input.read()
                         val domain = ByteArray(len)
                         input.read(domain)
                         String(domain)
                     }
-//
-//                0x04 -> { // IPv6 not support
-//                    val ip = ByteArray(16)
-//                    input.read(ip)
-//                    InetAddress.getByAddress(ip).hostAddress
-//                }
-
                     else -> {
                         client.close()
                         return@Thread
@@ -495,93 +528,162 @@ class SocketServerService : Service() {
 
                 val port = (input.read() shl 8) or input.read()
 
-                val response = byteArrayOf(
-                    0x05, 0x00, 0x00, 0x01, // VER, REP=success, RSV, ATYP=IPv4
-                    0x00, 0x00, 0x00, 0x00, // BND.ADDR (dummy)
-                    0x00, 0x00              // BND.PORT (dummy)
-                )
-
                 when (cmd) {
                     0x01 -> { // CONNECT
                         if (layerMinus != null) {
+                            // Send success response immediately
+                            val response = byteArrayOf(
+                                0x05, 0x00, 0x00, 0x01, // VER, REP=success, RSV, ATYP=IPv4
+                                0x00, 0x00, 0x00, 0x00, // BND.ADDR (dummy)
+                                0x00, 0x00              // BND.PORT (dummy)
+                            )
                             output.write(response)
                             output.flush()
 
-                            Thread {
-                                var remoteSocket: Socket? = null  // 改名为 remoteSocket 避免混淆
+                            // Handle the connection
+                            var remoteSocket: Socket? = null
+                            var firstPacketProcessed = false
+
+                            try {
+                                // Use mark/reset to peek at incoming data
+                                val bufferedInput = BufferedInputStream(input)
+                                bufferedInput.mark(8192)
+
+                                // Try to read first packet (non-blocking check)
+                                val firstBuffer = ByteArray(4096)
+                                var firstPacketSize = 0
+
+                                // Set a short timeout for first packet
+                                client.soTimeout = 100 // 100ms timeout
                                 try {
-                                    val buffer = ByteArray(4096)
-                                    var firstPacketSent = false
-
-                                    while (true) {
-                                        val bytesRead = try {
-                                            input.read(buffer)
-                                        } catch (e: java.net.SocketException) {
-                                            if (e.message?.contains("closed") == true) {
-                                                Log.d(LOG_TAG, "Client socket closed (normal)")
-                                                break
-                                            } else {
-                                                throw e
-                                            }
-                                        }
-
-                                        if (bytesRead == -1) break
-
-                                        if (!firstPacketSent) {
-                                            firstPacketSent = true
-                                            val firstData = if (bytesRead > 0) {
-                                                buffer.copyOfRange(0, bytesRead)
-                                            } else {
-                                                ByteArray(0)
-                                            }
-
-                                            Log.d(LOG_TAG, "First packet for $destHost:$port - ${bytesRead} bytes")
-
-                                            remoteSocket = layerMinus?.connectToLayerMinus(
-                                                destHost,
-                                                port.toString(),
-                                                firstData
-                                            )
-
-                                            if (remoteSocket == null) {
-                                                Log.e(LOG_TAG, "LayerMinus connection failed")
-                                                client.close()
-                                                break
-                                            }
-
-                                            // 启动反向转发
-
-                                            // 先把所有需要的流拿到手，避免参数求值时触发 Socket 已关闭
-                                            val rs = remoteSocket!!
-                                            val remoteIn  = BufferedInputStream(rs.getInputStream())
-                                            val remoteOut = rs.getOutputStream()
-                                            val clientOut = client.getOutputStream()
-
-                                            // 启动 远端->客户端
-                                            Thread {
-                                                forwardTraffic(remoteIn, clientOut)
-                                            }.start()
-
-
-                                        } else {
-                                            remoteSocket?.getOutputStream()?.write(buffer, 0, bytesRead)
-                                            remoteSocket?.getOutputStream()?.flush()
-                                        }
-                                    }
-                                } catch (e: Exception) {
-                                    Log.e(LOG_TAG, "Client to server forward error", e)
+                                    firstPacketSize = bufferedInput.read(firstBuffer)
+                                } catch (e: java.net.SocketTimeoutException) {
+                                    // No immediate data, that's ok
+                                    firstPacketSize = 0
                                 } finally {
-                                    remoteSocket?.close()
-                                    client.close()
+                                    client.soTimeout = 0 // Reset to blocking
                                 }
-                            }.start()
+
+                                // Reset to read again properly
+                                if (firstPacketSize > 0) {
+                                    bufferedInput.reset()
+                                }
+
+                                // Establish upstream connection
+                                val firstData = if (firstPacketSize > 0) {
+                                    val data = ByteArray(firstPacketSize)
+                                    bufferedInput.read(data)
+                                    firstPacketProcessed = true
+                                    Log.d(LOG_TAG, "First packet for $destHost:$port - $firstPacketSize bytes")
+                                    data
+                                } else {
+                                    Log.d(LOG_TAG, "No immediate data for $destHost:$port")
+                                    null
+                                }
+
+                                remoteSocket = layerMinus?.connectToLayerMinus(
+                                    destHost,
+                                    port.toString(),
+                                    firstData
+                                )
+
+                                if (remoteSocket == null) {
+                                    Log.e(LOG_TAG, "Failed to establish upstream connection to $destHost:$port")
+                                    // Send connection refused
+                                    val errorResponse = byteArrayOf(
+                                        0x05, 0x05, 0x00, 0x01, // VER, REP=connection refused
+                                        0x00, 0x00, 0x00, 0x00,
+                                        0x00, 0x00
+                                    )
+                                    output.write(errorResponse)
+                                    output.flush()
+                                    client.close()
+                                    return@Thread
+                                }
+
+                                Log.d(LOG_TAG, "Upstream established for $destHost:$port")
+
+                                // Start bidirectional forwarding
+                                val remoteIn = BufferedInputStream(remoteSocket.getInputStream())
+                                val remoteOut = BufferedOutputStream(remoteSocket.getOutputStream())
+                                val clientIn = bufferedInput
+                                val clientOut = BufferedOutputStream(output)
+
+                                // Remote -> Client forwarding thread
+                                val remoteToClient = Thread {
+                                    try {
+                                        val buffer = ByteArray(8192)
+                                        while (true) {
+                                            val n = remoteIn.read(buffer)
+                                            if (n == -1) break
+                                            clientOut.write(buffer, 0, n)
+                                            clientOut.flush()
+                                        }
+                                    } catch (e: Exception) {
+                                        Log.d(LOG_TAG, "Remote->Client ended: ${e.message}")
+                                    } finally {
+                                        try { client.shutdownOutput() } catch (_: Exception) {}
+                                    }
+                                }
+
+                                // Client -> Remote forwarding (main thread)
+                                val clientToRemote = Thread {
+                                    try {
+                                        val buffer = ByteArray(8192)
+                                        while (true) {
+                                            val n = clientIn.read(buffer)
+                                            if (n == -1) break
+                                            remoteOut.write(buffer, 0, n)
+                                            remoteOut.flush()
+                                        }
+                                    } catch (e: Exception) {
+                                        Log.d(LOG_TAG, "Client->Remote ended: ${e.message}")
+                                    } finally {
+                                        try { remoteSocket.shutdownOutput() } catch (_: Exception) {}
+                                    }
+                                }
+
+                                remoteToClient.start()
+                                clientToRemote.start()
+
+                                // Wait for both threads to complete
+                                remoteToClient.join()
+                                clientToRemote.join()
+
+                            } catch (e: Exception) {
+                                Log.e(LOG_TAG, "Error in SOCKS5 CONNECT handling", e)
+                            } finally {
+                                remoteSocket?.close()
+                                client.close()
+                            }
+
                         } else {
-                            // 直连模式
-                            val target = Socket(destHost, port)
-                            output.write(response)
-                            output.flush()
-                            forwardTraffic(input, target.getOutputStream())
-                            forwardTraffic(target.getInputStream(), output)
+                            // Direct connection mode
+                            try {
+                                val target = Socket(destHost, port)
+
+                                val response = byteArrayOf(
+                                    0x05, 0x00, 0x00, 0x01,
+                                    0x00, 0x00, 0x00, 0x00,
+                                    0x00, 0x00
+                                )
+                                output.write(response)
+                                output.flush()
+
+                                // Start bidirectional forwarding
+                                forwardTraffic(input, target.getOutputStream())
+                                forwardTraffic(target.getInputStream(), output)
+                            } catch (e: Exception) {
+                                Log.e(LOG_TAG, "Direct connection failed", e)
+                                val errorResponse = byteArrayOf(
+                                    0x05, 0x05, 0x00, 0x01,
+                                    0x00, 0x00, 0x00, 0x00,
+                                    0x00, 0x00
+                                )
+                                output.write(errorResponse)
+                                output.flush()
+                                client.close()
+                            }
                         }
                     }
 
@@ -597,10 +699,11 @@ class SocketServerService : Service() {
                 }
             } catch (e: Exception) {
                 Log.e(LOG_TAG, "Error in handleSocks5", e)
-                client.close()
+                try {
+                    client.close()
+                } catch (_: Exception) {}
             }
         }.start()
-
     }
 
     private enum class ProtocolType {
