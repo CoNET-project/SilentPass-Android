@@ -24,11 +24,7 @@ class ConnectionManager(
 
     // Speedtest domain cache for optimization
     private val speedtestDomains = setOf(
-        "www.speedtest.net",
-        "c.speedtest.net",
-        "speedtest.net",
-        "*.speedtest.net",
-        "*.ooklaserver.net"
+		""
     )
 
     // ====== 通用日志节流（200ms）======
@@ -262,7 +258,6 @@ class ConnectionManager(
 
         val bypassDirect = when {
             isBypassDomain -> true
-            isSpeedtest -> true  // Direct connection for speedtest
             isFakeByRange -> false
             hasDomainMapping && !isBypassDomain -> false
             else -> true
