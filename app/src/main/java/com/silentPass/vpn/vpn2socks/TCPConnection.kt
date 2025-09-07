@@ -1196,6 +1196,7 @@ class TCPConnection(
         var consecutiveTimeouts = 0
         val maxConsecutiveTimeouts = 30  // Increase from 10 to 30 (60 seconds with 2s timeout)
         var firstResponseSeen = false
+        val speedtestLike = isSpeedtestDomain(resolvedDomain)
 
         try {
             android.util.Log.i(LOG_TAG, "Downstream loop started for ${getDisplayKey()}")

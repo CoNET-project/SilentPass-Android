@@ -475,7 +475,6 @@ class DNSInterceptor private constructor() {
     private val adBlockDomains = setOf(
         // Google Ads
         "doubleclick.net",
-        "googleadservices.com",
         "googlesyndication.com",
         "googletagmanager.com",
         "googletagservices.com",
@@ -625,7 +624,6 @@ class DNSInterceptor private constructor() {
         "voicefive.com",
         "buysellads.com",
         "carbonads.com",
-        "cdn.ampproject.org",
 
         // 更多跟踪器
         "mixpanel.com",
@@ -788,6 +786,10 @@ class DNSInterceptor private constructor() {
         "mmbiz.qpic.cn",
         "mmbiz.qlogo.cn",
         "mmsns.qpic.cn",
+        "ampproject.org",
+        "googleadservices.com",
+        "doubleclick.net",
+
 
         // 腾讯推送服务
         "dns.weixin.qq.com",
