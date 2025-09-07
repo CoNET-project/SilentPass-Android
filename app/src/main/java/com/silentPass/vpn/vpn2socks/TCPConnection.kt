@@ -80,6 +80,9 @@ class TCPConnection(
     @Volatile private var mss: Int = calculateOptimalMSS()
     @Volatile private var mssFallbackSteps: Int = 0  // PMTU blackhole mitigation (max 3)
 
+    // 最近一次客户端（下游）写入上游的时间：用于判断是否处于“只上行阶段”（如测速上传）
+    @Volatile private var lastClientWriteTs: Long = 0L
+
 
     // Dynamic CWND values based on instance MSS
     private val INITIAL_CWND = INITIAL_CWND_MULTIPLIER * mss
@@ -107,11 +110,17 @@ class TCPConnection(
     // 在出现疑似 PMTU 黑洞或重传异常时，逐级把 MSS 再降 40B（最多 3 次）
     private fun maybeLowerMssOnBlackhole(): Boolean {
         if (mssFallbackSteps >= 3) return false
-        val newMss = (mss - 40).coerceAtLeast(536)
-        if (newMss < mss) {
+
+        val old = mss
+        val newMss = (old - 40).coerceAtLeast(536)
+        if (newMss < old) {
             mss = newMss
+
             mssFallbackSteps += 1
             Log.w(LOG_TAG, "PMTU blackhole suspected -> lowering MSS to $mss (step=$mssFallbackSteps) for ${getDisplayKey()}")
+            
+            // 同步缩放拥塞窗口参数
+            congestionControl.onMssReduced(old, newMss)
             return true
         }
         return false
@@ -223,6 +232,15 @@ class TCPConnection(
         }
 
         fun getRto(): Long = rto
+
+
+        // 当 MSS 被动下调时，等比例收缩窗口，避免旧窗口在新 MSS 下偏大
+        fun onMssReduced(old: Int, now: Int) {
+            if (old <= 0 || now <= 0 || old == now) return
+            cwnd = max((cwnd.toLong() * now / old).toInt(), this@TCPConnection.MIN_CWND)
+            ssthresh = max((ssthresh.toLong() * now / old).toInt(), this@TCPConnection.MIN_CWND)
+            Log.d(LOG_TAG, "Rescaled cwnd=$cwnd ssthresh=$ssthresh due to MSS drop $old->$now for ${getDisplayKey()}")
+        }
     }
 
     // Add standard MSS values
@@ -745,7 +763,7 @@ class TCPConnection(
             pending.addLast(payloadCopy)
             pendingSize.addAndGet(payloadCopy.size)  // 更新大小
         }
-
+        lastClientWriteTs = System.currentTimeMillis()
         deliverBufferedSegments()
         tryFlushUpstream()
         sendAckWithSack(ip, tcp)
@@ -779,6 +797,7 @@ class TCPConnection(
                 pending.addLast(newData)
                 pendingSize.addAndGet(newData.size)  // 更新大小
             }
+            lastClientWriteTs = System.currentTimeMillis()
             tryFlushUpstream()
             sendAckWithSack(ip, tcp)
         }
@@ -1001,6 +1020,8 @@ class TCPConnection(
                 Log.d(LOG_TAG, "Buffered pre-handshake ${data.size}B for ${getDisplayKey()}")
             }
         }
+        // SYN 前期也视为“客户端在写”
+        lastClientWriteTs = System.currentTimeMillis()
     }
 
     private suspend fun flushPreHandshakeBuffer() {
@@ -1012,6 +1033,7 @@ class TCPConnection(
                     pending.addLast(data)
                     pendingSize.addAndGet(data.size)  // 更新大小
                 }
+                lastClientWriteTs = System.currentTimeMillis()
                 clientNextSeq = (clientNextSeq + data.size) and 0xFFFFFFFFL
                 Log.d(LOG_TAG, "Flushed pre-handshake ${data.size}B for ${getDisplayKey()}")
             }
@@ -1057,13 +1079,17 @@ class TCPConnection(
             val hostForDial = domain ?: ip.dst.toString()
 
             Log.d(LOG_TAG, "Establishing upstream to $hostForDial:$port")
+            val speedtestLike = isSpeedtestDomain(hostForDial) || port == 8080
 
             socket = if (bypassDirect) {
                 // 直连模式使用池管理
                 pooledSocket = true
                 SocketPool.acquire().apply {
                     tcpNoDelay = true
+
+                    // 初值无所谓，稍后统一设置
                     soTimeout = 2000
+
                     Vpn2SocksService.protectSocket(this)
                     connect(InetSocketAddress(hostForDial, port), 15000)
                 }
@@ -1081,7 +1107,8 @@ class TCPConnection(
                 socket.keepAlive = true
                 socket.receiveBufferSize = 512 * 1024
                 socket.sendBufferSize    = 512 * 1024
-                socket.soTimeout         = 8000
+                // 测速域名放宽读超时，避免“长时间无下行”的上传阶段被误判
+                socket.soTimeout         = if (speedtestLike) 20000 else 8000
             } catch (_: Throwable) {}
 
             upstream = socket
@@ -1179,8 +1206,10 @@ class TCPConnection(
                 } catch (e: SocketTimeoutException) {
                     consecutiveTimeouts++
 
-                    // 首字节看门狗：完全没有回包的连接，≤4s 触发快速重试
-                    if (!firstResponseSeen && consecutiveTimeouts >= 2) {
+                    // 首字节看门狗：测速或仍在持续上传时，不触发快速重试
+                    val uploadingLikely =
+                        (System.currentTimeMillis() - lastClientWriteTs) < 20_000 || pendingSize.get() > 0
+                    if (!firstResponseSeen && consecutiveTimeouts >= 2 && !uploadingLikely && !speedtestLike) {
                         Log.w(LOG_TAG, "No server data within ~${consecutiveTimeouts * 2}s on fresh flow; triggering retry for ${getDisplayKey()}")
                         break
                     }
@@ -1293,13 +1322,14 @@ class TCPConnection(
     }
 
     private fun sendDataToClient(ip: IPv4Packet, tcp: TCPSegment, data: ByteArray) {
-        val mss = (mtu - 40).coerceAtLeast(536)
+        // 统一使用“实例级”的动态 MSS，而不是重新用 (mtu-40)
+        val mssLocal = mss
         var offset = 0
 
 
 
         while (offset < data.size && !isClosed) {
-            val chunkSize = min(mss, data.size - offset)
+            val chunkSize = min(mssLocal, data.size - offset)
 
             // Track send time for RTT measurement
             sentTimeMap[serverSeq] = System.currentTimeMillis()
@@ -1328,6 +1358,17 @@ class TCPConnection(
             serverSeq = (serverSeq + realChunk) and 0xFFFFFFFFL
             offset += realChunk
         }
+    }
+
+    // —— 简单识别测速域名 ——（面向 Ookla/MLab/自建测速）
+    private fun isSpeedtestDomain(host: String?): Boolean {
+        if (host == null) return false
+        val h = host.lowercase(Locale.ROOT)
+        return h.endsWith(".ooklaserver.net")
+            || h.contains("speedtest")
+            || h.contains("measurementlab")
+            || h.contains("mlab-oti")
+            || h.contains("mlab-oti.measurement-lab.org")
     }
 
     private fun sendFinToClient(ip: IPv4Packet, tcp: TCPSegment) {
