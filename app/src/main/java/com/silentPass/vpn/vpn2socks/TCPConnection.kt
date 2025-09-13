@@ -21,6 +21,10 @@ import kotlin.random.Random
 import java.util.concurrent.atomic.AtomicInteger
 
 
+private const val BBR_STARTUP = 0
+private const val BBR_DRAIN = 1
+private const val BBR_PROBE_BW = 2
+
 class TCPConnection(
     private val key: String,
     private val mtu: Int,
@@ -33,22 +37,23 @@ class TCPConnection(
         private const val LOG_TAG = "TCPConnection"
 
         // MSS constants for different connection types
-        private const val MSS_STANDARD = 1460     // Standard Ethernet
-        private const val MSS_SOCKS = 1420        // SOCKS proxy
-        private const val MSS_VPN = 1360          // VPN tunnel
+        private const val MSS_STANDARD = 1460 // Standard Ethernet
+        private const val MSS_SOCKS = 1420 // SOCKS proxy
+        private const val MSS_VPN = 1360 // VPN tunnel
 
         // Multipliers for CWND calculations
         private const val INITIAL_CWND_MULTIPLIER = 10
         private const val MIN_CWND_MULTIPLIER = 2
 
         // Other constants
-        private const val INITIAL_RTO = 1000L  // 1 second
+        private const val INITIAL_RTO = 1000L // 1 second
         private const val MIN_RTO = 200L
         private const val MAX_RTO = 60000L
         private const val SACK_PERMITTED = 4
         private const val SACK_OPTION = 5
 
-        @Volatile private var deferredHalfClose = false
+        @Volatile
+        private var deferredHalfClose = false
 
         // --- RFC 7323 Window Scale ---
         private const val WSCALE_KIND = 3
@@ -64,24 +69,35 @@ class TCPConnection(
         private const val MAX_PENDING_ACKS = 2
     }
 
-	// ---- Log deduplication (noise control) ----
-	private val lastLogTs = ConcurrentHashMap<String, Long>()
-	private fun shouldLog(key: String, windowMs: Long = 3000L): Boolean {
-		val now = System.currentTimeMillis()
-		val last = lastLogTs[key]
-		if (last != null && now - last < windowMs) return false
-			lastLogTs[key] = now
-			return true
+    // ---- Log deduplication (noise control) ----
+    private val lastLogTs = ConcurrentHashMap<String, Long>()
+    private fun shouldLog(key: String, windowMs: Long = 3000L): Boolean {
+        val now = System.currentTimeMillis()
+        val last = lastLogTs[key]
+        if (last != null && now - last < windowMs) return false
+        lastLogTs[key] = now
+        return true
     }
 
-	private fun tupleKeyForDedup(extra: String): String = getDisplayKey() + "|" + extra
+    fun updateMinRtt(measuredRtt: Long) {
+        val now = System.currentTimeMillis()
+        if (measuredRtt < minRttMs || now - minRttStamp > 10_000) {
+            minRttMs = measuredRtt
+            minRttStamp = now
+        }
+    }
+
+    private fun tupleKeyForDedup(extra: String): String = getDisplayKey() + "|" + extra
 
 
-    @Volatile private var mss: Int = calculateOptimalMSS()
-    @Volatile private var mssFallbackSteps: Int = 0  // PMTU blackhole mitigation (max 3)
+    @Volatile
+    private var mss: Int = calculateOptimalMSS()
+    @Volatile
+    private var mssFallbackSteps: Int = 0 // PMTU blackhole mitigation (max 3)
 
     // 最近一次客户端（下游）写入上游的时间：用于判断是否处于“只上行阶段”（如测速上传）
-    @Volatile private var lastClientWriteTs: Long = 0L
+    @Volatile
+    private var lastClientWriteTs: Long = 0L
 
 
     // Dynamic CWND values based on instance MSS
@@ -108,21 +124,12 @@ class TCPConnection(
     }
 
     // 在出现疑似 PMTU 黑洞或重传异常时，逐级把 MSS 再降 40B（最多 3 次）
+    // 此函数已被弃用，以支持更智能的 PMTUD
     private fun maybeLowerMssOnBlackhole(): Boolean {
-        if (mssFallbackSteps >= 3) return false
-
-        val old = mss
-        val newMss = (old - 40).coerceAtLeast(536)
-        if (newMss < old) {
-            mss = newMss
-
-            mssFallbackSteps += 1
-            Log.w(LOG_TAG, "PMTU blackhole suspected -> lowering MSS to $mss (step=$mssFallbackSteps) for ${getDisplayKey()}")
-            
-            // 同步缩放拥塞窗口参数
-            congestionControl.onMssReduced(old, newMss)
-            return true
-        }
+        Log.w(
+            LOG_TAG, "PMTU blackhole mitigation logic is deprecated. " +
+                    "A proper PMTUD implementation is needed."
+        )
         return false
     }
 
@@ -140,43 +147,122 @@ class TCPConnection(
 
     private fun getDisplayKey(): String {
         return if (resolvedDomain != null) {
-            "$key ($resolvedDomain)"  // Use 'key' directly, not getDisplayKey()
+            "$key ($resolvedDomain)"
         } else {
             key
         }
     }
 
+    private var lastSendTime = 0L
+    private val pacingLock = Object()
+
+    // 计算是否需要延迟发送（返回需要等待的毫秒数）
+    private fun getPacingDelay(bytes: Int): Long {
+        if (!congestionControl.bbrEnabled || congestionControl.bwBps <= 0) return 0L
+
+        synchronized(pacingLock) {
+            val pacingRate = congestionControl.bwBps * congestionControl.pacingGain
+            val intervalMs = (bytes * 1000.0 / pacingRate).toLong()
+            val now = System.currentTimeMillis()
+            val elapsed = now - lastSendTime
+
+            return if (elapsed < intervalMs) {
+                intervalMs - elapsed
+            } else {
+                lastSendTime = now
+                0L
+            }
+        }
+    }
+
+    // 记录发送时间（在实际发送后调用）
+    private fun recordSend(bytesSent: Int) {
+        synchronized(pacingLock) {
+            val intervalMs = (bytesSent * 1000.0 / (congestionControl.bwBps * congestionControl.pacingGain)).toLong()
+            lastSendTime = max(lastSendTime + intervalMs, System.currentTimeMillis())
+        }
+    }
+
     private val stats = ConnectionStats()
 
-    private val pendingSize = AtomicInteger(0)  // 新增：缓存pending的总大小
+    private val pendingSize = AtomicInteger(0)
 
     // SACK support flag (set during handshake)
-    @Volatile private var peerSupportsSack = false
-    @Volatile private var weSupportSack = true  // We always support SACK
+    @Volatile
+    private var peerSupportsSack = false
+    @Volatile
+    private var weSupportSack = true
 
     // --- Window Scaling state ---
-    @Volatile private var wscaleActive = false         // 双端均宣告后为 true
-    @Volatile private var ourWndScale = DEFAULT_WND_SCALE
-    @Volatile private var clientWndScale = 0           // 客户端在 SYN 中宣告的 WSCALE
-    @Volatile private var peerAdvertisedWnd = 65535    // 已按 clientWndScale 放大后的字节窗口
-    @Volatile private var lastAckFromClient: Long = 0L // 最近一次客户端 ACK 序号（用于计算未确认字节）
+    @Volatile
+    private var wscaleActive = false
+    @Volatile
+    private var ourWndScale = DEFAULT_WND_SCALE
+    @Volatile
+    private var clientWndScale = 0
+    @Volatile
+    private var peerAdvertisedWnd = 65535
+    @Volatile
+    private var lastAckFromClient: Long = 0L
 
 
     // =============== Congestion Control ===============
     private inner class CongestionControl {
-        @Volatile private var cwnd = this@TCPConnection.INITIAL_CWND  // Use instance value
-        @Volatile private var ssthresh = Int.MAX_VALUE
-        @Volatile private var flightSize = 0
+        @Volatile
+        private var cwnd = this@TCPConnection.INITIAL_CWND
+        @Volatile
+        private var ssthresh = Int.MAX_VALUE
+        @Volatile
+        private var flightSize = 0
 
         // RTT estimation (Jacobson/Karels algorithm)
-        @Volatile private var srtt = 0L  // Smoothed RTT
-        @Volatile private var rttvar = 0L  // RTT variance
-        @Volatile private var rto = INITIAL_RTO  // Retransmission timeout
+        @Volatile
+        private var srtt = 0L
+        @Volatile
+        private var rttvar = 0L
+        @Volatile
+        private var rto = INITIAL_RTO
 
         private val lastAckTime = AtomicLong(0)
         private val duplicateAckCount = AtomicLong(0)
 
+        // ===== BBR-lite state =====
+        @Volatile
+        var bbrEnabled = true
+        @Volatile
+        private var mode = BBR_STARTUP
+
+        @Volatile
+        var pacingGain = 2.0
+        @Volatile
+        private var cwndGain = 2.0
+        @Volatile
+        var bwBps = 10_000.0
+        @Volatile
+        private var maxBwSeen = 0.0
+        @Volatile
+        private var minRttMs = 100L
+        @Volatile
+        private var minRttStamp = 0L
+        private var deliveredBytes = 0L
+        private var lastAckTs = 0L
+        private var probeToggleTs = 0L
+        private var probeHigh = true
+
+
+        // 增强的RTT统计
+        @Volatile
+        private var minRttNanos = Long.MAX_VALUE
+        @Volatile
+        private var maxRttMs = 0L
+        @Volatile
+        private var avgRttMs = 0L
+        private var rttSampleCount = 0L
+        private var startupNoGrowthCount = 0
+        private var startupBeginTime = System.currentTimeMillis()
+
         fun updateRtt(measuredRtt: Long) {
+            // 现有的RTT更新逻辑
             if (srtt == 0L) {
                 srtt = measuredRtt
                 rttvar = measuredRtt / 2
@@ -187,9 +273,160 @@ class TCPConnection(
                 srtt = ((1 - alpha) * srtt + alpha * measuredRtt).toLong()
             }
             rto = (srtt + 4 * rttvar).coerceIn(MIN_RTO, MAX_RTO)
+
+            // 更新统计数据
+            val now = System.currentTimeMillis()
+            if (measuredRtt in 1..10_000) {
+                // 更新最小RTT（转换为纳秒存储以保持精度）
+                val rttNanos = measuredRtt * 1_000_000L
+                if (rttNanos < minRttNanos || now - minRttStamp > 10_000) {
+                    minRttNanos = rttNanos
+                    minRttMs = measuredRtt
+                    minRttStamp = now
+                }
+
+                // 更新最大和平均RTT
+                maxRttMs = max(maxRttMs, measuredRtt)
+                rttSampleCount++
+                avgRttMs = ((avgRttMs * (rttSampleCount - 1) + measuredRtt) / rttSampleCount)
+            }
         }
 
-        fun onAck(ackedBytes: Int) {
+        // 获取RTT统计信息
+        fun getRttStats(): String {
+            return "min=${minRttMs}ms, avg=${avgRttMs}ms, max=${maxRttMs}ms, srtt=${srtt}ms"
+        }
+
+        init {
+            bbrEnabled = true
+            Log.w(LOG_TAG, "BBR ENABLED for ${getDisplayKey()}")
+        }
+
+        // 添加上下行ACK处理方法
+        fun onUpstreamAck(ackedBytes: Int) {
+            if (!bbrEnabled || ackedBytes <= 0) return
+            // 上行数据被ACK时的处理
+            updateBandwidthEstimate(ackedBytes, true)
+        }
+
+        fun onDownstreamAck(ackedBytes: Int) {
+            if (!bbrEnabled || ackedBytes <= 0) return
+            // 下行数据被ACK时的处理（这是主要的BBR逻辑）
+            onClientAck(ackedBytes)
+            updateBandwidthEstimate(ackedBytes, false)
+        }
+
+        private fun updateBandwidthEstimate(ackedBytes: Int, isUpstream: Boolean) {
+            val now = System.currentTimeMillis()
+
+            // 添加调试日志
+            if (shouldLog("BBR_BW_${if (isUpstream) "UP" else "DOWN"}", 2000L)) {
+                val bwKBps = if (bwBps > 0) bwBps / 1024 else 0
+                val rtt = if (minRttMs != Long.MAX_VALUE) minRttMs else srtt
+                val modeStr = when (mode) {
+                    BBR_STARTUP -> "STARTUP"
+                    BBR_DRAIN -> "DRAIN"
+                    BBR_PROBE_BW -> "PROBE_BW"
+                    else -> "UNKNOWN"
+                }
+                Log.d(
+                    LOG_TAG, "BBR ${if (isUpstream) "UP" else "DOWN"}: " +
+                            "bw=${bwKBps.toInt()}KB/s, mode=$modeStr, rtt=${rtt}ms, " +
+                            "cwnd=${cwnd / 1024}KB for ${getDisplayKey()}"
+                )
+            }
+        }
+
+        fun getBBRStatus(): String {
+            val modeStr = when (mode) {
+                BBR_STARTUP -> "STARTUP"
+                BBR_DRAIN -> "DRAIN"
+                BBR_PROBE_BW -> "PROBE_BW"
+                else -> "UNKNOWN"
+            }
+            val bwKBps = if (bwBps > 0.0) bwBps / 1024 else 0.0
+            val rtt = if (minRttMs != Long.MAX_VALUE) minRttMs else srtt
+            return "mode=$modeStr, bw=${bwKBps.toInt()}KB/s, rtt=${rtt}ms"
+        }
+
+        fun onClientAck(ackedBytes: Int) {
+            if (ackedBytes <= 0) return
+            flightSize = max(0, flightSize - ackedBytes)
+            val now = System.currentTimeMillis()
+            
+            // 确保初始化
+            if (lastAckTs == 0L) {
+                lastAckTs = now
+                deliveredBytes = ackedBytes
+                return  // 第一个ACK不计算带宽
+            }
+            
+            deliveredBytes += ackedBytes
+            val dt = now - lastAckTs
+            
+            // 降低采样间隔要求
+            if (dt >= 10L) {  // 从 max(10L, min(srtt/4, 100L)) 简化
+                val sampleBw = (deliveredBytes * 1000.0) / dt
+                
+                // 更新带宽估计（避免bwBps变为0）
+                if (sampleBw > 0) {
+                    bwBps = if (bwBps > 0) max(bwBps * 0.85, sampleBw) else sampleBw
+                    maxBwSeen = max(maxBwSeen, sampleBw)
+                }
+                
+                deliveredBytes = 0
+                lastAckTs = now
+                
+                // 修复 STARTUP 退出条件
+                when (mode) {
+                    BBR_STARTUP -> {
+                        // 需要有效的RTT和带宽估计
+                        if (minRttMs < 1000L && bwBps > 0) {
+                            startupNoGrowthCount++
+                            if (startupNoGrowthCount >= 3 || 
+                                (now - startupBeginTime) > 2000L) {  // 2秒超时
+                                Log.i(LOG_TAG, "BBR: STARTUP -> DRAIN")
+                                mode = BBR_DRAIN
+                                pacingGain = 0.7
+                                cwndGain = 2.0
+                            }
+                        }
+                    }
+                    BBR_DRAIN -> {
+                        // 将 flight 下降至 ≈BDP 后进入 ProbeBW
+                        if (flightSize <= bdpBytes()) {
+                            Log.i(LOG_TAG, "BBR: DRAIN -> PROBE_BW for ${getDisplayKey()}")
+                            mode = BBR_PROBE_BW
+                            pacingGain = 1.0; cwndGain = 2.0
+                            probeToggleTs = now
+                            probeHigh = true
+                        }
+                    }
+                    else /* BBR_PROBE_BW */ -> {
+                        // 每 ~8×srtt 在 1.25/0.75 间摆动，温和探测
+                        if (now - probeToggleTs > (srtt.coerceAtLeast(50L) * 8)) {
+                            probeHigh = !probeHigh
+                            pacingGain = if (probeHigh) 1.25 else 0.75
+                            probeToggleTs = now
+                        }
+                    }
+                }
+            }
+
+            // BBR 目标窗：BDP × 增益（保底 MIN_CWND，上限 4MB）
+            val target = (bdpBytes() * cwndGain).toInt().coerceAtLeast(this@TCPConnection.MIN_CWND)
+            cwnd = target.coerceAtMost(MAX_ADV_WINDOW)
+        }
+
+        private fun bdpBytes(): Int {
+            val rtt = (if (minRttMs == Long.MAX_VALUE) srtt else minRttMs).coerceAtLeast(50L)
+            val bw = if (bwBps > 0.0) bwBps
+            else (INITIAL_CWND.toDouble() * 1000.0 / rtt)
+            val bdp = (bw * rtt / 1000.0).toInt()
+            return bdp.coerceAtLeast(4 * mss)
+        }
+
+        fun onClassicAck(ackedBytes: Int) {
             flightSize = max(0, flightSize - ackedBytes)
             duplicateAckCount.set(0)
 
@@ -202,27 +439,40 @@ class TCPConnection(
             }
         }
 
-        fun onDuplicateAck() {
-            val count = duplicateAckCount.incrementAndGet()
-            stats.duplicateAcks++
+        fun availableBudget(): Int = max(0, cwnd - flightSize)
 
-            if (count == 3L) {
-                ssthresh = max(flightSize / 2, this@TCPConnection.MIN_CWND)  // Use instance value
-                cwnd = ssthresh + 3 * mss
-                Log.d(LOG_TAG, "Fast recovery triggered: ssthresh=$ssthresh, cwnd=$cwnd")
-                // 触发 3 重复 ACK：尝试降 MSS 一档
-                maybeLowerMssOnBlackhole()
+        fun onDuplicateAck() {
+            stats.duplicateAcks++
+            if (bbrEnabled) {
+                Log.d(LOG_TAG, "BBR: Packet loss detected via dup-ACKs. Transitioning to PROBE_BW")
+                mode = BBR_PROBE_BW
+                pacingGain = 1.0; cwndGain = 2.0
+                probeToggleTs = System.currentTimeMillis()
+                probeHigh = true
+            } else {
+                val count = duplicateAckCount.incrementAndGet()
+                if (count == 3L) {
+                    ssthresh = max(flightSize / 2, this@TCPConnection.MIN_CWND)
+                    cwnd = ssthresh + 3 * mss
+                    Log.d(LOG_TAG, "Fast recovery triggered: ssthresh=$ssthresh, cwnd=$cwnd")
+                }
             }
         }
 
         fun onTimeout() {
-            ssthresh = max(cwnd / 2, this@TCPConnection.MIN_CWND)  // Use instance value
-            cwnd = this@TCPConnection.MIN_CWND  // Use instance value
+            if (bbrEnabled) {
+                Log.d(LOG_TAG, "BBR: Timeout detected. Resetting state.")
+                mode = BBR_STARTUP
+                pacingGain = 2.0; cwndGain = 2.0
+                maxBwSeen = 0.0
+                minRttMs = Long.MAX_VALUE
+                minRttStamp = 0L
+            } else {
+                ssthresh = max(cwnd / 2, this@TCPConnection.MIN_CWND)
+                cwnd = this@TCPConnection.MIN_CWND
+            }
             duplicateAckCount.set(0)
             Log.d(LOG_TAG, "Timeout: ssthresh=$ssthresh, cwnd=$cwnd")
-
-            // 超时：更强烈的黑洞信号，降 MSS 一档
-            maybeLowerMssOnBlackhole()
         }
 
         fun canSend(bytes: Int): Boolean = (flightSize + bytes) <= cwnd
@@ -233,17 +483,16 @@ class TCPConnection(
 
         fun getRto(): Long = rto
 
-
-        // 当 MSS 被动下调时，等比例收缩窗口，避免旧窗口在新 MSS 下偏大
         fun onMssReduced(old: Int, now: Int) {
             if (old <= 0 || now <= 0 || old == now) return
             cwnd = max((cwnd.toLong() * now / old).toInt(), this@TCPConnection.MIN_CWND)
             ssthresh = max((ssthresh.toLong() * now / old).toInt(), this@TCPConnection.MIN_CWND)
-            Log.d(LOG_TAG, "Rescaled cwnd=$cwnd ssthresh=$ssthresh due to MSS drop $old->$now for ${getDisplayKey()}")
+            Log.d(
+                LOG_TAG,
+                "Rescaled cwnd=$cwnd ssthresh=$ssthresh due to MSS drop $old->$now for ${getDisplayKey()}"
+            )
         }
     }
-
-    // Add standard MSS values
 
 
     // =============== SACK Support ===============
@@ -255,7 +504,6 @@ class TCPConnection(
         var currentStart: Long? = null
         var currentEnd: Long? = null
 
-        // ConcurrentSkipListMap is thread-safe for iteration
         outOfOrderSegments.forEach { (seq, segment) ->
             val segEnd = seq + segment.data.size.toLong()
 
@@ -288,13 +536,11 @@ class TCPConnection(
         option.write(optionLength)
 
         blocks.forEach { block ->
-            // Write start (4 bytes)
             option.write((block.start shr 24).toInt() and 0xFF)
             option.write((block.start shr 16).toInt() and 0xFF)
             option.write((block.start shr 8).toInt() and 0xFF)
             option.write(block.start.toInt() and 0xFF)
 
-            // Write end (4 bytes)
             option.write((block.end shr 24).toInt() and 0xFF)
             option.write((block.end shr 16).toInt() and 0xFF)
             option.write((block.end shr 8).toInt() and 0xFF)
@@ -318,9 +564,9 @@ class TCPConnection(
             val kind = tcp.raw[optionsStart + i].toInt() and 0xFF
 
             when (kind) {
-                0 -> break  // End of options
-                1 -> i++    // NOP
-                4 -> {      // SACK-Permitted
+                0 -> break
+                1 -> i++
+                4 -> {
                     if (i + 1 < optionsLength) {
                         val length = tcp.raw[optionsStart + i + 1].toInt() and 0xFF
                         if (length == 2) {
@@ -333,12 +579,12 @@ class TCPConnection(
                     }
                 }
 
-                WSCALE_KIND -> { // Window Scale
+                WSCALE_KIND -> {
                     if (i + 2 < optionsLength) {
                         val length = tcp.raw[optionsStart + i + 1].toInt() and 0xFF
                         if (length == 3) {
                             val valShift = tcp.raw[optionsStart + i + 2].toInt() and 0xFF
-                            clientWndScale = (valShift.coerceIn(0, 14)) // RFC：0..14
+                            clientWndScale = (valShift.coerceIn(0, 14))
                             Log.d(LOG_TAG, "Peer Window-Scale=$clientWndScale for ${getDisplayKey()}")
                         }
                         i += length
@@ -346,9 +592,8 @@ class TCPConnection(
                         i++
                     }
                 }
-                
+
                 else -> {
-                    // Other options
                     if (i + 1 < optionsLength) {
                         val length = tcp.raw[optionsStart + i + 1].toInt() and 0xFF
                         i += if (length > 0) length else 1
@@ -359,7 +604,6 @@ class TCPConnection(
             }
         }
     }
-
 
 
     // =============== Adaptive Write Coalescer ===============
@@ -392,12 +636,11 @@ class TCPConnection(
                 val now = System.currentTimeMillis()
                 val timeSinceLastWrite = now - lastWriteTime
 
-                // 动态决定是否flush
                 val shouldFlush = when {
                     buffer.size() >= mtu - 100 -> true
-                    buffer.size() >= 4096 -> true  // Reduced from 16KB
+                    buffer.size() >= 4096 -> true
                     pendingWrites.size >= 2 -> true
-                    timeSinceLastWrite > 1 && buffer.size() > 0 -> true  // Reduced from 5ms
+                    timeSinceLastWrite > 1 && buffer.size() > 0 -> true
                     data.size > 1000 -> true
                     else -> false
                 }
@@ -423,16 +666,21 @@ class TCPConnection(
     // =============== State Management ===============
     private val writeLock = Mutex()
     private val stateLock = Mutex()
-    @Volatile private var isClosed = false
+    @Volatile
+    private var isClosed = false
 
     private enum class Phase {
         SYN, HANDSHAKE_ACKED, SOCKS_PRIMED, STREAMING,
         HALF_CLOSED_LOCAL, HALF_CLOSED_REMOTE, CLOSED
     }
-    @Volatile private var phase: Phase = Phase.SYN
-    @Volatile private var handshakeAcked = false
-    @Volatile private var socksPrimed = false
-    @Volatile private var warmupDone = false
+    @Volatile
+    private var phase: Phase = Phase.SYN
+    @Volatile
+    private var handshakeAcked = false
+    @Volatile
+    private var socksPrimed = false
+    @Volatile
+    private var warmupDone = false
 
     // =============== TCP Sequence State ===============
     private var clientSeq0: Long? = null
@@ -449,7 +697,7 @@ class TCPConnection(
     private val outOfOrderLock = Mutex()
     private val outOfOrderSegments = ConcurrentSkipListMap<Long, Segment>()
     private var oooBufferSize = AtomicInteger(0)
-    private val maxOooBufferSize = 256 * 1024  // 256KB max
+    private val maxOooBufferSize = 256 * 1024
 
     // =============== Upstream Connection ===============
     private var upstream: Socket? = null
@@ -470,17 +718,22 @@ class TCPConnection(
     private val writeCoalescer = AdaptiveWriteCoalescer()
 
     // =============== Connection State ===============
-    @Volatile private var clientHalfClosed = false
-    @Volatile private var pendingShutdown = false
-    @Volatile private var downstreamStarted = false
+    @Volatile
+    private var clientHalfClosed = false
+    @Volatile
+    private var pendingShutdown = false
+    @Volatile
+    private var downstreamStarted = false
     private val closedOnce = AtomicBoolean(false)
 
     // Tracking for RTT measurement
-    private val sentTimeMap = ConcurrentHashMap<Long, Long>()  // seq -> timestamp
+    private val sentTimeMap = ConcurrentHashMap<Long, Long>()
 
     // New: Delayed-ACK machinery
-    @Volatile private var lastAckTime = 0L
-    @Volatile private var pendingAckCount = 0
+    @Volatile
+    private var lastAckTime = 0L
+    @Volatile
+    private var pendingAckCount = 0
     private var ackFlushJob: Job? = null
 
     private var quickAckUntilMs: Long = 0L
@@ -495,30 +748,30 @@ class TCPConnection(
     }
 
     init {
-        // Log the MSS being used for this connection
-        android.util.Log.i(LOG_TAG, "Connection initialized with MSS=$mss for ${getDisplayKey()} (bypassDirect=$bypassDirect")
-
-        // Start health monitoring
+        android.util.Log.i(
+            LOG_TAG,
+            "Connection initialized with MSS=$mss for ${getDisplayKey()} (bypassDirect=$bypassDirect"
+        )
         scope.launch {
             monitorConnectionHealth()
         }
     }
 
     private suspend fun monitorConnectionHealth() {
-        // 等待一段时间让连接有机会建立
         delay(5000)
 
         while (!isClosed) {
             val checkInterval = when (phase) {
-                Phase.SYN, Phase.HANDSHAKE_ACKED, Phase.SOCKS_PRIMED -> 3000L  // Less frequent during setup
-                Phase.STREAMING -> 5000L  // Normal monitoring during data transfer
+                Phase.SYN, Phase.HANDSHAKE_ACKED, Phase.SOCKS_PRIMED -> 3000L
+                Phase.STREAMING -> 5000L
                 else -> 10000L
             }
             delay(checkInterval)
 
             if (phase == Phase.STREAMING ||
                 phase == Phase.HALF_CLOSED_LOCAL ||
-                phase == Phase.HALF_CLOSED_REMOTE) {
+                phase == Phase.HALF_CLOSED_REMOTE
+            ) {
                 if (!isSocketHealthy() && !isClosed) {
                     Log.w(LOG_TAG, "Socket unhealthy in phase $phase")
                     closeConnection()
@@ -527,37 +780,42 @@ class TCPConnection(
             }
 
             try {
-                // 获取当前状态
                 val currentPhase = stateLock.withLock { phase }
 
-                // 根据不同阶段采取不同的健康检查策略
                 when (currentPhase) {
                     Phase.SYN, Phase.HANDSHAKE_ACKED, Phase.SOCKS_PRIMED -> {
-                        // 建立阶段，不检查 socket 健康状态
-                        // 但可以检查是否超时
-                        // 这里可以添加建立超时逻辑
                     }
 
                     Phase.STREAMING, Phase.HALF_CLOSED_LOCAL, Phase.HALF_CLOSED_REMOTE -> {
-                        // 数据传输阶段，检查 socket 健康状态
                         if (!isSocketHealthy() && !isClosed) {
-                            Log.w(LOG_TAG, "Socket unhealthy in phase $currentPhase for ${getDisplayKey()}")
+                            Log.w(
+                                LOG_TAG,
+                                "Socket unhealthy in phase $currentPhase for ${getDisplayKey()}"
+                            )
                             closeConnection()
                             break
                         }
                     }
 
                     Phase.CLOSED -> {
-                        // 已关闭，退出监控
                         break
                     }
                 }
 
-                // 监控统计信息
-                if (stats.totalPackets > 100) {  // 有足够的样本
+                if (stats.totalPackets > 100) {
                     val packetLoss = stats.droppedPackets.toFloat() / stats.totalPackets
                     if (packetLoss > 0.05) {
-                        Log.w(LOG_TAG, "High packet loss: ${(packetLoss * 100).toInt()}% for ${getDisplayKey()}")
+                        Log.w(
+                            LOG_TAG,
+                            "High packet loss: ${(packetLoss * 100).toInt()}% for ${getDisplayKey()}"
+                        )
+                    }
+                }
+
+                if (congestionControl.bbrEnabled && currentPhase == Phase.STREAMING) {
+                    if (shouldLog("BBR_HEALTH_STATUS", 10000L)) {
+                        val bbrStatus = congestionControl.getBBRStatus()
+                        Log.i(LOG_TAG, "BBR Status: $bbrStatus for ${getDisplayKey()}")
                     }
                 }
 
@@ -577,11 +835,13 @@ class TCPConnection(
 
     private suspend fun processPacket(ip: IPv4Packet, tcp: TCPSegment) {
         if (isClosed) {
-            if (shouldLog(tupleKeyForDedup("ALREADY_CLOSED"), 5000L)) Log.d(LOG_TAG, "Connection already closed for ${getDisplayKey()}")
+            if (shouldLog(tupleKeyForDedup("ALREADY_CLOSED"), 5000L)) Log.d(
+                LOG_TAG,
+                "Connection already closed for ${getDisplayKey()}"
+            )
             return
         }
 
-        // RST handling - check if already closing
         if (tcp.isRST) {
             Log.d(LOG_TAG, "RST received for ${getDisplayKey()}")
             if (!isClosed) {
@@ -590,25 +850,20 @@ class TCPConnection(
             return
         }
 
-
-        // SYN handling
         if (tcp.isSYN && !tcp.isACK) {
             handleSyn(ip, tcp)
             return
         }
 
-        // Handshake completion
         if (!handshakeAcked && tcp.isACK && !tcp.isSYN) {
             handleHandshakeAck(ip, tcp)
             return
         }
 
-        // Established connection
         if (handshakeAcked) {
-            // Measure RTT if this is an ACK
             if (tcp.isACK) {
                 measureRtt(tcp)
-                updatePeerWindowFromAck(tcp) // 同步对端窗口与最近ACK
+                updatePeerWindowFromAck(tcp)
             }
 
             if (tcp.payload.isNotEmpty()) {
@@ -620,7 +875,6 @@ class TCPConnection(
             return
         }
 
-        // FIN before establishment
         if (tcp.isFIN) {
             Log.d(LOG_TAG, "FIN received before establishment for ${getDisplayKey()}")
             clientNextSeq = (clientNextSeq + 1L) and 0xFFFFFFFFL
@@ -629,26 +883,31 @@ class TCPConnection(
             return
         }
 
-        // Buffer pre-handshake data
         if (tcp.payload.isNotEmpty()) {
             bufferPreHandshakeData(tcp.payload)
         }
     }
 
+
     private fun updatePeerWindowFromAck(tcp: TCPSegment) {
-        lastAckFromClient = tcp.ack.toLong() and 0xFFFFFFFFL
-        // TCP 头 14..15 字节为 16-bit 的 window 字段
+        val prevAck = lastAckFromClient
+        val ackNum = tcp.ack.toLong() and 0xFFFFFFFFL
+        lastAckFromClient = ackNum
+
         if (tcp.raw.size >= 16) {
             val rawWin = ((tcp.raw[14].toInt() and 0xFF) shl 8) or (tcp.raw[15].toInt() and 0xFF)
-            val scaled = rawWin shl clientWndScale   // 按对端 WSCALE 放大
+            val scaled = rawWin shl clientWndScale
             peerAdvertisedWnd = if (scaled > 0) scaled else 0
-        } else {
-            // 头长度异常时保持上一次窗口，避免崩溃
+        }
+
+        val delta = ((ackNum - prevAck) and 0xFFFFFFFFL).toInt().coerceIn(0, 512 * 1024)
+        if (delta > 0) {
+            congestionControl.onDownstreamAck(delta)
         }
     }
 
     private fun calcAdvertisedWindowField(): Int {
-        val advBytes = calcAdvertisedWindow() // 真实可用字节数（0..MAX_ADV_WINDOW）
+        val advBytes = calcAdvertisedWindow()
         val shift = if (wscaleActive) ourWndScale else 0
         var field = advBytes ushr shift
         if (field <= 0) field = 1
@@ -664,13 +923,11 @@ class TCPConnection(
         clientNextSeq = (clientSeq0!! + 1L) and 0xFFFFFFFFL
 
         parseTcpOptions(tcp)
-        // 若客户端在 SYN 中提供了 WSCALE，我们就激活窗口缩放并在 SYN-ACK 中宣告
-        wscaleActive = true // 你也可以只在 clientWndScale>0 时启用；这里总是回宣告
-        if (!wscaleActive) ourWndScale = 0          // 保险：未启用时右移量为 0
+        wscaleActive = true
+        if (!wscaleActive) ourWndScale = 0
 
         scope.launch { establishUpstream(ip, tcp, domain) }
 
-        // Send SYN-ACK with dynamic MSS (+ Window-Scale if启用)
         val synAck = IpBuilders.tcpSynAckWithOptions(
             src = ip.dst,
             dst = ip.src,
@@ -678,8 +935,8 @@ class TCPConnection(
             dstPort = tcp.srcPort,
             seq = serverSeq.toInt(),
             ack = clientNextSeq.toInt(),
-            window = calcAdvertisedWindowField(), // 写入16bit字段（右移 ourWndScale）
-            mss = mss,  // Use dynamic mss instead of MSS
+            window = calcAdvertisedWindowField(),
+            mss = mss,
             sackPermitted = weSupportSack,
             windowScale = if (wscaleActive) ourWndScale else null
         )
@@ -687,7 +944,10 @@ class TCPConnection(
         packetWriter(listOf(synAck), listOf(ConnectionManager.PROTO_IPV4))
         serverSeq = (serverSeq + 1L) and 0xFFFFFFFFL
 
-        android.util.Log.v(LOG_TAG, "Sent SYN-ACK with MSS=$mss and SACK-Permitted=$weSupportSack for ${getDisplayKey()}")
+        android.util.Log.v(
+            LOG_TAG,
+            "Sent SYN-ACK with MSS=$mss and SACK-Permitted=$weSupportSack for ${getDisplayKey()}"
+        )
     }
 
     private suspend fun handleHandshakeAck(ip: IPv4Packet, tcp: TCPSegment) {
@@ -697,12 +957,13 @@ class TCPConnection(
                 handshakeAcked = true
                 phase = Phase.HANDSHAKE_ACKED
             }
-            android.util.Log.i(LOG_TAG, "3-way handshake established for ${getDisplayKey()} (SACK enabled: $peerSupportsSack)")
+            android.util.Log.i(
+                LOG_TAG,
+                "3-way handshake established for ${getDisplayKey()} (SACK enabled: $peerSupportsSack)"
+            )
 
-            // 在握手完成后的短时窗口内优先快速 ACK，帮对端更快拉大 cwnd
             quickAckUntilMs = System.currentTimeMillis() + 1500
 
-            // 初始化对端通告窗口（SYN 之后的第一个 ACK 的窗口字段开始生效）
             updatePeerWindowFromAck(tcp)
             flushPreHandshakeBuffer()
             tryStartDownstream(ip, tcp)
@@ -718,9 +979,15 @@ class TCPConnection(
 
     private suspend fun measureRtt(tcp: TCPSegment) {
         val ackSeq = tcp.ack.toLong() and 0xFFFFFFFFL
-        sentTimeMap.remove(ackSeq)?.let { sentTime ->
-            val rtt = System.currentTimeMillis() - sentTime
-            congestionControl.updateRtt(rtt)
+        sentTimeMap.remove(ackSeq)?.let { sentNanoTime ->
+            val rttNanos = System.nanoTime() - sentNanoTime
+            val rttMillis = rttNanos / 1_000_000L
+            
+            if (rttMillis in 1..30_000) {
+                congestionControl.updateRtt(rttMillis)
+                // 确保 BBR 也更新 minRttMs
+                congestionControl.updateMinRtt(rttMillis)  // 新增方法
+            }
         }
     }
 
@@ -734,15 +1001,12 @@ class TCPConnection(
 
         when {
             segSeq == expect -> {
-                // In-order packet
                 handleInOrderPacket(ip, tcp, segEnd)
             }
             isSeqBefore(segSeq, expect) -> {
-                // Old segment or partial retransmission
                 handleRetransmission(ip, tcp, segSeq, segEnd, expect)
             }
             else -> {
-                // Out-of-order packet
                 handleOutOfOrderPacket(ip, tcp, segSeq)
             }
         }
@@ -753,15 +1017,18 @@ class TCPConnection(
             "Client->Server (in-order): ${tcp.payload.size} bytes for ${getDisplayKey()}"
         }
 
-
         clientNextSeq = segEnd
-        congestionControl.onAck(tcp.payload.size)
 
-        // Queue data for upstream
+        if (congestionControl.bbrEnabled) {
+            congestionControl.onUpstreamAck(tcp.payload.size)
+        } else {
+            congestionControl.onClassicAck(tcp.payload.size)
+        }
+
         val payloadCopy = tcp.payload.copyOf()
         pendingLock.withLock {
             pending.addLast(payloadCopy)
-            pendingSize.addAndGet(payloadCopy.size)  // 更新大小
+            pendingSize.addAndGet(payloadCopy.size)
         }
         lastClientWriteTs = System.currentTimeMillis()
         deliverBufferedSegments()
@@ -790,12 +1057,10 @@ class TCPConnection(
                 "Partial retrans: ${newData.size} new bytes for ${getDisplayKey()}"
             }
 
-
-
             clientNextSeq = (expect + newData.size) and 0xFFFFFFFFL
             pendingLock.withLock {
                 pending.addLast(newData)
-                pendingSize.addAndGet(newData.size)  // 更新大小
+                pendingSize.addAndGet(newData.size)
             }
             lastClientWriteTs = System.currentTimeMillis()
             tryFlushUpstream()
@@ -804,21 +1069,17 @@ class TCPConnection(
     }
 
 
-
     private suspend fun handleOutOfOrderPacket(ip: IPv4Packet, tcp: TCPSegment, segSeq: Long) {
         val gap = segSeq - clientNextSeq
         val segEnd = (segSeq + tcp.payload.size) and 0xFFFFFFFFL
 
-        // Small gap - wait briefly
-        if (gap <= mss) {  // Changed MSS to mss
-
+        if (gap <= mss) {
             if (segSeq == clientNextSeq) {
                 handleInOrderPacket(ip, tcp, segEnd)
                 return
             }
         }
 
-        // For small gaps, buffer immediately without delay
         if (gap <= 3 * mss) {
             val newSegment = Segment(
                 tcp.payload.copyOf(),
@@ -830,7 +1091,6 @@ class TCPConnection(
                 stats.outOfOrderPackets++
             }
 
-            // Try immediate delivery
             deliverBufferedSegments()
             sendAckWithSack(ip, tcp, immediate = true)
             return
@@ -849,7 +1109,6 @@ class TCPConnection(
             return
         }
 
-        // Clean old segments if needed
         if (oooBufferSize.get() > maxOooBufferSize * 0.8) {
             cleanOldSegments(aggressiveClean = true)
         }
@@ -889,7 +1148,6 @@ class TCPConnection(
             val entry = outOfOrderSegments.firstEntry() ?: break
 
             if (entry.key == clientNextSeq) {
-                // Remove and prepare for delivery
                 if (outOfOrderSegments.remove(entry.key, entry.value)) {
                     oooBufferSize.addAndGet(-entry.value.data.size)
                     val segEnd = (entry.key + entry.value.data.size.toLong()) and 0xFFFFFFFFL
@@ -898,7 +1156,6 @@ class TCPConnection(
                     delivered++
                 }
             } else if (isSeqBefore(entry.key, clientNextSeq)) {
-                // Handle overlap
                 val overlap = (clientNextSeq - entry.key).toInt()
                 if (overlap < entry.value.data.size) {
                     val newData = entry.value.data.copyOfRange(overlap, entry.value.data.size)
@@ -913,7 +1170,6 @@ class TCPConnection(
             }
         }
 
-        // Batch add to pending queue
         if (toDeliver.isNotEmpty()) {
             pendingLock.withLock {
                 for (data in toDeliver) {
@@ -924,22 +1180,19 @@ class TCPConnection(
             Log.d(LOG_TAG, "Delivered $delivered buffered segments for ${getDisplayKey()}")
             tryFlushUpstream()
         }
-
     }
 
-    // =============== Delayed ACK with SACK support ===============
     private fun scheduleAckFlush(ip: IPv4Packet, tcp: TCPSegment) {
         ackFlushJob?.cancel()
         ackFlushJob = scope.launch {
             delay(DELAYED_ACK_MS)
-            emitAck(ip, tcp)  // This is now a suspend function
+            emitAck(ip, tcp)
         }
     }
 
     private fun emitAck(ip: IPv4Packet, tcp: TCPSegment) {
-        // Build SACK options if we have out-of-order segments and peer supports SACK
         val tcpOptions = if (peerSupportsSack && outOfOrderSegments.isNotEmpty()) {
-            val sackBlocks = generateSackBlocks()  // Now properly synchronized
+            val sackBlocks = generateSackBlocks()
             if (sackBlocks.isNotEmpty()) {
                 if (shouldLog(tupleKeyForDedup("SACK")))
                     LogNoiseLimiter.log(LOG_TAG, "sack:${getDisplayKey()}", 'V', 1500) {
@@ -961,7 +1214,7 @@ class TCPConnection(
             payload = ByteArray(0),
             seq = serverSeq.toInt(),
             ack = clientNextSeq.toInt(),
-            flags = 0x10, // ACK
+            flags = 0x10,
             window = calcAdvertisedWindowField(),
             tcpOptions = tcpOptions
         )
@@ -976,18 +1229,14 @@ class TCPConnection(
     ) {
         val now = System.currentTimeMillis()
 
-
-        // Check out-of-order segments safely
         val hasOutOfOrder = outOfOrderLock.withLock {
             outOfOrderSegments.isNotEmpty()
         }
 
-        // Quick-ACK 条件：显式要求 / 有乱序要发 SACK / 仍在快速阶段 / 小包（< MSS/2）
         val quickPhase = now < quickAckUntilMs
         val smallPayload = tcp.payload.size < (mss / 2)
-        val shouldSendImmediate = immediate || (peerSupportsSack && hasOutOfOrder) || quickPhase || smallPayload
-
-
+        val shouldSendImmediate =
+            immediate || (peerSupportsSack && hasOutOfOrder) || quickPhase || smallPayload
 
         if (!shouldSendImmediate) {
             if ((now - lastAckTime < DELAYED_ACK_MS) && pendingAckCount < MAX_PENDING_ACKS) {
@@ -1003,13 +1252,10 @@ class TCPConnection(
     }
 
     private fun calcAdvertisedWindow(): Int {
-        
-        // 直接使用缓存的大小，避免遍历
         val pendingBytes = pendingSize.get()
         val oooBytes = oooBufferSize.get()
         val used = min(MAX_PENDING_BYTES, pendingBytes + oooBytes)
         val free = (MAX_PENDING_BYTES - used).coerceAtLeast(0)
-        // 注：返回真实字节窗口；写入 TCP 头前会在 calcAdvertisedWindowField() 内按 ourWndScale 右移
         return free.coerceIn(MIN_ADV_WINDOW, MAX_ADV_WINDOW)
     }
 
@@ -1020,7 +1266,6 @@ class TCPConnection(
                 Log.d(LOG_TAG, "Buffered pre-handshake ${data.size}B for ${getDisplayKey()}")
             }
         }
-        // SYN 前期也视为“客户端在写”
         lastClientWriteTs = System.currentTimeMillis()
     }
 
@@ -1031,7 +1276,7 @@ class TCPConnection(
                 preHandshakeBuf.reset()
                 pendingLock.withLock {
                     pending.addLast(data)
-                    pendingSize.addAndGet(data.size)  // 更新大小
+                    pendingSize.addAndGet(data.size)
                 }
                 lastClientWriteTs = System.currentTimeMillis()
                 clientNextSeq = (clientNextSeq + data.size) and 0xFFFFFFFFL
@@ -1042,130 +1287,138 @@ class TCPConnection(
     }
 
     private suspend fun handleFIN(ip: IPv4Packet, tcp: TCPSegment) {
-
-        // Check if already closing
         if (isClosed || clientHalfClosed) {
-            Log.d(LOG_TAG, "FIN received but already closing for ${getDisplayKey()}")
-            return
-        }
-
-        Log.d(LOG_TAG, "FIN received for ${getDisplayKey()} (client half-close)")
-        clientNextSeq = (clientNextSeq + 1L) and 0xFFFFFFFFL
-        sendAckWithSack(ip, tcp, immediate = true)
-
-        stateLock.withLock {
-            clientHalfClosed = true
-            pendingShutdown = true
-            phase = Phase.HALF_CLOSED_LOCAL
-        }
-
-        tryFlushUpstream()
-    }
-
-    private suspend fun establishUpstream(ip: IPv4Packet, syn: TCPSegment, domain: String?) = withContext(Dispatchers.IO) {
-        var socket: Socket? = null
-        var pooledSocket = false  // 标记是否从池中获取
-
-        try {
-
-            // Soft-wait up to 800ms for control-plane/overlay readiness (avoid blackhole on first flow)
-            try {
-                if (!OverlayGate.awaitReady(800)) {
-                    Log.d(LOG_TAG, "Overlay not ready within 800ms (soft wait); proceeding")
-                }
-            } catch (_: Throwable) {}
-
-            val port = syn.dstPort
-            val hostForDial = domain ?: ip.dst.toString()
-
-            Log.d(LOG_TAG, "Establishing upstream to $hostForDial:$port")
-            val speedtestLike = isSpeedtestDomain(hostForDial) || port == 8080
-
-            socket = if (bypassDirect) {
-                // 直连模式使用池管理
-                pooledSocket = true
-                SocketPool.acquire().apply {
-                    tcpNoDelay = true
-
-                    // 初值无所谓，稍后统一设置
-                    soTimeout = 2000
-
-                    Vpn2SocksService.protectSocket(this)
-                    connect(InetSocketAddress(hostForDial, port), 15000)
-                }
-            } else {
-                // SOCKS模式不使用池（因为SocksClient内部创建Socket）
-                SocksClient(socksEndpoint).dial(hostForDial, port).apply {
-                    tcpNoDelay = true
-                    soTimeout = 2000
-                }
+                Log.d(LOG_TAG, "FIN received but already closing")
+                return
             }
 
+            Log.d(LOG_TAG, "FIN received (client half-close)")
+            clientNextSeq = (clientNextSeq + 1L) and 0xFFFFFFFFL
+            sendAckWithSack(ip, tcp, immediate = true)
 
-            // 放大缓冲 & 放宽 read 超时（上传起步更稳）
-            try {
-                socket.keepAlive = true
-                socket.receiveBufferSize = 512 * 1024
-                socket.sendBufferSize    = 512 * 1024
-                // 测速域名放宽读超时，避免“长时间无下行”的上传阶段被误判
-                socket.soTimeout         = if (speedtestLike) 20000 else 8000
-            } catch (_: Throwable) {}
-
-            upstream = socket
-            upstreamWriter = socket.getOutputStream()
-            upstreamReader = socket.getInputStream()
-
-
-            // Only then update phase
             stateLock.withLock {
-                socksPrimed = true
-                phase = Phase.SOCKS_PRIMED
+                clientHalfClosed = true
+                pendingShutdown = true
+                phase = Phase.HALF_CLOSED_LOCAL
             }
 
-            android.util.Log.i(LOG_TAG, "Upstream established for ${getDisplayKey()}")
-
+            // 不要立即关闭！等待数据传输完成
             tryFlushUpstream()
-            tryStartDownstream(ip, syn)
-
-        } catch (e: Exception) {
-            Log.e(LOG_TAG, "Upstream establishment failed: ${e.message}", e)
-            closeConnection()
-        } finally {
-            // 确保异常时释放资源
-            if (socket != null && upstream == null) {
-                try {
-                    if (pooledSocket) {
-                        SocketPool.release(socket)
-                    } else {
-                        socket.close()
+            
+            // 延迟关闭，给下行数据时间
+            scope.launch {
+                delay(1000)  // 等待1秒
+                if (pendingSize.get() == 0 && !outputShutdown) {
+                    writeLock.withLock {
+                        upstream?.shutdownOutput()
+                        outputShutdown = true
                     }
-                } catch (e: Exception) {
-                    Log.w(LOG_TAG, "Failed to cleanup socket: ${e.message}")
+                }
+            }
+    }
+
+    private suspend fun establishUpstream(ip: IPv4Packet, syn: TCPSegment, domain: String?) =
+        withContext(Dispatchers.IO) {
+            var socket: Socket? = null
+            var pooledSocket = false
+
+            try {
+                try {
+                    if (!OverlayGate.awaitReady(800)) {
+                        Log.d(
+                            LOG_TAG,
+                            "Overlay not ready within 800ms (soft wait); proceeding"
+                        )
+                    }
+                } catch (_: Throwable) {
+                }
+
+                val port = syn.dstPort
+                val hostForDial = domain ?: ip.dst.toString()
+
+                Log.d(LOG_TAG, "Establishing upstream to $hostForDial:$port")
+                val speedtestLike = isSpeedtestDomain(hostForDial) || port == 8080
+
+                socket = if (bypassDirect) {
+                    pooledSocket = true
+                    SocketPool.acquire().apply {
+                        tcpNoDelay = true
+                        soTimeout = 2000
+                        Vpn2SocksService.protectSocket(this)
+                        connect(InetSocketAddress(hostForDial, port), 15000)
+                    }
+                } else {
+                    SocksClient(socksEndpoint).dial(hostForDial, port).apply {
+                        tcpNoDelay = true
+                        soTimeout = 2000
+                    }
+                }
+
+
+                try {
+                    socket.keepAlive = true
+                    socket.receiveBufferSize = 512 * 1024
+                    socket.sendBufferSize = 512 * 1024
+                    socket.soTimeout = if (speedtestLike) 20000 else 8000
+                } catch (_: Throwable) {
+                }
+
+                upstream = socket
+                upstreamWriter = socket.getOutputStream()
+                upstreamReader = socket.getInputStream()
+
+
+                stateLock.withLock {
+                    socksPrimed = true
+                    phase = Phase.SOCKS_PRIMED
+                }
+
+                android.util.Log.i(LOG_TAG, "Upstream established for ${getDisplayKey()}")
+
+                tryFlushUpstream()
+                tryStartDownstream(ip, syn)
+
+            } catch (e: Exception) {
+                Log.e(LOG_TAG, "Upstream establishment failed: ${e.message}", e)
+                closeConnection()
+            } finally {
+                if (socket != null && upstream == null) {
+                    try {
+                        if (pooledSocket) {
+                            SocketPool.release(socket)
+                        } else {
+                            socket.close()
+                        }
+                    } catch (e: Exception) {
+                        Log.w(LOG_TAG, "Failed to cleanup socket: ${e.message}")
+                    }
                 }
             }
         }
-    }
-    @Volatile private var canWrite = true  // 新增：控制是否允许写入
+
+    @Volatile
+    private var canWrite = true
     private fun isSocketHealthy(): Boolean {
         return try {
             val socket = upstream
             val currentPhase = phase
             if (socket == null) {
                 return currentPhase != Phase.STREAMING &&
-                    currentPhase != Phase.HALF_CLOSED_LOCAL &&
-                    currentPhase != Phase.HALF_CLOSED_REMOTE
+                        currentPhase != Phase.HALF_CLOSED_LOCAL &&
+                        currentPhase != Phase.HALF_CLOSED_REMOTE
             }
             val isConnected = socket.isConnected && !socket.isClosed
             val canReadFromSocket = !socket.isInputShutdown
-            // “读优先”：只要还连着且能读，就继续 downstream
             val healthy = isConnected && canReadFromSocket
 
             if (!healthy) {
-                Log.d(LOG_TAG, "Socket state: closed=${socket.isClosed}, " +
-                        "connected=${socket.isConnected}, " +
-                        "inputShutdown=${socket.isInputShutdown}, " +
-                        "outputShutdown=${socket.isOutputShutdown}, healthy=$healthy")
-                }
+                Log.d(
+                    LOG_TAG, "Socket state: closed=${socket.isClosed}, " +
+                            "connected=${socket.isConnected}, " +
+                            "inputShutdown=${socket.isInputShutdown}, " +
+                            "outputShutdown=${socket.isOutputShutdown}, healthy=$healthy"
+                )
+            }
             healthy
         } catch (e: Exception) {
             Log.e(LOG_TAG, "Error checking socket health: ${e.message}")
@@ -1189,115 +1442,138 @@ class TCPConnection(
         }
     }
 
-    private suspend fun downstreamLoop(ip: IPv4Packet, tcp: TCPSegment) = withContext(Dispatchers.IO) {
-        val reader = upstreamReader ?: return@withContext
-        val buffer = ByteArray(64 * 1024)
-        var totalRead = 0
-        var consecutiveTimeouts = 0
-        val maxConsecutiveTimeouts = 30  // Increase from 10 to 30 (60 seconds with 2s timeout)
-        var firstResponseSeen = false
-        val speedtestLike = isSpeedtestDomain(resolvedDomain)
+    private suspend fun downstreamLoop(ip: IPv4Packet, tcp: TCPSegment) =
+        withContext(Dispatchers.IO) {
+            val reader = upstreamReader ?: return@withContext
+            val buffer = ByteArray(64 * 1024)
+            var totalRead = 0
+            var consecutiveTimeouts = 0
+            val maxConsecutiveTimeouts = 30
+            var firstResponseSeen = false
+            val speedtestLike = isSpeedtestDomain(resolvedDomain)
 
-        try {
-            android.util.Log.i(LOG_TAG, "Downstream loop started for ${getDisplayKey()}")
+            try {
+                android.util.Log.i(LOG_TAG, "Downstream loop started for ${getDisplayKey()}")
 
-            while (!isClosed && isSocketHealthy()) {
-                val n = try {
-                    reader.read(buffer)
-                } catch (e: SocketTimeoutException) {
-                    consecutiveTimeouts++
+                while (!isClosed && isSocketHealthy()) {
+                    val n = try {
+                        reader.read(buffer)
+                    } catch (e: SocketTimeoutException) {
+                        consecutiveTimeouts++
 
-                    // 首字节看门狗：测速或仍在持续上传时，不触发快速重试
-                    val uploadingLikely =
-                        (System.currentTimeMillis() - lastClientWriteTs) < 20_000 || pendingSize.get() > 0
-                    if (!firstResponseSeen && consecutiveTimeouts >= 2 && !uploadingLikely && !speedtestLike) {
-                        Log.w(LOG_TAG, "No server data within ~${consecutiveTimeouts * 2}s on fresh flow; triggering retry for ${getDisplayKey()}")
+                        val uploadingLikely =
+                            (System.currentTimeMillis() - lastClientWriteTs) < 20_000 || pendingSize.get() > 0
+                        if (!firstResponseSeen && consecutiveTimeouts >= 2 && !uploadingLikely && !speedtestLike) {
+                            Log.w(
+                                LOG_TAG,
+                                "No server data within ~${consecutiveTimeouts * 2}s on fresh flow; triggering retry for ${getDisplayKey()}"
+                            )
+                            break
+                        }
+
+                        if (consecutiveTimeouts > maxConsecutiveTimeouts) {
+                            if (totalRead > 0) {
+                                Log.d(
+                                    LOG_TAG,
+                                    "Closing after timeouts with $totalRead bytes received"
+                                )
+                                break
+                            } else {
+                                Log.w(
+                                    LOG_TAG,
+                                    "No data received after ${consecutiveTimeouts * 2}s, closing"
+                                )
+                                break
+                            }
+                        }
+                        continue
+                    } catch (e: IOException) {
+                        if (totalRead > 0) {
+                            Log.d(
+                                LOG_TAG,
+                                "Connection closed after $totalRead bytes: ${e.message}"
+                            )
+                        } else {
+                            Log.e(
+                                LOG_TAG,
+                                "Connection failed with no data: ${e.message}"
+                            )
+                        }
                         break
                     }
 
-                    if (consecutiveTimeouts > maxConsecutiveTimeouts) {
-                        // Only close if we've received some data
-                        if (totalRead > 0) {
-                            Log.d(LOG_TAG, "Closing after timeouts with $totalRead bytes received")
-                            break
-                        } else {
-                            Log.w(LOG_TAG, "No data received after ${consecutiveTimeouts * 2}s, closing")
-                            break
+                    consecutiveTimeouts = 0
+
+
+                    if (n <= 0) {
+                        delay(100)
+                        if (totalRead == 0) {
+                            delay(500)
+                            continue
                         }
+                        break
                     }
-                    continue
-                } catch (e: IOException) {
-                    // Differentiate between expected and unexpected closures
-                    if (totalRead > 0) {
-                        Log.d(LOG_TAG, "Connection closed after $totalRead bytes: ${e.message}")
-                    } else {
-                        Log.e(LOG_TAG, "Connection failed with no data: ${e.message}")
+
+                    totalRead += n
+
+                    if (!firstResponseSeen) firstResponseSeen = true
+
+                    LogNoiseLimiter.log(LOG_TAG, "sc:${getDisplayKey()}", 'V', 900) {
+                        "Server->Client: $n bytes (total: $totalRead) for ${getDisplayKey()}"
                     }
-                    break
+
+
+                    sendDataToClient(ip, tcp, buffer.copyOf(n))
+                }
+            } catch (e: CancellationException) {
+                android.util.Log.i(
+                    LOG_TAG,
+                    "Downstream loop cancelled after $totalRead bytes for ${getDisplayKey()}"
+                )
+            } catch (e: Exception) {
+                if (!isClosed) {
+                    Log.e(
+                        LOG_TAG,
+                        "Downstream error after $totalRead bytes: ${e.message}",
+                        e
+                    )
+                } else {
+                    Log.d(
+                        LOG_TAG,
+                        "Downstream stopped after $totalRead bytes: ${e.message}"
+                    )
+                }
+            } finally {
+                if (totalRead == 0 && !isClosed) {
+                    Log.e(
+                        LOG_TAG,
+                        "Downstream loop exiting with NO DATA for ${getDisplayKey()}"
+                    )
+                } else {
+                    android.util.Log.i(
+                        LOG_TAG,
+                        "Downstream loop exiting after $totalRead bytes for ${getDisplayKey()}"
+                    )
                 }
 
-                consecutiveTimeouts = 0  // Reset on successful read
-
-
-                if (n <= 0) {
-                    delay(100)
-                    if (totalRead == 0) {
-                        // Give more retries for initial data
-                        delay(500)
-                        continue
-                    }
-                    break
+                if (!isClosed) {
+                    closeConnection()
                 }
-
-                totalRead += n
-
-                if (!firstResponseSeen) firstResponseSeen = true
-
-                LogNoiseLimiter.log(LOG_TAG, "sc:${getDisplayKey()}", 'V', 900) {
-                    "Server->Client: $n bytes (total: $totalRead) for ${getDisplayKey()}"
-                }
-
-
-
-
-                sendDataToClient(ip, tcp, buffer.copyOf(n))
-            }
-        } catch (e: CancellationException) {
-            // This is expected when connection is closed
-            android.util.Log.i(LOG_TAG, "Downstream loop cancelled after $totalRead bytes for ${getDisplayKey()}")
-        } catch (e: Exception) {
-            // Only log as error if it's unexpected
-            if (!isClosed) {
-                Log.e(LOG_TAG, "Downstream error after $totalRead bytes: ${e.message}", e)
-            } else {
-                Log.d(LOG_TAG, "Downstream stopped after $totalRead bytes: ${e.message}")
-            }
-        } finally {
-            // Only log error if no data was received AND connection wasn't intentionally closed
-            if (totalRead == 0 && !isClosed) {
-                Log.e(LOG_TAG, "Downstream loop exiting with NO DATA for ${getDisplayKey()}")
-            } else {
-                android.util.Log.i(LOG_TAG, "Downstream loop exiting after $totalRead bytes for ${getDisplayKey()}")
-            }
-
-            // Only close if not already closing
-            if (!isClosed) {
-                closeConnection()
             }
         }
-    }
 
     private object LogNoiseLimiter {
         private data class Entry(var lastTs: Long, var suppressed: Int, var lastMsgHash: Int)
         private val map = java.util.concurrent.ConcurrentHashMap<String, Entry>()
         private fun now() = android.os.SystemClock.uptimeMillis()
 
-        /**
-         * Throttled, de-duplicated log.
-         * @param key stable key (e.g., "cs:$fiveTuple", "sc:$fiveTuple")
-         * @param level 'V','D','I','W','E'
-         */
-        fun log(tag: String, key: String, level: Char, intervalMs: Long = 800, build: () -> String) {
+        fun log(
+            tag: String,
+            key: String,
+            level: Char,
+            intervalMs: Long = 800,
+            build: () -> String
+        ) {
             val msg = build()
             val h = msg.hashCode()
             val e = map.getOrPut(key) { Entry(0L, 0, 0) }
@@ -1323,53 +1599,47 @@ class TCPConnection(
     }
 
     private fun sendDataToClient(ip: IPv4Packet, tcp: TCPSegment, data: ByteArray) {
-        // 统一使用“实例级”的动态 MSS，而不是重新用 (mtu-40)
-        val mssLocal = mss
+        scope.launch {
         var offset = 0
-
-
-
         while (offset < data.size && !isClosed) {
-            val chunkSize = min(mssLocal, data.size - offset)
-
-            // Track send time for RTT measurement
-            sentTimeMap[serverSeq] = System.currentTimeMillis()
-
-            // 发送前做一个简单的对端窗口检查（可选，防止超窗）
-            val unacked = ((serverSeq - lastAckFromClient) and 0xFFFFFFFFL).toInt()
-            val allowed = (peerAdvertisedWnd - unacked).coerceAtLeast(0)
-            val realChunk = if (allowed in 1 until chunkSize) allowed else chunkSize
-
-            // 直接从源缓冲切片，避免重复拷贝
-            val payloadSlice = data.copyOfRange(offset, offset + realChunk)
-
+            val chunkSize = min(mss, data.size - offset)
+            val chunk = data.copyOfRange(offset, offset + chunkSize)
+            
+            val packetSeq = (serverSeq + offset) and 0xFFFFFFFFL
+            
+            // 记录发送时间用于RTT测量
+            sentTimeMap[packetSeq + chunkSize] = System.nanoTime()
+            
             val packet = IpBuilders.tcpPayloadFromServer(
-                src = ip.dst, dst = ip.src,
-                srcPort = tcp.dstPort, dstPort = tcp.srcPort,
-                payload = payloadSlice,
-                seq = serverSeq.toInt(),
-                ack = clientNextSeq.toInt(),
-                flags = 0x18, // PSH | ACK
-                window = calcAdvertisedWindowField()
-            )
+                    src = ip.dst, dst = ip.src,
+                    srcPort = tcp.dstPort, dstPort = tcp.srcPort,
+                    payload = chunk,
+                    seq = packetSeq.toInt(),
+                    ack = clientNextSeq.toInt(),
+                    flags = 0x10,
+                    window = calcAdvertisedWindowField()
+                )
 
-            packetWriter(listOf(packet), listOf(ConnectionManager.PROTO_IPV4))
+                packetWriter(listOf(packet), listOf(ConnectionManager.PROTO_IPV4))
+                offset += chunkSize
+            }
 
-            // 按实际发送的 realChunk 递增序列号
-            serverSeq = (serverSeq + realChunk) and 0xFFFFFFFFL
-            offset += realChunk
+            if (packets.isNotEmpty()) {
+                packetWriter(packets.toList(), protocols.toList())
+            }
+            // 修复点：在循环结束后，统一更新 serverSeq
+            serverSeq = (serverSeq + offset) and 0xFFFFFFFFL
         }
     }
 
-    // —— 简单识别测速域名 ——（面向 Ookla/MLab/自建测速）
     private fun isSpeedtestDomain(host: String?): Boolean {
         if (host == null) return false
         val h = host.lowercase(Locale.ROOT)
         return h.endsWith(".ooklaserver.net")
-            || h.contains("speedtest")
-            || h.contains("measurementlab")
-            || h.contains("mlab-oti")
-            || h.contains("mlab-oti.measurement-lab.org")
+                || h.contains("speedtest")
+                || h.contains("measurementlab")
+                || h.contains("mlab-oti")
+                || h.contains("mlab-oti.measurement-lab.org")
     }
 
     private fun sendFinToClient(ip: IPv4Packet, tcp: TCPSegment) {
@@ -1379,7 +1649,7 @@ class TCPConnection(
             payload = ByteArray(0),
             seq = serverSeq.toInt(),
             ack = clientNextSeq.toInt(),
-            flags = 0x11, // FIN | ACK
+            flags = 0x11,
             window = calcAdvertisedWindowField()
         )
         packetWriter(listOf(finPacket), listOf(ConnectionManager.PROTO_IPV4))
@@ -1390,14 +1660,11 @@ class TCPConnection(
         val writer = upstreamWriter ?: return@withContext
         var totalFlushed = 0
 
-        // Enhanced warmup for SOCKS connections — run ONCE only, very short
         if (!warmupDone && totalFlushed == 0 && phase == Phase.SOCKS_PRIMED && !bypassDirect) {
-            // 可按需去掉 delay，或保持 5~10ms 的极短预热
-            // delay(5)
             warmupDone = true
         }
 
-        while (canWrite && !outputShutdown) {  // 检查写入状态
+        while (canWrite && !outputShutdown) {
             if (!isSocketHealthy()) {
                 Log.w(LOG_TAG, "Socket unhealthy, stopping flush")
                 canWrite = false
@@ -1415,7 +1682,6 @@ class TCPConnection(
 
             try {
                 writeLock.withLock {
-                    // 三重检查
                     if (!canWrite || outputShutdown || !isSocketHealthy()) {
                         pendingLock.withLock {
                             pending.addFirst(chunk)
@@ -1426,7 +1692,6 @@ class TCPConnection(
 
                     val success = writeCoalescer.offer(chunk) { data: ByteArray ->
                         try {
-                            // 写入前最后检查
                             if (!canWrite || outputShutdown) {
                                 return@offer false
                             }
@@ -1437,7 +1702,7 @@ class TCPConnection(
                             true
                         } catch (e: IOException) {
                             Log.e(LOG_TAG, "Write failed: ${e.message}")
-                            canWrite = false  // 写入失败后禁止后续写入
+                            canWrite = false
                             false
                         }
                     }
@@ -1460,11 +1725,11 @@ class TCPConnection(
         cleanupPendingData()
     }
 
-    @Volatile private var outputShutdown = false  // 标记输出是否已关闭
+    @Volatile
+    private var outputShutdown = false
     private suspend fun cleanupPendingData() {
         try {
             writeLock.withLock {
-                // 先检查是否还能写
                 if (!canWrite || outputShutdown) {
                     return@withLock
                 }
@@ -1472,7 +1737,6 @@ class TCPConnection(
                 if (isSocketHealthy() && upstreamWriter != null) {
                     writeCoalescer.flush { data ->
                         try {
-                            // 再次检查写入状态
                             if (canWrite && !outputShutdown && isSocketHealthy()) {
                                 upstreamWriter?.write(data)
                                 upstreamWriter?.flush()
@@ -1482,7 +1746,7 @@ class TCPConnection(
                             }
                         } catch (e: Exception) {
                             Log.d(LOG_TAG, "Final flush exception: ${e.message}")
-                            canWrite = false  // 出错后禁止写入
+                            canWrite = false
                             false
                         }
                     }
@@ -1497,10 +1761,18 @@ class TCPConnection(
         }
         if (shouldDeferHalfClose) {
             writeLock.withLock {
-                // 不主动半关，延迟到服务端 FIN 或最终 closeConnection() 再处理
-                deferredHalfClose = true
+                // 修复点：FIN包的处理逻辑已经在 handleFIN 中处理，此处改为立即半关闭
+                if (!outputShutdown) {
+                    kotlin.runCatching {
+                        upstream?.shutdownOutput()
+                        outputShutdown = true
+                    }
+                    Log.d(
+                        LOG_TAG,
+                        "Upstream output half-closed after pending data flush"
+                    )
+                }
                 canWrite = false
-                Log.d(LOG_TAG, "Deferring upstream half-close (client half-closed & no pending)")
             }
         }
     }
@@ -1512,9 +1784,7 @@ class TCPConnection(
     }
 
 
-
     fun closeConnection() {
-        // Already closing/closed, just return
         if (!closedOnce.compareAndSet(false, true)) {
             Log.d(LOG_TAG, "Connection already closing/closed for ${getDisplayKey()}")
             return
@@ -1523,21 +1793,14 @@ class TCPConnection(
         Log.d(LOG_TAG, "Starting connection close for ${getDisplayKey()}")
 
         isClosed = true
-        canWrite = false  // 立即禁止写入
+        canWrite = false
 
-        // Use cancelChildren instead of cancel to avoid propagating cancellation
         scope.coroutineContext.cancelChildren()
 
         cleanupScope.launch {
             try {
-
-                // Give coroutines time to handle cancellation gracefully
                 delay(100)
-
                 ackFlushJob?.cancelAndJoin()
-
-
-                // 安全关闭写入流
                 writeLock.withLock {
                     kotlin.runCatching {
                         if (!outputShutdown) {
@@ -1552,9 +1815,10 @@ class TCPConnection(
                 upstream?.let { socket ->
                     kotlin.runCatching {
                         if (!socket.isClosed) {
-
-                            if (deferredHalfClose && !socket.isOutputShutdown) { socket.shutdownOutput() }
-
+                            // 修复点：避免在 closeConnection() 中重复半关闭
+                            if (!socket.isOutputShutdown) {
+                                socket.shutdownOutput()
+                            }
                             if (bypassDirect && socket.isConnected) {
                                 SocketPool.release(socket)
                             } else {
@@ -1563,8 +1827,6 @@ class TCPConnection(
                         }
                     }
                 }
-
-                // 清理资源...
             } finally {
                 cleanupScope.cancel()
             }
