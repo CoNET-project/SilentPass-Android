@@ -1,4 +1,5 @@
 package com.silentPass.vpn
+
 import android.R
 import android.app.Notification
 import android.app.NotificationChannel
@@ -7,410 +8,605 @@ import android.app.Service
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
-import android.text.TextUtils.isEmpty
-import android.util.Log
-import java.io.BufferedInputStream
-import java.io.BufferedOutputStream
-import java.io.BufferedReader
-import java.io.BufferedWriter
-import java.io.InputStream
-import java.io.InputStreamReader
-import java.io.OutputStream
-import java.io.OutputStreamWriter
-import java.net.InetAddress
-import java.net.ServerSocket
-import java.net.Socket
-import java.net.URL
 import android.util.Base64
+import android.util.Log
 import com.google.gson.Gson
-import java.io.ByteArrayOutputStream
-import kotlin.ByteArray
-import java.net.DatagramSocket
-import java.net.DatagramPacket
-import java.net.InetSocketAddress
+import java.io.*
+import java.net.*
+import java.nio.ByteBuffer
+import java.nio.channels.Channels
+import java.util.concurrent.*
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 class SocketServerService : Service() {
 
+    // ====== Server State ======
     private var serverThread: Thread? = null
-    private var isRunning = true
+    @Volatile private var isRunning = true
     private var layerMinus: LayerMinus? = null
     private var serverSocket: ServerSocket? = null
     private val LOG_TAG = "SocketServerService"
-    private fun forwardTraffic(input: InputStream, output: OutputStream): Thread {
-        return Thread {
+
+    // ====== ThreadPool (avoid per-conn thread explosion) ======
+    private val threadCounter = AtomicInteger(0)
+    private val threadPoolExecutor = ThreadPoolExecutor(
+        10, 200, 60L, TimeUnit.SECONDS,
+        SynchronousQueue<Runnable>(),
+        ThreadFactory { r ->
+            Thread(r).apply {
+                name = "ProxyWorker-${threadCounter.incrementAndGet()}"
+                isDaemon = true
+                priority = Thread.NORM_PRIORITY
+            }
+        },
+        ThreadPoolExecutor.CallerRunsPolicy()
+    )
+
+    // ====== Event-style metrics (print only on connection OPEN/CLOSE) ======
+    private val activeConns = AtomicInteger(0)
+    private val connSeq = AtomicLong(0)
+    private fun logPoolSnapshot(event: String, connId: Long, note: String = "") {
+        val q = threadPoolExecutor.queue
+        Log.i(
+            LOG_TAG,
+            "[$event] conn#$connId " +
+                    "activeConns=${activeConns.get()} " +
+                    "pool={active:${threadPoolExecutor.activeCount}, size:${threadPoolExecutor.poolSize}/${threadPoolExecutor.maximumPoolSize}, largest:${threadPoolExecutor.largestPoolSize}} " +
+                    "tasks={submitted:${threadPoolExecutor.taskCount}, completed:${threadPoolExecutor.completedTaskCount}} " +
+                    "queue.size=${q.size} $note"
+        )
+    }
+    private fun onConnOpen(connId: Long)  { activeConns.incrementAndGet(); logPoolSnapshot("OPEN",  connId) }
+    private fun onConnClose(connId: Long) { if (activeConns.decrementAndGet() < 0) activeConns.set(0); logPoolSnapshot("CLOSE", connId) }
+
+    // ====== High-throughput forwarder (NIO Channels + Direct ByteBuffer) ======
+    // - Natural backpressure: write blocks when socket send buffer is full
+    // - Adaptive flush: small-flow (e.g., TLS ClientHello) flush eagerly; bulk-flow flush in batches
+    private fun forwardTrafficAsync(
+        input: InputStream,
+        output: OutputStream,
+        bufferSize: Int = 128 * 1024,
+        onDone: (() -> Unit)? = null,
+        onEof: (() -> Unit)? = null,
+        minBytesBeforeEofCallback: Long = 0   // 新增：EOF 回调的最小搬运字节数
+    ): Future<*> {
+        return threadPoolExecutor.submit {
+            Log.d(LOG_TAG, "Start forwarding from ${input.javaClass.simpleName} to ${output.javaClass.simpleName}")
+            var src: java.nio.channels.ReadableByteChannel? = null
+            var dst: java.nio.channels.WritableByteChannel? = null
             try {
-                val buffer = ByteArray(8192) // Larger buffer for better performance
-                var totalBytes = 0L
+
+                Log.d(LOG_TAG, "input available bytes: ${input.available()}")
+                src = Channels.newChannel(input)
+                dst = Channels.newChannel(output)
+                val buf = ByteBuffer.allocateDirect(bufferSize)
+                var totalBytes = 0L             // 该方向由本任务实际搬运的字节数
+                var sinceLastFlush = 0L
+                val WARMUP_LIMIT = 64 * 1024     // small-flow threshold
+                val FLUSH_THRESHOLD = 64 * 1024  // batch flush in bulk flow
 
                 while (true) {
-                    val bytes = try {
-                        input.read(buffer)
-                    } catch (e: java.net.SocketTimeoutException) {
-                        // Timeout is ok, continue
-                        continue
-                    } catch (e: java.net.SocketException) {
-                        if (e.message?.contains("reset") == true ||
-                            e.message?.contains("closed") == true ||
-                            e.message?.contains("Broken pipe") == true) {
-                            // Expected socket closure
-                            Log.d(LOG_TAG, "Socket closed after $totalBytes bytes (normal)")
-                            break
-                        } else {
-                            throw e
+                    val nRead = try {
+                        src.read(buf)
+                    } catch (_: SocketTimeoutException) {
+                        // 上游短暂停笔：如果手里攒着数据就冲一下，避免尾部卡住
+                        if (output is BufferedOutputStream) {
+                            try { output.flush() } catch (_: Exception) {}
                         }
-                    }
-
-                    if (bytes == -1) {
-                        Log.d(LOG_TAG, "EOF reached after forwarding $totalBytes bytes")
+                        continue
+                    } catch (_: java.nio.channels.ClosedByInterruptException) {
+                        break
+                    } catch (_: java.nio.channels.AsynchronousCloseException) {
                         break
                     }
+                    if (nRead == -1) {
+                        Log.d(LOG_TAG, "EOF reached after forwarding $totalBytes bytes")
+                        try { (output as? BufferedOutputStream)?.flush() } catch (_: Exception) {}
+                        // 只有在本任务确实搬过至少 minBytesBeforeEofCallback 才触发 onEof（半关闭）
+                        if (totalBytes >= minBytesBeforeEofCallback) {
+                            try { onEof?.invoke() } catch (_: Exception) {}
+                        } else {
+                            Log.d(LOG_TAG, "Skip half-close: forwarded=$totalBytes < $minBytesBeforeEofCallback")
+                        }
+                        break
+                    }
+                    if (nRead == 0) continue
 
-                    if (bytes > 0) {
-                        try {
-                            output.write(buffer, 0, bytes)
-                            output.flush()
-                            totalBytes += bytes
-                        } catch (e: java.net.SocketException) {
-                            if (e.message?.contains("reset") == true ||
-                                e.message?.contains("closed") == true ||
-                                e.message?.contains("Broken pipe") == true) {
-                                Log.d(LOG_TAG, "Output socket closed after $totalBytes bytes")
-                                break
-                            } else {
-                                throw e
-                            }
+                    totalBytes += nRead
+                    buf.flip()
+                    var wroteThisChunk = 0
+                    while (buf.hasRemaining()) {
+                        val nWritten = try { dst.write(buf) }
+                        catch (_: java.nio.channels.ClosedChannelException) {
+                            Log.d(LOG_TAG, "Output channel closed after $totalBytes bytes"); return@submit
+                        }
+                        if (nWritten == 0) Thread.yield()
+                        wroteThisChunk += nWritten
+                    }
+                    buf.compact()
+
+                    // Adaptive flush: protect TLS handshakes and tiny requests from buffering
+                    if (output is BufferedOutputStream) {
+                        sinceLastFlush += wroteThisChunk
+                        val inWarmup = totalBytes <= WARMUP_LIMIT
+
+                        // 1) 小流阶段：每块都刷
+                        // 2) 大流阶段：累计到阈值再刷
+                        // 3) 尾部微小块：立即刷，防止“只差一点点”却被憋住
+                        val tinyChunk = wroteThisChunk in 1 until 32 * 1024
+
+                        if (inWarmup || sinceLastFlush >= FLUSH_THRESHOLD || tinyChunk) {
+                            try { output.flush() } catch (_: Exception) {}
+                            sinceLastFlush = 0
                         }
                     }
                 }
             } catch (e: Exception) {
-                if (e !is java.io.IOException ||
-                    (!e.message.isNullOrEmpty() &&
-                            !e.message!!.contains("Stream closed") &&
-                            !e.message!!.contains("Socket closed"))) {
-                    Log.e(LOG_TAG, "Unexpected error in forwardTraffic", e)
-                }
+                Log.e(LOG_TAG, "Error forwarding traffic (NIO)", e)
             } finally {
-                // Gracefully close streams
-                try {
-                    input.close()
-                } catch (_: Exception) {}
-                try {
-                    output.close()
-                } catch (_: Exception) {}
+                // Half-close friendly: close read side; flush write side; let peer direction finish
+                try { src?.close() } catch (_: Exception) {}
+                try { input.close() } catch (_: Exception) {}
+                try { (output as? BufferedOutputStream)?.flush() } catch (_: Exception) {}
+                try { onDone?.invoke() } catch (_: Exception) {}
             }
-        }.apply { start() }
+        }
     }
-    //      curl local proxy test command
-    //      curl -v -x socks5://127.0.0.1:8888 --resolve "www.google.com:53:8.8.8.8" www.google.com
-    //      curl -v -x socks5://127.0.0.1:8888 https://www.google.com
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val base64 = intent?.getStringExtra("VPN_DATA_B64")
-        if (base64 != null) {
-            try {
-                val decodedBytes = Base64.decode(base64, Base64.DEFAULT)
-                val jsonString = String(decodedBytes, Charsets.UTF_8)
-                var startVPNData = Gson().fromJson(jsonString, StartVPNData::class.java)
-                this.layerMinus = LayerMinus(startVPNData)
 
-                // Use vpnData to start your server...
+    // ====== Android Service lifecycle ======
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+        startForeground(1, createNotification()) // must start within 5s
+        Log.d(LOG_TAG, "Service created")
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        intent?.getStringExtra("VPN_DATA_B64")?.let { b64 ->
+            try {
+                val data = Base64.decode(b64, Base64.DEFAULT)
+                val json = String(data, Charsets.UTF_8)
+                val startVPNData = Gson().fromJson(json, StartVPNData::class.java)
+                this.layerMinus = null      //LayerMinus(startVPNData)
+
             } catch (e: Exception) {
-                Log.e("SocketServerService", "Failed to parse VPN data", e)
+                Log.e(LOG_TAG, "Failed to parse VPN data", e)
             }
         }
-
-        if (serverThread == null || !serverThread!!.isAlive) {
-            startSocketServer()
-        }
+        if (serverThread == null || !serverThread!!.isAlive) startSocketServer()
         return START_STICKY
     }
 
     private fun startSocketServer() {
         serverThread = Thread {
             try {
-                serverSocket = ServerSocket(8888, 50)
-                Log.d("SocketServer", "Server started on port 8888")
-
+                serverSocket = ServerSocket(8888, 256)
+                Log.d(LOG_TAG, "Server started on port 8888")
                 while (isRunning) {
                     val client = serverSocket?.accept() ?: break
-                    handleClient(client)
+                    val connId = connSeq.incrementAndGet()
+                    onConnOpen(connId)
+                    threadPoolExecutor.execute { handleClient(client, connId) }
                 }
-                serverSocket?.close()
             } catch (e: Exception) {
-                Log.e("SocketServer", "Server error", e)
+                Log.e(LOG_TAG, "Server error", e)
+            } finally {
+                try { serverSocket?.close() } catch (_: Exception) {}
             }
-        }
+        }.apply { isDaemon = true }
         serverThread?.start()
     }
 
-    override fun onCreate() {
-        super.onCreate()
-        createNotificationChannel()
-        startForeground(1, createNotification()) // REQUIRED WITHIN 5s
-        Log.d(LOG_TAG, "Service created")
+    override fun onDestroy() {
+        isRunning = false
+        try { serverSocket?.close() } catch (_: Exception) {}
+        serverThread?.interrupt()
+        super.onDestroy()
+        Log.d(LOG_TAG, "onDestroy called")
     }
 
-    private fun handleHttpProxy(client: Socket, requestLine: String?, reader: BufferedReader) {
-        Thread {
-            if (requestLine == null) {
-                Log.e(LOG_TAG, "Null request line")
-                client.close()
-                return@Thread
-            }
+    override fun onBind(intent: Intent?): IBinder? = null
 
-            try {
-                Log.d(LOG_TAG, "Request Line: $requestLine")
-
-                val headers = mutableListOf<String>()
-                var line: String?
-                while (reader.readLine().also { line = it } != null && line!!.isNotEmpty()) {
-                    headers.add(line!!)
-                }
-
-                val parts = requestLine.split(" ")
-
-                if (parts.size < 3) {
-                    Log.e(LOG_TAG, "Invalid request line")
-                    client.close()
-                    return@Thread
-                }
-
-                val method = parts[0]
-                val fullUrl = parts[1]
-                val httpVersion = parts[2]
-
-                val url = URL(fullUrl)
-
-                val host = url.host
-                val port = if (url.port != -1) url.port else 80
-                val path = url.file.ifEmpty { "/" }
-
-                Log.d(LOG_TAG, "Target: $host:$port$path")
-
-                var body: CharArray? = null
-                val contentLength = headers
-                    .find { it.startsWith("Content-Length", ignoreCase = true) }
-                    ?.split(":")?.getOrNull(1)?.trim()?.toIntOrNull() ?: 0
-
-                if (contentLength > 0) {
-                    body = CharArray(contentLength)
-                    reader.read(body)
-                }
-
-                var requestBody = "$method $path $httpVersion\r\n"
-
-                for (header in headers) {
-                    if (!header.startsWith("Proxy-", ignoreCase = true)) {
-                        requestBody += "$header\r\n"
-                    }
-                }
-
-                requestBody += "\r\n"
-
-                if (body != null) {
-                    requestBody += String(body!!)
-                }
-
-                val serverSocket: Socket?
-                if (layerMinus != null) {
-
-                    serverSocket = layerMinus?.connectToLayerMinus(host, port.toString(), requestBody.toByteArray(Charsets.UTF_8))
-                    if (serverSocket != null) {
-                        val serverInput = BufferedInputStream(serverSocket.getInputStream())
-                        val clientOutput = client.getOutputStream()
-                        forwardTraffic(serverInput, clientOutput)
-                    } else {
-                        client.close()
-                        return@Thread
-                    }
-                } else {
-                    serverSocket = try {
-                        Socket(host, port)
-                    } catch (e: Exception) {
-                        Log.e(LOG_TAG, "Failed to connect to $host:$port", e)
-                        client.close()
-                        return@Thread
-                    }
-
-                    val serverOutput = BufferedWriter(OutputStreamWriter(serverSocket.getOutputStream()))
-                    val serverInput = BufferedInputStream(serverSocket.getInputStream())
-                    val clientOutput = client.getOutputStream()
-
-                    // Rewrite request line (strip full URL)
-                    serverOutput.write(requestBody)
-                    serverOutput.flush()
-
-
-                    // Pipe the response back to client
-                    forwardTraffic(serverInput, clientOutput)
-                }
-
-            } catch (e: Exception) {
-                Log.e(LOG_TAG, "Error: ${e.message}", e)
-                try {
-                    client.close()
-                } catch (_: Exception) {}
-            }
-        }.start()
-    }
-
+    // ====== Helpers ======
     private fun readFirstChunkOrNull(ins: InputStream): ByteArray? {
         val buf = ByteArray(4096)
-        val n = try { ins.read(buf) } catch (e: Exception) { return null }
+        val n = try { ins.read(buf) } catch (_: Exception) { return null }
         return when {
-            n > 0  -> buf.copyOf(n)     // 首包
-            n == 0 -> ByteArray(0)      // 极少见，但允许空首包
-            else   -> null              // -1，立刻返回 null（不传首包）
+            n > 0  -> buf.copyOf(n)
+            n == 0 -> ByteArray(0)
+            else   -> null
         }
     }
 
-    private fun handleHttpsConnect(client: Socket, requestLine: String) {
-        Thread {
-            try {
-                val parts = requestLine.split(" ")
-                val target = parts[1]
-                val host = target.substringBefore(":")
-                val port = target.substringAfter(":").toIntOrNull() ?: 443
-
-
-                val clientWriter = BufferedWriter(OutputStreamWriter(client.getOutputStream()))
-                clientWriter.write("HTTP/1.1 200 Connection Established\r\n\r\n")
-                clientWriter.flush()
-
-                if (layerMinus != null) {
-                    val inputStream: InputStream = client.getInputStream()
-                    val firstData: ByteArray? = readFirstChunkOrNull(inputStream)
-                    Log.d(LOG_TAG, "rawBytes length = ${firstData?.size ?: 0}")
-                    val serverSocket = layerMinus?.connectToLayerMinus(host, port.toString(), firstData)
-
-
-
-
-
-                    if (serverSocket == null) {
-                        client.close()
-                        return@Thread
-                    }
-
-                    val serverInput = BufferedInputStream(serverSocket.getInputStream())
-
-
-                    val clientOutput = client.getOutputStream()
-                    forwardTraffic(serverInput, clientOutput)
-                    forwardTraffic(client.getInputStream(), serverSocket.getOutputStream())
-                } else {
-                    var targetSocket = try {
-                        Socket(host, port)
-                    } catch (e: Exception) {
-                        Log.e(LOG_TAG, "Failed to connect to $host:$port", e)
-                        client.close()
-                        return@Thread
-                    }
-
-
-                    forwardTraffic(client.getInputStream(), targetSocket.getOutputStream())
-                    forwardTraffic(targetSocket.getInputStream(), client.getOutputStream())
-                    Log.d(
-                        LOG_TAG,
-                        "Forwarding ${host}:${port} via Local CONNECTING"
-                    )
-                    }
-
-            } catch (e: Exception) {
-                Log.e(LOG_TAG, "HTTPS CONNECT failed", e)
-                client.close()
-                return@Thread
-            }
-        }.start()
+    private fun setSocketPerfOptions(a: Socket?, b: Socket?) {
+        try {
+            a?.tcpNoDelay = true
+            a?.sendBufferSize = 256 * 1024
+            a?.receiveBufferSize = 256 * 1024
+            a?.soTimeout = 500   // 500ms 读超时，用于触发 idle flush
+            b?.tcpNoDelay = true
+            b?.sendBufferSize = 256 * 1024
+            b?.receiveBufferSize = 256 * 1024
+            b?.soTimeout = 500
+        } catch (_: Exception) {}
     }
 
-    private fun handleSocks4(client: Socket, input: InputStream, output: OutputStream) {
-        Thread {
+    // ====== Client dispatcher ======
+    private fun handleClient(client: Socket, connId: Long) {
+        try {
+            val input  = BufferedInputStream(client.getInputStream())
+            val output = client.getOutputStream()
+            input.mark(4096)
             val version = input.read()
-            val command = input.read()
-            val port = (input.read() shl 8) or input.read()
-            val ip = ByteArray(4)
-            input.read(ip)
+            input.reset()
 
-            val userId = StringBuilder()
-            var b: Int
-            while (input.read().also { b = it } != 0 && b != -1) {
-                userId.append(b.toChar())
+            when (version) {
+                0x04 -> handleSocks4(client, input, output, connId)
+                0x05 -> handleSocks5(client, input, output, connId)
+                else -> {
+                    val reader = BufferedReader(InputStreamReader(input))
+                    val requestLine = reader.readLine()
+                    Log.d(LOG_TAG, "HTTP/s forwarding $requestLine")
+                    if (requestLine?.startsWith("CONNECT") == true) {
+                        handleHttpsConnect(client, requestLine, connId)
+                    } else {
+                        handleHttpProxy(client, requestLine, reader, connId)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(LOG_TAG, "Error handling client", e)
+            try { client.close() } catch (_: Exception) {}
+            onConnClose(connId)
+        }
+    }
+
+    // ====== HTTP (non-CONNECT) ======
+    private fun handleHttpProxy(client: Socket, requestLine: String?, reader: BufferedReader, connId: Long) {
+        if (requestLine == null) {
+            Log.e(LOG_TAG, "Null request line")
+            try { client.close() } catch (_: Exception) {}
+            onConnClose(connId); return
+        }
+
+        try {
+            val headers = mutableListOf<String>()
+            var line: String?
+            while (reader.readLine().also { line = it } != null && line!!.isNotEmpty()) {
+                headers.add(line!!)
             }
 
-            val isSocks4a =
-                ip[0].toInt() == 0 && ip[1].toInt() == 0 && ip[2].toInt() == 0 && ip[3].toInt() != 0
-            val destHost = if (isSocks4a) {
-                val sb = StringBuilder()
-                while (input.read().also { b = it } != 0 && b != -1) {
-                    sb.append(b.toChar())
+            val parts = requestLine.split(" ")
+            if (parts.size < 3) {
+                Log.e(LOG_TAG, "Invalid request line")
+                try { client.close() } catch (_: Exception) {}
+                onConnClose(connId); return
+            }
+            val method = parts[0]
+            val fullUrl = parts[1]
+            val httpVersion = parts[2]
+
+            val url = URL(fullUrl)
+            val host = url.host
+            val port = if (url.port != -1) url.port else 80
+            val path = url.file.ifEmpty { "/" }
+
+            // Body (if any)
+            var body: CharArray? = null
+            val contentLength = headers.find { it.startsWith("Content-Length", ignoreCase = true) }
+                ?.split(":")?.getOrNull(1)?.trim()?.toIntOrNull() ?: 0
+            if (contentLength > 0) {
+                body = CharArray(contentLength)
+                reader.read(body)
+            }
+
+            // Rewrite: full URL -> path (strip Proxy-* headers)
+            val sb = StringBuilder()
+            sb.append("$method $path $httpVersion\r\n")
+            for (h in headers) if (!h.startsWith("Proxy-", ignoreCase = true)) sb.append(h).append("\r\n")
+            sb.append("\r\n")
+            if (body != null) sb.append(String(body))
+            val requestBody = sb.toString() // == firstData for HTTP
+
+            val upstream: Socket? = if (layerMinus != null) {
+                // LayerMinus expects firstData packaged inside
+                layerMinus?.connectToLayerMinus(host, port.toString(), requestBody.toByteArray(Charsets.UTF_8))
+            } else {
+                try { Socket(host, port) } catch (e: Exception) {
+                    Log.e(LOG_TAG, "Failed to connect to $host:$port", e); null
                 }
+            }
+            if (upstream == null) {
+                try { client.close() } catch (_: Exception) {}
+                onConnClose(connId); return
+            }
+
+            setSocketPerfOptions(client, upstream)
+
+            // DIRECT must write firstData first, then start bidirectional pumps
+            if (layerMinus == null) {
+                BufferedWriter(OutputStreamWriter(upstream.getOutputStream())).apply {
+                    write(requestBody); flush()
+                }
+            }
+
+            val upIn  = BufferedInputStream(upstream.getInputStream(),   128 * 1024)
+            val upOut = BufferedOutputStream(upstream.getOutputStream(), 128 * 1024)
+            val cliIn  = BufferedInputStream(client.getInputStream(),    128 * 1024)
+            val cliOut = BufferedOutputStream(client.getOutputStream(),  128 * 1024)
+
+            val remaining = AtomicInteger(2)
+            val onBothDone = {
+                if (remaining.decrementAndGet() == 0) {
+                    try { cliOut.flush() } catch (_: Exception) {}
+                    try { upOut.flush() }  catch (_: Exception) {}
+                    try { upstream.close() } catch (_: Exception) {}
+                    try { client.close() }   catch (_: Exception) {}
+                    onConnClose(connId)
+                }
+            }
+            forwardTrafficAsync(upIn,  cliOut, onDone = onBothDone) // upstream -> client
+            forwardTrafficAsync(cliIn, upOut,  onDone = onBothDone) // client   -> upstream
+        } catch (e: Exception) {
+            Log.e(LOG_TAG, "HTTP proxy error", e)
+            try { client.close() } catch (_: Exception) {}
+            onConnClose(connId)
+        }
+    }
+
+    // ====== HTTPS (CONNECT) ======
+    private fun handleHttpsConnect(client: Socket, requestLine: String, connId: Long) {
+        try {
+            val parts = requestLine.split(" ")
+            val target = parts[1]
+            val host = target.substringBefore(":")
+            val port = target.substringAfter(":").toIntOrNull() ?: 443
+
+            // Tell client the tunnel is ready
+            BufferedWriter(OutputStreamWriter(client.getOutputStream())).apply {
+                write("HTTP/1.1 200 Connection Established\r\n\r\n")
+                flush()
+            }
+
+            // Read client's TLS ClientHello as firstData
+            val cliInStream: InputStream = client.getInputStream()
+            val firstData: ByteArray? = readFirstChunkOrNull(cliInStream)
+            Log.d(LOG_TAG, "CONNECT firstData length = ${firstData?.size ?: 0}")
+
+            val upstream: Socket? = if (layerMinus != null) {
+                layerMinus?.connectToLayerMinus(host, port.toString(), firstData)
+            } else {
+                try { Socket(host, port) } catch (_: Exception) { null }
+            }
+            if (upstream == null) {
+                try { client.close() } catch (_: Exception) {}
+                onConnClose(connId); return
+            }
+
+            setSocketPerfOptions(client, upstream)
+
+            val upIn   = BufferedInputStream(upstream.getInputStream(),   128 * 1024)
+            val upOutB = BufferedOutputStream(upstream.getOutputStream(), 128 * 1024)
+            val cliOut = BufferedOutputStream(client.getOutputStream(),   128 * 1024)
+
+            // DIRECT: push the captured firstData immediately so server can handshake
+            if (layerMinus == null && firstData != null && firstData.isNotEmpty()) {
+                try { upOutB.write(firstData); upOutB.flush() } catch (_: Exception) {}
+            }
+
+            val remaining = AtomicInteger(2)
+            val onBothDone = {
+                if (remaining.decrementAndGet() == 0) {
+                    try { cliOut.flush() } catch (_: Exception) {}
+                    try { upOutB.flush() } catch (_: Exception) {}
+                    try { upstream.close() } catch (_: Exception) {}
+                    try { client.close() }   catch (_: Exception) {}
+                    onConnClose(connId)
+                }
+            }
+            // Upstream -> Client：上游写完，通知客户端“我不再写了”
+            forwardTrafficAsync(
+                upIn, cliOut,
+                onDone = onBothDone,
+                onEof  = { try { client.shutdownOutput() } catch (_: Exception) {} }
+            )
+            // Client -> Upstream：客户端写完，通知上游“我不再写了”
+            forwardTrafficAsync(
+                cliInStream, upOutB,
+                onDone = onBothDone,
+                onEof  = { try { upstream.shutdownOutput() } catch (_: Exception) {} }
+            )
+
+            Log.d(LOG_TAG, "Forwarding $host:$port via CONNECT")
+        } catch (e: Exception) {
+            Log.e(LOG_TAG, "HTTPS CONNECT failed", e)
+            try { client.close() } catch (_: Exception) {}
+            onConnClose(connId)
+        }
+    }
+
+    // ====== SOCKS4 ======
+    // ====== SOCKS4 / SOCKS4a ======
+    private fun handleSocks4(client: Socket, input: InputStream, output: OutputStream, connId: Long) {
+        try {
+            // VER(0x04)
+            val ver = input.read()
+            if (ver != 0x04) {
+                // 非 SOCKS4：按失败 8 字节返回
+                try { output.write(byteArrayOf(0x00, 0x5b, 0,0, 0,0,0,0)); output.flush() } catch (_: Exception) {}
+                client.close(); onConnClose(connId); return
+            }
+
+            // CMD，仅支持 CONNECT(0x01)
+            val cmd = input.read()
+            if (cmd != 0x01) {
+                try { output.write(byteArrayOf(0x00, 0x5b, 0,0, 0,0,0,0)); output.flush() } catch (_: Exception) {}
+                client.close(); onConnClose(connId); return
+            }
+
+            // DSTPORT (network-order)
+            val port = (input.read() shl 8) or input.read()
+            // DSTIP
+            val ip = ByteArray(4); input.read(ip)
+
+            // USERID (NUL terminated)
+            while (input.read() != 0) { /* discard */ }
+
+            // SOCKS4a: ip=0.0.0.x 且 x!=0 时，后续还有域名（NUL 结尾）
+            val isSocks4a = (ip[0].toInt() == 0 && ip[1].toInt() == 0 && ip[2].toInt() == 0 && ip[3].toInt() != 0)
+            val destHostOrIp = if (isSocks4a) {
+                val sb = StringBuilder(); var b: Int
+                while (input.read().also { b = it } != 0 && b != -1) sb.append(b.toChar())
                 sb.toString()
             } else {
-                ip.joinToString(".") { (it.toInt() and 0xFF).toString() }
+                ip.joinToString(".") { (it.toInt() and 0xFF).toString() } // IPv4 字符串
             }
 
-            val response = byteArrayOf(0x00, 0x5a, 0, 0, 0, 0, 0, 0) // request granted
-            if (layerMinus != null) {
-                val inputStream: InputStream = client.getInputStream()
-                val firstData: ByteArray? = readFirstChunkOrNull(inputStream)
-                Log.d("handleHttpsConnect", "rawBytes length = ${firstData?.size ?: 0}")
-                val serverSocket =
-                    layerMinus?.connectToLayerMinus(destHost, port.toString(), firstData)
+            // —— 按 SOCKS4 规范：只允许 IPv4；强制解析到 IPv4，否则失败 8 字节 ——
+            val targetInet4: Inet4Address? = try {
+                val all = InetAddress.getAllByName(destHostOrIp)
+                all.firstOrNull { it is Inet4Address } as? Inet4Address
+            } catch (_: Exception) { null }
 
+            Log.d(LOG_TAG, "SOCKS4 req -> host=$destHostOrIp (v4=${targetInet4?.hostAddress}) port=$port")
 
+            if (targetInet4 == null) {
+                try { output.write(byteArrayOf(0x00, 0x5b, 0,0, 0,0,0,0)); output.flush() } catch (_: Exception) {}
+                client.close(); onConnClose(connId); return
+            }
 
-
-
-                if (serverSocket == null) {
-                    client.close()
-                    return@Thread
-                }
-
-                val serverInput = BufferedInputStream(serverSocket.getInputStream())
-                val clientOutput = client.getOutputStream()
-                forwardTraffic(serverInput, clientOutput)
-                forwardTraffic(client.getInputStream(), serverSocket.getOutputStream())
+            // —— 建立上游连接：直连用 IPv4 地址；LayerMinus 也传 IPv4 字符串 ——
+            val upstream: Socket? = if (layerMinus != null) {
+                layerMinus?.connectToLayerMinus(targetInet4.hostAddress, port.toString(), null)
             } else {
-                try {
-                    val target = Socket(destHost, port)
+                try { Socket(targetInet4, port) } catch (_: Exception) { null }
+            }
+            if (upstream == null) {
+                try { output.write(byteArrayOf(0x00, 0x5b, 0,0, 0,0,0,0)); output.flush() } catch (_: Exception) {}
+                client.close(); onConnClose(connId); return
+            }
 
-                    output.write(response)
-                    output.flush()
+            setSocketPerfOptions(client, upstream)
 
-                    forwardTraffic(input, target.getOutputStream())
-                    forwardTraffic(target.getInputStream(), output)
-                } catch (e: Exception) {
-                    Log.e(LOG_TAG, "Connection error", e)
-                    output.write(byteArrayOf(0x00, 0x5b)) // request rejected
-                    output.flush()
-                    client.close()
-                    return@Thread
+            // —— 0x5A 成功应答：回“代理端本地绑定的 IPv4 与端口” (BNDADDR/BNDPORT) ——
+            val bndPort = upstream.localPort
+            val bndAddrV4: ByteArray = (upstream.localAddress as? Inet4Address)?.address
+                ?: try {
+                    // 极端情形（local 为 v6），兜底给一个合法 IPv4（127.0.0.1）
+                    InetAddress.getByName("127.0.0.1").address
+                } catch (_: Exception) {
+                    byteArrayOf(127,0,0,1)
+                }
+
+            val granted = byteArrayOf(
+                0x00, 0x5a,
+                (bndPort shr 8).toByte(), (bndPort and 0xFF).toByte(),
+                bndAddrV4[0], bndAddrV4[1], bndAddrV4[2], bndAddrV4[3]
+            )
+            try {
+                Log.d(LOG_TAG, "SOCKS4 granted -> BND=${bndAddrV4[0].toInt() and 0xFF}.${bndAddrV4[1].toInt() and 0xFF}.${bndAddrV4[2].toInt() and 0xFF}.${bndAddrV4[3].toInt() and 0xFF}:$bndPort")
+                output.write(granted)
+                output.flush()
+            } catch (_: Exception) {}
+
+            // —— 双向转发：复用握手时的 input，避免预读首包丢失 ——
+            val upIn  = BufferedInputStream(upstream.getInputStream(),   128 * 1024)
+            val upOut = BufferedOutputStream(upstream.getOutputStream(), 128 * 1024)
+            val cliIn  = if (input is BufferedInputStream) input else BufferedInputStream(input, 128 * 1024)
+            val cliOut = BufferedOutputStream(output, 128 * 1024)
+
+            // 新：非阻塞 prime（仅在有“已到达数据”时立刻踢一下；否则不等待）
+            try {
+                val avail = try { cliIn.available() } catch (_: Exception) { 0 }
+                if (avail > 0) {
+                    val kick = ByteArray(minOf(avail, 16 * 1024))
+                    val n = cliIn.read(kick)
+                    if (n > 0) {
+                        upOut.write(kick, 0, n)
+                        upOut.flush()
+                        Log.d(LOG_TAG, "SOCKS4 prime(non-block) kick $n bytes")
+                    }
+                }
+            } catch (_: Exception) { /* 忽略 prime 异常 */ }
+
+            // 之后再启动双泵（保持你现有的 onEof→shutdownOutput、onDone 收尾）
+            val remaining = java.util.concurrent.atomic.AtomicInteger(2)
+            val onBothDone = {
+                if (remaining.decrementAndGet() == 0) {
+                    try { cliOut.flush() } catch (_: Exception) {}
+                    try { upOut.flush() }  catch (_: Exception) {}
+                    try { upstream.close() } catch (_: Exception) {}
+                    try { client.close() }   catch (_: Exception) {}
+                    onConnClose(connId)
                 }
             }
-        }.start()
 
+            // 上游 -> 客户端
+            forwardTrafficAsync(
+                upIn, cliOut,
+                onDone = onBothDone,
+                onEof  = { try { client.shutdownOutput() } catch (_: Exception) {} }
+            )
+            // 客户端 -> 上游：至少搬过 1B 才半关（防 prime-only 触发）
+            forwardTrafficAsync(
+                cliIn, upOut,
+                onDone = onBothDone,
+                onEof  = { try { upstream.shutdownOutput() } catch (_: Exception) {} },
+                minBytesBeforeEofCallback = 1
+            )
+        } catch (e: Exception) {
+            Log.e(LOG_TAG, "Error in handleSocks4", e)
+            try { client.close() } catch (_: Exception) {}
+            onConnClose(connId)
+        }
+    }
+
+
+    // ====== SOCKS5 (CONNECT + UDP ASSOCIATE) ======
+    private fun handleSocks5UdpAssociate(client: Socket, output: OutputStream) {
+        try {
+            val udpSocket = DatagramSocket(0)
+            val udpPort = udpSocket.localPort
+            val response = byteArrayOf(
+                0x05, 0x00, 0x00, 0x01,
+                0x00, 0x00, 0x00, 0x00,
+                (udpPort shr 8).toByte(), (udpPort and 0xFF).toByte()
+            )
+            output.write(response); output.flush()
+
+            threadPoolExecutor.execute {
+                val buffer = ByteArray(65507)
+                while (true) {
+                    try {
+                        val packet = DatagramPacket(buffer, buffer.size)
+                        udpSocket.receive(packet)
+
+                        val data = packet.data
+                        if (data[2].toInt() != 0) continue // no frag support
+
+                        val (_, _, payloadOffset) = parseUdpHeader(data)
+                        val payload = data.copyOfRange(payloadOffset, packet.length)
+
+                        // echo back for demo; real impl should send out and await resp
+                        val respData = wrapSocks5Udp(DatagramPacket(payload, payload.size, packet.socketAddress))
+                        val clientResp = DatagramPacket(respData, respData.size, packet.socketAddress)
+                        udpSocket.send(clientResp)
+                    } catch (_: Exception) {}
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(LOG_TAG, "UDP associate failed", e)
+            try { client.close() } catch (_: Exception) {}
+        }
     }
 
     private fun parseUdpHeader(data: ByteArray): Triple<String, Int, Int> {
-        var offset = 3 // skip RSV and FRAG
+        var offset = 3 // RSV(2)+FRAG
         val atyp = data[offset++].toInt()
         val destHost = when (atyp) {
-            0x01 -> { // IPv4
-                val ip = data.copyOfRange(offset, offset + 4).joinToString(".") { (it.toInt() and 0xFF).toString() }
-                offset += 4
-                ip
-            }
-            0x03 -> { // Domain
-                val len = data[offset++].toInt()
-                val domain = String(data.copyOfRange(offset, offset + len))
-                offset += len
-                domain
-            }
-//            0x04 -> { // IPv6 not support
-//                val ip = InetAddress.getByAddress(data.copyOfRange(offset, offset + 16)).hostAddress
-//                offset += 16
-//                ip
-//            }
+            0x01 -> { val ip = data.copyOfRange(offset, offset + 4).joinToString(".") { (it.toInt() and 0xFF).toString() }; offset += 4; ip }
+            0x03 -> { val len = data[offset++].toInt(); val domain = String(data.copyOfRange(offset, offset + len)); offset += len; domain }
             else -> "0.0.0.0"
         }
         val port = (data[offset++].toInt() shl 8) or (data[offset++].toInt() and 0xFF)
@@ -421,374 +617,152 @@ class SocketServerService : Service() {
         val addr = packet.address.address
         val port = packet.port
         val header = ByteArray(3 + 1 + addr.size + 2)
-        header[0] = 0x00 // RSV
-        header[1] = 0x00
-        header[2] = 0x00 // FRAG
-        header[3] = when (addr.size) {
-            4 -> 0x01.toByte() // IPv4
-            16 -> 0x04.toByte() // IPv6
-            else -> 0x01.toByte()
-        }
+        header[0] = 0x00; header[1] = 0x00; header[2] = 0x00
+        header[3] = if (addr.size == 16) 0x04 else 0x01
         System.arraycopy(addr, 0, header, 4, addr.size)
         header[4 + addr.size] = (port shr 8).toByte()
         header[5 + addr.size] = (port and 0xFF).toByte()
-
         return header + packet.data.copyOfRange(0, packet.length)
     }
 
-    private fun handleSocks5UdpAssociate(client: Socket, output: OutputStream) {
+    private fun handleSocks5(client: Socket, input: InputStream, output: OutputStream, connId: Long) {
         try {
-            val udpSocket = DatagramSocket(0)
-            val udpPort = udpSocket.localPort
-
-            // Respond to client with UDP bind info (0.0.0.0:udpPort)
-            val response = byteArrayOf(
-                0x05, 0x00, 0x00, 0x01, // VER, REP=OK, RSV, ATYP=IPv4
-                0x00, 0x00, 0x00, 0x00, // BND.ADDR = 0.0.0.0
-                (udpPort shr 8).toByte(), (udpPort and 0xFF).toByte()
-            )
-            output.write(response)
+            // Greeting
+            input.read() // VER
+            val nMethods = input.read()
+            val methods = ByteArray(nMethods); input.read(methods)
+            output.write(byteArrayOf(0x05, 0x00)) // no-auth
             output.flush()
 
-            Thread {
-                val buffer = ByteArray(65507)
-                while (true) {
-                    try {
-                        val packet = DatagramPacket(buffer, buffer.size)
-                        udpSocket.receive(packet)
+            // Request
+            input.read() // VER
+            val cmd = input.read()
+            input.read() // RSV
+            val atyp = input.read()
 
-                        val data = packet.data
-                        val frag = data[2].toInt()
-                        if (frag != 0) continue // we don't support fragmentation
+            val destHost = when (atyp) {
+                0x01 -> { val ip = ByteArray(4); input.read(ip); ip.joinToString(".") { (it.toInt() and 0xFF).toString() } }
+                0x03 -> { val len = input.read(); val domain = ByteArray(len); input.read(domain); String(domain) }
+                else -> { try { client.close() } catch (_: Exception) {}; onConnClose(connId); return }
+            }
+            val port = (input.read() shl 8) or input.read()
 
-                        val atyp = data[3].toInt()
-                        val (targetHost, targetPort, payloadOffset) = parseUdpHeader(data)
+            val okResp = byteArrayOf(0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0)
+            when (cmd) {
+                0x01 -> { // CONNECT
+                    output.write(okResp); output.flush()
+                    if (layerMinus != null) {
+                        // Try to capture firstData quickly (short timeout) to package to LM
+                        val bufferedInput = BufferedInputStream(input)
+                        bufferedInput.mark(8192)
+                        val peekBuf = ByteArray(4096)
+                        var firstPacketSize = 0
+                        client.soTimeout = 100
+                        try { firstPacketSize = bufferedInput.read(peekBuf) }
+                        catch (_: SocketTimeoutException) { firstPacketSize = 0 }
+                        finally { client.soTimeout = 0 }
+                        if (firstPacketSize > 0) bufferedInput.reset()
+                        val firstData = if (firstPacketSize > 0) {
+                            val data = ByteArray(firstPacketSize)
+                            bufferedInput.read(data); data
+                        } else null
 
-                        val payload = data.copyOfRange(payloadOffset, packet.length)
+                        val upstream = layerMinus?.connectToLayerMinus(destHost, port.toString(), firstData)
+                        if (upstream == null) {
+                            Log.e(LOG_TAG, "LayerMinus upstream failed $destHost:$port")
+                            try { client.close() } catch (_: Exception) {}
+                            onConnClose(connId); return
+                        }
 
-                        val targetAddr = InetSocketAddress(targetHost, targetPort)
-                        val forwardPacket = DatagramPacket(payload, payload.size, targetAddr)
-                        udpSocket.send(forwardPacket)
+                        setSocketPerfOptions(client, upstream)
 
-                        // Optional: Read response from target and send back to client (with SOCKS5 header)
-                        val responseBuf = ByteArray(65507)
-                        val responsePacket = DatagramPacket(responseBuf, responseBuf.size)
-                        udpSocket.receive(responsePacket)
+                        val upIn  = BufferedInputStream(upstream.getInputStream(),   128 * 1024)
+                        val upOut = BufferedOutputStream(upstream.getOutputStream(), 128 * 1024)
+                        val cliIn  = bufferedInput
+                        val cliOut = BufferedOutputStream(output,                   128 * 1024)
 
-                        val responseData = wrapSocks5Udp(responsePacket)
-                        val clientResponse = DatagramPacket(
-                            responseData, responseData.size, packet.socketAddress
+                        val remaining = AtomicInteger(2)
+                        val onBothDone = {
+                            if (remaining.decrementAndGet() == 0) {
+                                try { cliOut.flush() } catch (_: Exception) {}
+                                try { upOut.flush() }  catch (_: Exception) {}
+                                try { upstream.close() } catch (_: Exception) {}
+                                try { client.close() }   catch (_: Exception) {}
+                                onConnClose(connId)
+                            }
+                        }
+
+                        forwardTrafficAsync(
+                            upIn, cliOut,
+                            onDone = onBothDone,
+                            onEof  = { try { client.shutdownOutput() } catch (_: Exception) {} }
                         )
-                        udpSocket.send(clientResponse)
-                    } catch (_: Exception) {}
+                        forwardTrafficAsync(
+                            cliIn, upOut,
+                            onDone = onBothDone,
+                            onEof  = { try { upstream.shutdownOutput() } catch (_: Exception) {} }
+                        )
+
+                    } else {
+                        val target = try { Socket(destHost, port) } catch (_: Exception) { null }
+                        if (target == null) {
+                            try { client.close() } catch (_: Exception) {}
+                            onConnClose(connId); return
+                        }
+
+                        setSocketPerfOptions(client, target)
+
+                        val upIn  = BufferedInputStream(target.getInputStream(),   128 * 1024)
+                        val upOut = BufferedOutputStream(target.getOutputStream(), 128 * 1024)
+                        val cliIn  = BufferedInputStream(input,                  128 * 1024)
+                        val cliOut = BufferedOutputStream(output,                 128 * 1024)
+
+                        val remaining = AtomicInteger(2)
+                        val onBothDone = {
+                            if (remaining.decrementAndGet() == 0) {
+                                try { cliOut.flush() } catch (_: Exception) {}
+                                try { upOut.flush() }  catch (_: Exception) {}
+                                try { target.close() }  catch (_: Exception) {}
+                                try { client.close() }  catch (_: Exception) {}
+                                onConnClose(connId)
+                            }
+                        }
+                        forwardTrafficAsync(
+                            upIn, cliOut,
+                            onDone = onBothDone,
+                            onEof  = { try { client.shutdownOutput() } catch (_: Exception) {} }
+                        )
+                        forwardTrafficAsync(
+                            cliIn, upOut,
+                            onDone = onBothDone,
+                            onEof  = { try { target.shutdownOutput() } catch (_: Exception) {} }
+                        )
+                    }
                 }
-            }.start()
+                0x03 -> { // UDP ASSOCIATE
+                    handleSocks5UdpAssociate(client, output)
+                    // Close will be logged when client disconnects; not handled here
+                }
+                else -> {
+                    output.write(byteArrayOf(0x05, 0x07)) // Command not supported
+                    output.flush()
+                    try { client.close() } catch (_: Exception) {}
+                    onConnClose(connId)
+                }
+            }
         } catch (e: Exception) {
-            Log.e(LOG_TAG, "UDP associate failed", e)
-            client.close()
+            Log.e(LOG_TAG, "Error in handleSocks5", e)
+            try { client.close() } catch (_: Exception) {}
+            onConnClose(connId)
         }
     }
 
-    private fun handleSocks5(client: Socket, input: InputStream, output: OutputStream) {
-        Thread {
-            try {
-                // Authentication phase
-                input.read() // version
-                val nMethods = input.read()
-                val methods = ByteArray(nMethods)
-                input.read(methods)
-
-                // Respond with no auth
-                output.write(byteArrayOf(0x05, 0x00))
-                output.flush()
-
-                // Request phase
-                val version = input.read()
-                val cmd = input.read()
-                input.read() // RSV
-                val atyp = input.read()
-
-                val destHost = when (atyp) {
-                    0x01 -> { // IPv4
-                        val ip = ByteArray(4)
-                        input.read(ip)
-                        ip.joinToString(".") { (it.toInt() and 0xFF).toString() }
-                    }
-                    0x03 -> { // Domain name
-                        val len = input.read()
-                        val domain = ByteArray(len)
-                        input.read(domain)
-                        String(domain)
-                    }
-                    else -> {
-                        client.close()
-                        return@Thread
-                    }
-                }
-
-                val port = (input.read() shl 8) or input.read()
-
-                when (cmd) {
-                    0x01 -> { // CONNECT
-                        if (layerMinus != null) {
-                            // Send success response immediately
-                            val response = byteArrayOf(
-                                0x05, 0x00, 0x00, 0x01, // VER, REP=success, RSV, ATYP=IPv4
-                                0x00, 0x00, 0x00, 0x00, // BND.ADDR (dummy)
-                                0x00, 0x00              // BND.PORT (dummy)
-                            )
-                            output.write(response)
-                            output.flush()
-
-                            // Handle the connection
-                            var remoteSocket: Socket? = null
-                            var firstPacketProcessed = false
-
-                            try {
-                                // Use mark/reset to peek at incoming data
-                                val bufferedInput = BufferedInputStream(input)
-                                bufferedInput.mark(8192)
-
-                                // Try to read first packet (non-blocking check)
-                                val firstBuffer = ByteArray(4096)
-                                var firstPacketSize = 0
-
-                                // Set a short timeout for first packet
-                                client.soTimeout = 100 // 100ms timeout
-                                try {
-                                    firstPacketSize = bufferedInput.read(firstBuffer)
-                                } catch (e: java.net.SocketTimeoutException) {
-                                    // No immediate data, that's ok
-                                    firstPacketSize = 0
-                                } finally {
-                                    client.soTimeout = 0 // Reset to blocking
-                                }
-
-                                // Reset to read again properly
-                                if (firstPacketSize > 0) {
-                                    bufferedInput.reset()
-                                }
-
-                                // Establish upstream connection
-                                val firstData = if (firstPacketSize > 0) {
-                                    val data = ByteArray(firstPacketSize)
-                                    bufferedInput.read(data)
-                                    firstPacketProcessed = true
-                                    Log.d(LOG_TAG, "First packet for $destHost:$port - $firstPacketSize bytes")
-                                    data
-                                } else {
-                                    Log.d(LOG_TAG, "No immediate data for $destHost:$port")
-                                    null
-                                }
-
-                                remoteSocket = layerMinus?.connectToLayerMinus(
-                                    destHost,
-                                    port.toString(),
-                                    firstData
-                                )
-
-                                if (remoteSocket == null) {
-                                    Log.e(LOG_TAG, "Failed to establish upstream connection to $destHost:$port")
-                                    // Send connection refused
-                                    val errorResponse = byteArrayOf(
-                                        0x05, 0x05, 0x00, 0x01, // VER, REP=connection refused
-                                        0x00, 0x00, 0x00, 0x00,
-                                        0x00, 0x00
-                                    )
-                                    output.write(errorResponse)
-                                    output.flush()
-                                    client.close()
-                                    return@Thread
-                                }
-
-                                Log.d(LOG_TAG, "Upstream established for $destHost:$port")
-
-                                // Start bidirectional forwarding
-                                val remoteIn = BufferedInputStream(remoteSocket.getInputStream())
-                                val remoteOut = BufferedOutputStream(remoteSocket.getOutputStream())
-                                val clientIn = bufferedInput
-                                val clientOut = BufferedOutputStream(output)
-
-                                // Remote -> Client forwarding thread
-                                val remoteToClient = Thread {
-                                    try {
-                                        val buffer = ByteArray(8192)
-                                        while (true) {
-                                            val n = remoteIn.read(buffer)
-                                            if (n == -1) break
-                                            clientOut.write(buffer, 0, n)
-                                            clientOut.flush()
-                                        }
-                                    } catch (e: Exception) {
-                                        Log.d(LOG_TAG, "Remote->Client ended: ${e.message}")
-                                    } finally {
-                                        try { client.shutdownOutput() } catch (_: Exception) {}
-                                    }
-                                }
-
-                                // Client -> Remote forwarding (main thread)
-                                val clientToRemote = Thread {
-                                    try {
-                                        val buffer = ByteArray(8192)
-                                        while (true) {
-                                            val n = clientIn.read(buffer)
-                                            if (n == -1) break
-                                            remoteOut.write(buffer, 0, n)
-                                            remoteOut.flush()
-                                        }
-                                    } catch (e: Exception) {
-                                        Log.d(LOG_TAG, "Client->Remote ended: ${e.message}")
-                                    } finally {
-                                        try { remoteSocket.shutdownOutput() } catch (_: Exception) {}
-                                    }
-                                }
-
-                                remoteToClient.start()
-                                clientToRemote.start()
-
-                                // Wait for both threads to complete
-                                remoteToClient.join()
-                                clientToRemote.join()
-
-                            } catch (e: Exception) {
-                                Log.e(LOG_TAG, "Error in SOCKS5 CONNECT handling", e)
-                            } finally {
-                                remoteSocket?.close()
-                                client.close()
-                            }
-
-                        } else {
-                            // Direct connection mode
-                            try {
-                                val target = Socket(destHost, port)
-
-                                val response = byteArrayOf(
-                                    0x05, 0x00, 0x00, 0x01,
-                                    0x00, 0x00, 0x00, 0x00,
-                                    0x00, 0x00
-                                )
-                                output.write(response)
-                                output.flush()
-
-                                // Start bidirectional forwarding
-                                forwardTraffic(input, target.getOutputStream())
-                                forwardTraffic(target.getInputStream(), output)
-                            } catch (e: Exception) {
-                                Log.e(LOG_TAG, "Direct connection failed", e)
-                                val errorResponse = byteArrayOf(
-                                    0x05, 0x05, 0x00, 0x01,
-                                    0x00, 0x00, 0x00, 0x00,
-                                    0x00, 0x00
-                                )
-                                output.write(errorResponse)
-                                output.flush()
-                                client.close()
-                            }
-                        }
-                    }
-
-                    0x03 -> { // UDP ASSOCIATE
-                        handleSocks5UdpAssociate(client, output)
-                    }
-
-                    else -> {
-                        output.write(byteArrayOf(0x05, 0x07)) // Command not supported
-                        output.flush()
-                        client.close()
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(LOG_TAG, "Error in handleSocks5", e)
-                try {
-                    client.close()
-                } catch (_: Exception) {}
-            }
-        }.start()
-    }
-
-    private enum class ProtocolType {
-        TLS, HTTP, UNKNOWN
-    }
-    private data class ProtocolInfo(val type: ProtocolType, val details: String = "")
-    private fun detectProtocol(data: ByteArray, port: Int): ProtocolInfo {
-        // TLS 检测
-        if (data.size >= 3 && data[0] == 0x16.toByte() && data[1] == 0x03.toByte()) {
-            return ProtocolInfo(ProtocolType.TLS, "TLS ClientHello")
-        }
-
-        // HTTP 检测
-        val httpMethods = listOf("GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "CONNECT ", "PATCH ", "TRACE ")
-        if (data.size >= 4) {
-            val header = String(data.take(16).toByteArray(), Charsets.UTF_8)
-            for (method in httpMethods) {
-                if (header.startsWith(method)) {
-                    return ProtocolInfo(ProtocolType.HTTP, method.trim())
-                }
-            }
-        }
-
-        // 根据端口推断
-        return when (port) {
-            443, 8443 -> ProtocolInfo(ProtocolType.TLS, "Assumed by port")
-            80, 8080 -> ProtocolInfo(ProtocolType.HTTP, "Assumed by port")
-            else -> ProtocolInfo(ProtocolType.UNKNOWN)
-        }
-    }
-    private fun rewriteHttpRequest(data: ByteArray, host: String, port: Int): ByteArray {
-        // 如果 LayerMinus 需要特殊的 HTTP 请求格式，在这里重写
-        // 目前看起来 LayerMinus 接受原始请求，所以可能不需要重写
-        return data
-    }
-
-    private fun handleClient(client: Socket) {
-        Thread {
-            try {
-                val input = BufferedInputStream(client.getInputStream())
-                val output = client.getOutputStream()
-                input.mark(4096)
-                val version = input.read()
-                input.reset()
-
-                when (version) {
-                    0x04 -> handleSocks4(client, input, output)
-                    0x05 -> handleSocks5(client, input, output)
-                    else -> {
-                        val reader = BufferedReader(InputStreamReader(input))
-                        var requestLine = reader.readLine()
-                        Log.d(LOG_TAG, "HTTP/s forwarding ${requestLine}")
-                        if (requestLine?.startsWith("CONNECT") == true) {
-                            handleHttpsConnect(client, requestLine)
-                        } else {
-                            handleHttpProxy(client, requestLine, reader)
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(LOG_TAG, "Error handling client", e)
-                try {
-                    client.close()
-                } catch (_: Exception) {}
-            }
-        }.start()
-    }
-
-
-
-    override fun onDestroy() {
-        isRunning = false
-        serverThread?.interrupt()
-        super.onDestroy()
-        serverSocket?.close()
-        Log.d(LOG_TAG, "onDestroy called")
-    }
-
-    override fun onBind(intent: Intent?): IBinder? = null
-
+    // ====== Notification ======
     private fun createNotification(): Notification {
         return Notification.Builder(this, "SocketChannel")
             .setContentTitle("Socket Server Running")
-            .setContentText("Listening on port 9000")
-            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setContentText("Listening on port 8888")
+            .setSmallIcon(R.drawable.stat_notify_sync)
             .build()
     }
 
@@ -803,6 +777,4 @@ class SocketServerService : Service() {
             manager?.createNotificationChannel(serviceChannel)
         }
     }
-
-
 }
