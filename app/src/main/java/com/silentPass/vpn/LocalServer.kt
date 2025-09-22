@@ -31,8 +31,8 @@ class SocketServerService : Service() {
     // ====== ThreadPool (avoid per-conn thread explosion) ======
     private val threadCounter = AtomicInteger(0)
     private val threadPoolExecutor = ThreadPoolExecutor(
-        10, 200, 60L, TimeUnit.SECONDS,
-        SynchronousQueue<Runnable>(),
+        50, 500, 30L, TimeUnit.SECONDS,
+        LinkedBlockingQueue<Runnable>(100),
         ThreadFactory { r ->
             Thread(r).apply {
                 name = "ProxyWorker-${threadCounter.incrementAndGet()}"
@@ -41,7 +41,10 @@ class SocketServerService : Service() {
             }
         },
         ThreadPoolExecutor.CallerRunsPolicy()
-    )
+    ).apply {
+        // 核心线程也允许在空闲 keepAlive 后回收：高峰过后自动收缩
+        allowCoreThreadTimeOut(true)
+    }
 
     // ====== Event-style metrics (print only on connection OPEN/CLOSE) ======
     private val activeConns = AtomicInteger(0)
@@ -249,7 +252,7 @@ class SocketServerService : Service() {
                     val requestLine = reader.readLine()
                     Log.d(LOG_TAG, "HTTP/s forwarding $requestLine")
                     if (requestLine?.startsWith("CONNECT") == true) {
-                        handleHttpsConnect(client, requestLine, connId)
+                        handleHttpsConnect(client, input, requestLine, connId)
                     } else {
                         handleHttpProxy(client, requestLine, reader, connId)
                     }
@@ -323,7 +326,8 @@ class SocketServerService : Service() {
             }
 
             setSocketPerfOptions(client, upstream)
-
+            // 仅 SOCKS4/4a：上游首包可能慢半拍，放宽读超时，减少首个响应被“早判超时”带来的抖动
+            try { upstream.soTimeout = 300 } catch (_: Exception) {}
             // DIRECT must write firstData first, then start bidirectional pumps
             if (layerMinus == null) {
                 BufferedWriter(OutputStreamWriter(upstream.getOutputStream())).apply {
@@ -356,7 +360,7 @@ class SocketServerService : Service() {
     }
 
     // ====== HTTPS (CONNECT) ======
-    private fun handleHttpsConnect(client: Socket, requestLine: String, connId: Long) {
+    private fun handleHttpsConnect(client: Socket, input: BufferedInputStream, requestLine: String, connId: Long) {
         try {
             val parts = requestLine.split(" ")
             val target = parts[1]
@@ -369,10 +373,44 @@ class SocketServerService : Service() {
                 flush()
             }
 
-            // Read client's TLS ClientHello as firstData
-            val cliInStream: InputStream = client.getInputStream()
-            val firstData: ByteArray? = readFirstChunkOrNull(cliInStream)
+            // —— 微等待 prime：最多 10ms，不阻塞更久；把“已经到达”的小碎片尽量合并到 16KiB ——
+            // 仍然复用同一个 BufferedInputStream（input）
+
+            val PRIME_BUDGET_MS = 15         // 可调：0~10ms；0=完全非阻塞
+            val PRIME_MAX_BYTES = 16 * 1024  // 合并上限
+
+
+            val firstData: ByteArray? = run {
+                val prev = client.soTimeout
+                var total = 0
+                val buf = ByteArray(PRIME_MAX_BYTES)
+                try {
+                    client.soTimeout = PRIME_BUDGET_MS
+                    while (total < PRIME_MAX_BYTES) {
+                        val n = try {
+                            input.read(buf, total, PRIME_MAX_BYTES - total)
+                        } catch (_: java.net.SocketTimeoutException) {
+                            // 超过预算就退出，不再等待
+                            break
+                        }
+                        if (n <= 0) break
+                        total += n
+                        // 若当前可读窗口已清空，就不再多读，避免额外等待
+                        if (input.available() == 0) break
+                    }
+                } catch (_: Exception) {
+                    // 忽略 prime 异常
+                } finally {
+                    try { client.soTimeout = prev } catch (_: Exception) {}
+                }
+                if (total > 0) buf.copyOf(total) else null
+            }
+
+
+
+
             Log.d(LOG_TAG, "CONNECT firstData length = ${firstData?.size ?: 0}")
+
 
             val upstream: Socket? = if (layerMinus != null) {
                 layerMinus?.connectToLayerMinus(host, port.toString(), firstData)
@@ -383,19 +421,21 @@ class SocketServerService : Service() {
                 try { client.close() } catch (_: Exception) {}
                 onConnClose(connId); return
             }
-
             setSocketPerfOptions(client, upstream)
+            try { upstream.soTimeout = 300 } catch (_: Exception) {} // 仅 CONNECT 放宽
 
             val upIn   = BufferedInputStream(upstream.getInputStream(),   128 * 1024)
             val upOutB = BufferedOutputStream(upstream.getOutputStream(), 128 * 1024)
             val cliOut = BufferedOutputStream(client.getOutputStream(),   128 * 1024)
+            val cliIn  = input // ✅ 继续复用同一个 BufferedInputStream，避免预读丢失
 
-            // DIRECT: push the captured firstData immediately so server can handshake
+            // DIRECT：如果 prime 抓到了首包，先送一脚
             if (layerMinus == null && firstData != null && firstData.isNotEmpty()) {
                 try { upOutB.write(firstData); upOutB.flush() } catch (_: Exception) {}
             }
 
-            val remaining = AtomicInteger(2)
+            // 启动双泵（维持你已有的半关闭保护）
+            val remaining = java.util.concurrent.atomic.AtomicInteger(2)
             val onBothDone = {
                 if (remaining.decrementAndGet() == 0) {
                     try { cliOut.flush() } catch (_: Exception) {}
@@ -405,17 +445,16 @@ class SocketServerService : Service() {
                     onConnClose(connId)
                 }
             }
-            // Upstream -> Client：上游写完，通知客户端“我不再写了”
             forwardTrafficAsync(
                 upIn, cliOut,
                 onDone = onBothDone,
                 onEof  = { try { client.shutdownOutput() } catch (_: Exception) {} }
             )
-            // Client -> Upstream：客户端写完，通知上游“我不再写了”
             forwardTrafficAsync(
-                cliInStream, upOutB,
+                cliIn, upOutB,
                 onDone = onBothDone,
-                onEof  = { try { upstream.shutdownOutput() } catch (_: Exception) {} }
+                onEof  = { try { upstream.shutdownOutput() } catch (_: Exception) {} },
+                minBytesBeforeEofCallback = 1 // 防 0B EOF 误半关
             )
 
             Log.d(LOG_TAG, "Forwarding $host:$port via CONNECT")
