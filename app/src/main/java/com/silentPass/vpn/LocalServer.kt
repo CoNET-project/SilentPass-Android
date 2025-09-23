@@ -66,6 +66,9 @@ class SocketServerService : Service() {
         prestartAllCoreThreads() // 预热核心线程，降低冷启动抖动
     }
 
+	// —— 大流提档的全局并发上限，避免系统内存/FD 压力过大 ——
+	private val boostedGlobal = AtomicInteger(0)
+
     // 自适应微等待 prime：每轮最多阻塞 stepMs（默认5ms），若没数据则再等一轮，最多 maxRounds 轮；合并到 maxBytes（默认16KiB）
     private fun capturePrimeAdaptive(
         cliIn: BufferedInputStream,
@@ -201,8 +204,10 @@ class SocketServerService : Service() {
 				val buf = java.nio.ByteBuffer.allocateDirect(bufferSize)
 				var totalBytes = 0L
 				var sinceLastFlush = 0L
-				val WARMUP_LIMIT = 64 * 1024
-				val FLUSH_THRESHOLD = 64 * 1024
+                val WARMUP_LIMIT = 64 * 1024
+                val FLUSH_THRESHOLD = 256 * 1024   // 提升批量阈值，减少碎片写
+                var lastFlushNs = System.nanoTime()
+
 				while (true) {
 					val nRead = try { src.read(buf) }
 					catch (_: SocketTimeoutException) {
@@ -237,12 +242,17 @@ class SocketServerService : Service() {
 						sinceLastFlush += wroteThisChunk
 						val inWarmup = totalBytes <= WARMUP_LIMIT
 						val tinyChunk = wroteThisChunk in 1 until 32 * 1024
-						if (inWarmup || sinceLastFlush >= FLUSH_THRESHOLD || tinyChunk) {
+
+                        // 新增时间门槛：>8ms 再 flush，可显著降低碎片写开销
+                        val timeDue = (System.nanoTime() - lastFlushNs) >= 8_000_000L
+                        if (inWarmup || sinceLastFlush >= FLUSH_THRESHOLD || tinyChunk || timeDue) {
 							try { output.flush() } catch (_: Exception) {}
 							sinceLastFlush = 0
+							lastFlushNs = System.nanoTime()
 						}
 					}
 				}
+
 			} catch (e: Exception) {
 				Log.e(LOG_TAG, "Error forwarding traffic (fallback NIO)", e)
 			} finally {
@@ -269,6 +279,7 @@ class SocketServerService : Service() {
 	): Future<*> {
 		return threadPoolExecutor.submit {
 			var selector: Selector? = null
+			var boostedLocal = false
 			try {
 				clientCh.configureBlocking(false)
 				upstreamCh.configureBlocking(false)
@@ -276,15 +287,111 @@ class SocketServerService : Service() {
 				val cKey = clientCh.register(selector, SelectionKey.OP_READ)
 				val uKey = upstreamCh.register(selector, SelectionKey.OP_READ)
 
-				val c2u = java.nio.ByteBuffer.allocateDirect(bufSize)
-				val u2c = java.nio.ByteBuffer.allocateDirect(bufSize)
+				// —— 自适应：热点大流按需把 DirectBuffer 从 128KiB 涨到 256/512KiB ——
+                var c2u = java.nio.ByteBuffer.allocateDirect(bufSize)
+                var u2c = java.nio.ByteBuffer.allocateDirect(bufSize)
+
 				var cClosed = false
 				var uClosed = false
 				var c2uBytes = 0L
 				var u2cBytes = 0L
 
+                var boostedC2U = false     // 已为 c2u 方向提档
+                var boostedU2C = false     // 已为 u2c 方向提档
+
 				var clientWriteClosed = false
 				var upstreamWriteClosed = false
+
+
+				var c2uStall = 0
+                var u2cStall = 0
+
+				// 记录初始 OS 缓冲，便于回收
+                val cliSock = clientCh.socket()
+                val upSock  = upstreamCh.socket()
+                val initCliRcv = cliSock.receiveBufferSize
+                val initCliSnd = cliSock.sendBufferSize
+                val initUpRcv  = upSock.receiveBufferSize
+                val initUpSnd  = upSock.sendBufferSize
+
+                // 提档与回收的时间 & 窗口统计
+                var c2uBoostNs = 0L
+                var u2cBoostNs = 0L
+                var lastCheckNs = System.nanoTime()
+                var lastC2UBytesCheck = 0L
+                var lastU2CBytesCheck = 0L
+			    
+
+                fun grow(buf: java.nio.ByteBuffer, newCap: Int): java.nio.ByteBuffer {
+                    val nb = java.nio.ByteBuffer.allocateDirect(newCap)
+                    buf.flip(); nb.put(buf); return nb
+                }
+
+                fun maybeBoostKernelBuffers() {
+                    // 方向性提档：最多对本连接执行一次全局计数（boostedLocal）
+                    val cap = 2 * 1024 * 1024
+                    if (boostedGlobal.get() >= 48) return
+                   // 上行（client -> upstream）大流：放大 client.recv & upstream.send
+                    if (!boostedC2U && c2uBytes >= 256*1024) {
+                        runCatching {
+                            cliSock.receiveBufferSize = cap
+                            upSock.sendBufferSize     = cap
+                        }
+                        boostedC2U = true
+						c2uBoostNs = System.nanoTime()
+                        if (!boostedLocal) { boostedLocal = true; boostedGlobal.incrementAndGet() }
+                        Log.d(LOG_TAG, "Kernel buffers boosted (c2u) to 1MiB for this flow")
+                    }
+                    // 下行（upstream -> client）大流：放大 upstream.recv & client.send
+                    if (!boostedU2C && u2cBytes >= 256*1024) {
+                        runCatching {
+                            upSock.receiveBufferSize = cap
+                            cliSock.sendBufferSize   = cap
+                        }
+                        boostedU2C = true
+						u2cBoostNs = System.nanoTime()
+                        if (!boostedLocal) { boostedLocal = true; boostedGlobal.incrementAndGet() }
+                        Log.d(LOG_TAG, "Kernel buffers boosted (u2c) to 1MiB for this flow")
+                    }
+                }
+
+				// —— 安静时回收（方向性降级）：5s 窗口内该方向增量 <64KiB，且距提档 ≥30s，且无待写 → 收回到初始值
+                fun maybeShrinkKernelBuffers(cKey: SelectionKey, uKey: SelectionKey) {
+                    val now = System.nanoTime()
+                    val CHECK_INTERVAL_NS = 5_000_000_000L     // 5s
+                    val HOLD_NS           = 30_000_000_000L    // 30s
+                    val QUIET_DELTA       = 64 * 1024          // 64KiB
+                    if (now - lastCheckNs < CHECK_INTERVAL_NS) return
+                    val dC2U = c2uBytes - lastC2UBytesCheck
+                    val dU2C = u2cBytes - lastU2CBytesCheck
+
+                    // c2u 方向回收条件：已提档 + 持有≥30s + 近窗增量小 + 本地缓冲空 + 未挂 OP_WRITE
+                    if (boostedC2U && now - c2uBoostNs >= HOLD_NS &&
+                        dC2U < QUIET_DELTA && c2u.position() == 0 &&
+                        (uKey.interestOps() and SelectionKey.OP_WRITE) == 0) {
+                        runCatching {
+                            cliSock.receiveBufferSize = initCliRcv
+                            upSock.sendBufferSize     = initUpSnd
+                        }
+                        boostedC2U = false
+                        Log.d(LOG_TAG, "Kernel buffers shrunk (c2u) to initial")
+                    }
+                    // u2c 方向回收条件
+                    if (boostedU2C && now - u2cBoostNs >= HOLD_NS &&
+                        dU2C < QUIET_DELTA && u2c.position() == 0 &&
+                        (cKey.interestOps() and SelectionKey.OP_WRITE) == 0) {
+                        runCatching {
+                            upSock.receiveBufferSize = initUpRcv
+                            cliSock.sendBufferSize   = initCliSnd
+                        }
+                        boostedU2C = false
+                        Log.d(LOG_TAG, "Kernel buffers shrunk (u2c) to initial")
+                    }
+                    lastCheckNs = now
+                    lastC2UBytesCheck = c2uBytes
+                    lastU2CBytesCheck = u2cBytes
+                }
+
 
 				fun keyOpen(ch: SocketChannel?, key: SelectionKey?): Boolean =
 					(ch != null && ch.isOpen && key != null && key.isValid)
@@ -306,6 +413,8 @@ class SocketServerService : Service() {
 							if (n == 0) {
 								uKey.interestOps(uKey.interestOps() or SelectionKey.OP_WRITE)
 								cKey.interestOps(cKey.interestOps() and SelectionKey.OP_READ.inv())
+								// 避免首包注入被一个 select 周期延
+								try { selector?.wakeup() } catch (_: Exception) {}
 								break
 							}
 							c2uBytes += n
@@ -319,9 +428,17 @@ class SocketServerService : Service() {
 					if (!c2u.hasRemaining()) { c2u.clear() } else { c2u.compact() }
 				}
 
-				val SELECT_TIMEOUT = 500L
+				val SELECT_TIMEOUT = 50L
 				loop@ while (true) {
 					selector.select(SELECT_TIMEOUT)
+
+					if (c2uStall >= 2 && c2u.capacity() < 512*1024) { c2u = grow(c2u, minOf(c2u.capacity()*2, 512*1024)); c2uStall = 0 }
+				    if (u2cStall >= 2 && u2c.capacity() < 512*1024) { u2c = grow(u2c, minOf(u2c.capacity()*2, 512*1024)); u2cStall = 0 }
+                    // —— 提升 / 回收：只做轻量判断，不阻塞
+					maybeBoostKernelBuffers()
+                    maybeShrinkKernelBuffers(cKey, uKey)
+                    
+
 					val it = selector.selectedKeys().iterator()
 					while (it.hasNext()) {
 						val key = it.next(); it.remove()
@@ -344,8 +461,9 @@ class SocketServerService : Service() {
 												}
 											} else if (n > 0) {
 												c2uBytes += n
-												// 触发上游可写
+										        // 触发上游可写 + 立刻唤醒，避免白等一个 select 周期
 												uKey.interestOps(uKey.interestOps() or SelectionKey.OP_WRITE)
+										        try { selector?.wakeup() } catch (_: Exception) {}
 											}
 										} catch (_: java.nio.channels.ClosedChannelException) {
 											Log.d(LOG_TAG, "Selector: client closed on read")
@@ -364,22 +482,40 @@ class SocketServerService : Service() {
 												// 保留一次 OP_WRITE，暂停上游读，等待可写
 												key.interestOps(key.interestOps() or SelectionKey.OP_WRITE)
 												uKey.interestOps(uKey.interestOps() and SelectionKey.OP_READ.inv())
+												// 立刻唤醒，减少等待
+                                               try { selector?.wakeup() } catch (_: Exception) {}
+												u2cStall++
 												break
                                             }
                                         }
                                         u2c.compact()
+
+										if (u2cStall >= 2 && u2c.capacity() < 512*1024) {
+                                            u2c = grow(u2c, kotlin.math.min(u2c.capacity()*2, 512*1024))
+                                            u2cStall = 0
+                                            Log.i(LOG_TAG, "Grow u2c buffer to ${u2c.capacity()} bytes")
+                                        }
+
+
                                         if (u2c.position() == 0) {
                                             key.interestOps(key.interestOps() and SelectionKey.OP_WRITE.inv())
                                             // 读上游可恢复
                                             uKey.interestOps(uKey.interestOps() or SelectionKey.OP_READ)
+											u2cStall = 0
                                         }
-                                    } catch (_: java.nio.channels.ClosedChannelException) {
-                                        Log.d(LOG_TAG, "Selector: client closed on write")
-                                        clientWriteClosed = true
-                                        cancelKeyQuiet(cKey)
-                                        u2c.clear()
-                                    } catch (_: java.nio.channels.CancelledKeyException) {
-                                        clientWriteClosed = true
+                                    } catch (e: Exception) {
+                                        when (e) {
+                                            is java.nio.channels.ClosedChannelException,
+                                            is java.nio.channels.CancelledKeyException,
+                                            is java.nio.channels.AsynchronousCloseException -> {
+                                                // 正常关闭竞态：降级为 DEBUG，取消 key 并清理缓冲，不再抛出
+                                                Log.d(LOG_TAG, "Selector(client): write side closed (${e::class.simpleName})")
+                                                clientWriteClosed = true
+                                                cancelKeyQuiet(cKey)
+                                                u2c.clear()
+                                            }
+                                            else -> throw e
+                                        }
                                     }
 								}
 							}
@@ -397,12 +533,12 @@ class SocketServerService : Service() {
                                                 if (u2cBytes >= minUpstreamBytesBeforeEof) {
                                                     try { onUpstreamEof?.invoke() } catch (_: Exception) {}
                                                 } else {
-                                                    Log.d(LOG_TAG, "Skip half-close (upstream): forwarded=$u2cBytes < $minUpstreamBytesBeforeEof")
+                                                    Log.i(LOG_TAG, "Skip half-close (upstream): forwarded=$u2cBytes < $minUpstreamBytesBeforeEof")
                                                 }
                                             } else if (n > 0) {
-                                                u2cBytes += n
-                                                // 触发下游可写
-                                                cKey.interestOps(cKey.interestOps() or SelectionKey.OP_WRITE)
+										        u2cBytes += n
+										        cKey.interestOps(cKey.interestOps() or SelectionKey.OP_WRITE)
+										        try { selector?.wakeup() } catch (_: Exception) {}
                                             }
                                         } catch (_: java.nio.channels.ClosedChannelException) {
                                             Log.d(LOG_TAG, "Selector: upstream closed on read")
@@ -421,22 +557,45 @@ class SocketServerService : Service() {
                                             if (n == 0) {
                                                 key.interestOps(key.interestOps() or SelectionKey.OP_WRITE)
                                                 cKey.interestOps(cKey.interestOps() and SelectionKey.OP_READ.inv())
+												c2uStall++
+												// 立刻唤醒，减少等待
+                                                try { selector?.wakeup() } catch (_: Exception) {}
                                                 break
                                             }
                                         }
                                         c2u.compact()
+
+										if (c2uStall >= 2 && c2u.capacity() < 512*1024) {
+                                            c2u = grow(c2u, kotlin.math.min(c2u.capacity()*2, 512*1024))
+                                            c2uStall = 0
+                                            Log.i(LOG_TAG, "Grow c2u buffer to ${c2u.capacity()} bytes")
+                                        }
+
                                         if (c2u.position() == 0) {
                                             key.interestOps(key.interestOps() and SelectionKey.OP_WRITE.inv())
                                             // 读 client 可恢复
                                             cKey.interestOps(cKey.interestOps() or SelectionKey.OP_READ)
+											c2uStall = 0
                                         }
-                                    } catch (_: java.nio.channels.ClosedChannelException) {
-                                        Log.d(LOG_TAG, "Selector: upstream closed on write")
-                                        upstreamWriteClosed = true
-                                        cancelKeyQuiet(uKey)
-                                        c2u.clear()
-                                    } catch (_: java.nio.channels.CancelledKeyException) {
-                                        upstreamWriteClosed = true
+                                    } catch (e: Exception) {
+                                        when (e) {
+                                            is java.nio.channels.ClosedChannelException,
+                                            is java.nio.channels.CancelledKeyException,
+                                            is java.nio.channels.AsynchronousCloseException -> {
+                                                Log.d(LOG_TAG, "Selector(upstream): write side closed (${e::class.simpleName})")
+                                                upstreamWriteClosed = true
+                                                cancelKeyQuiet(uKey)
+                                                c2u.clear()
+                                            }
+                                            is java.io.IOException -> {
+                                                // 常见 Broken pipe / Connection reset 也归入正常收尾
+                                                Log.d(LOG_TAG, "Selector(upstream): write IOException (${e.message})")
+                                                upstreamWriteClosed = true
+                                                cancelKeyQuiet(uKey)
+                                                c2u.clear()
+                                            }
+                                            else -> throw e
+                                        }
                                     }
 								}
 							}
@@ -449,9 +608,25 @@ class SocketServerService : Service() {
                         c2u.position() == 0 && u2c.position() == 0) break@loop
 				}
 			} catch (e: Exception) {
-				// 剩余异常留作错误，ClosedChannel 相关已在分支内消化为 DEBUG
-                Log.e(LOG_TAG, "Selector bridge error", e)
+                // 分类降级：常见正常收尾异常降为 DEBUG，其它才记 ERROR
+                val msg = e.message?.lowercase() ?: ""
+                when (e) {
+                    is java.nio.channels.ClosedChannelException,
+                    is java.nio.channels.CancelledKeyException,
+                    is java.nio.channels.AsynchronousCloseException -> {
+                        Log.d(LOG_TAG, "Selector bridge closed (${e::class.simpleName})")
+                    }
+                    is java.io.IOException -> {
+                        if (msg.contains("broken pipe") || msg.contains("reset by peer")) {
+                            Log.d(LOG_TAG, "Selector bridge IO closed (${e.message})")
+                        } else {
+                            Log.e(LOG_TAG, "Selector bridge error", e)
+                        }
+                    }
+                    else -> Log.e(LOG_TAG, "Selector bridge error", e)
+                }
 			} finally {
+				if (boostedLocal) boostedGlobal.decrementAndGet()
 				try { selector?.close() } catch (_: Exception) {}
 				try { onDone?.invoke() } catch (_: Exception) {}
 			}
@@ -463,7 +638,7 @@ class SocketServerService : Service() {
         super.onCreate()
         createNotificationChannel()
         startForeground(1, createNotification()) // must start within 5s
-        Log.d(LOG_TAG, "Service created")
+        Log.i(LOG_TAG, "Service created")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -562,13 +737,25 @@ class SocketServerService : Service() {
                 0x04 -> handleSocks4(client, input, output, connId, clientChHere)
                 0x05 -> handleSocks5(client, input, output, connId, clientChHere)
                 else -> {
-                    val reader = BufferedReader(InputStreamReader(input))
+					val reader = BufferedReader(InputStreamReader(input))
                     val requestLine = reader.readLine()
                     Log.d(LOG_TAG, "HTTP/s forwarding $requestLine")
-                    if (requestLine?.startsWith("CONNECT") == true) {
-                        handleHttpsConnect(client, input, requestLine, connId, clientChHere)
-                    } else {
+                    // 仅允许典型 HTTP 起始动词；否则不要走 HTTP 分支，直接温和关闭
+                    val httpMethods = setOf("GET","POST","HEAD","PUT","DELETE","OPTIONS","PATCH","CONNECT")
+                    if (requestLine == null) {
+                        Log.i(LOG_TAG, "Non-HTTP traffic (null request line), drop")
+                        try { client.close() } catch (_: Exception) {}
+                        onConnClose(connId); return
+                    }
+                    val firstWord = requestLine.substringBefore(' ').uppercase()
+                    if (firstWord == "CONNECT") {
+                        handleHttpsConnect(client, input as BufferedInputStream, requestLine, connId, clientChHere)
+                    } else if (httpMethods.contains(firstWord)) {
                         handleHttpProxy(client, requestLine, reader, connId, clientChHere)
+                    } else {
+                        Log.i(LOG_TAG, "Non-HTTP first word: $firstWord, drop")
+                        try { client.close() } catch (_: Exception) {}
+                        onConnClose(connId); return
                     }
                 }
             }
@@ -596,7 +783,7 @@ class SocketServerService : Service() {
 
             val parts = requestLine.split(" ")
             if (parts.size < 3) {
-                Log.e(LOG_TAG, "Invalid request line")
+                Log.i(LOG_TAG, "Invalid request line")
                 try { client.close() } catch (_: Exception) {}
                 onConnClose(connId); return
             }
@@ -626,7 +813,7 @@ class SocketServerService : Service() {
             if (body != null) sb.append(String(body))
             val requestBody = sb.toString() // == firstData for HTTP
             val isLayerMinus = (layerMinus != null)
-            Log.e(LOG_TAG, "HTTP proxy error $host:$port via LayerMinus=$isLayerMinus")
+            Log.i(LOG_TAG, "HTTP proxy $host:$port via LayerMinus=$isLayerMinus")
 
 
             val upstream: Socket? = if (isLayerMinus) {
@@ -720,7 +907,7 @@ class SocketServerService : Service() {
 
 
             val isLayerMinus = (layerMinus != null)
-            Log.e(LOG_TAG, "HTTPS proxy $host:$port via LayerMinus=$isLayerMinus")
+            Log.i(LOG_TAG, "HTTPS proxy $host:$port via LayerMinus=$isLayerMinus")
 
 
             val upstream: Socket? = if (isLayerMinus) {
@@ -980,7 +1167,7 @@ class SocketServerService : Service() {
 
 
             val isLayerMinus = (layerMinus != null)
-            Log.e(LOG_TAG, "SOCKS v4 proxy $destHost:$port via LayerMinus=$isLayerMinus")
+            Log.i(LOG_TAG, "SOCKS v4 proxy $destHost:$port via LayerMinus=$isLayerMinus")
 
             val upstream: Socket? = if (isLayerMinus) {
                 layerMinus?.connectToLayerMinus(destHost, port.toString(), firstData)
@@ -1192,7 +1379,7 @@ class SocketServerService : Service() {
 
 
                     val isLayerMinus = (layerMinus != null)
-                    Log.e(LOG_TAG, "SOCKS v5 proxy $destHost:$port via LayerMinus=$isLayerMinus")
+                    Log.i(LOG_TAG, "SOCKS v5 proxy $destHost:$port via LayerMinus=$isLayerMinus")
 
 
 

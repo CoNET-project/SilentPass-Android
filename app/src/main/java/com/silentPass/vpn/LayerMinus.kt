@@ -172,7 +172,7 @@ class LayerMinus(startVPNData: StartVPNData) {
             data = requestData
         )
         val _postData = this.jsonGson.toJson(jsonbPost)
-        Log.d("WebAppInterface", "connectToLayerMinus Entry Node ${randomEntryNode.ip_addr}:80 Exit Node ${randomExitNode.ip_addr}")
+        Log.i("WebAppInterface", "connectToLayerMinus Entry Node ${randomEntryNode.ip_addr}:80 Exit Node ${randomExitNode.ip_addr}")
 
         if (_postData.isNotEmpty()) {
             return postEncryptedPGPMessage(randomEntryNode.ip_addr, _postData)
