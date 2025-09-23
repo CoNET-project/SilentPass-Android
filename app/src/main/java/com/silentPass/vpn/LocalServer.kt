@@ -20,7 +20,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 class SocketServerService : Service() {
-
+    private val DEBUG_FORWARD = false
     // ====== Server State ======
     private var serverThread: Thread? = null
     @Volatile private var isRunning = true
@@ -31,7 +31,7 @@ class SocketServerService : Service() {
     // ====== ThreadPool (avoid per-conn thread explosion) ======
     private val threadCounter = AtomicInteger(0)
     private val threadPoolExecutor = ThreadPoolExecutor(
-        50, 500, 30L, TimeUnit.SECONDS,
+        50, 200, 30L, TimeUnit.SECONDS,
         SynchronousQueue<Runnable>(),
         ThreadFactory { r ->
             Thread(r).apply {
@@ -40,7 +40,7 @@ class SocketServerService : Service() {
                 priority = Thread.NORM_PRIORITY
             }
         },
-        ThreadPoolExecutor.CallerRunsPolicy()
+        ThreadPoolExecutor.DiscardOldestPolicy() // 过载时丢弃最老任务，保护当前活跃连接
     ).apply {
         // 核心线程也允许在空闲 keepAlive 后回收：高峰过后自动收缩
         allowCoreThreadTimeOut(true)
@@ -161,25 +161,40 @@ class SocketServerService : Service() {
     private fun forwardTrafficAsync(
         input: InputStream,
         output: OutputStream,
-        bufferSize: Int = 128 * 1024,
+        bufferSize: Int = 256 * 1024,
         onDone: (() -> Unit)? = null,
         onEof: (() -> Unit)? = null,
         minBytesBeforeEofCallback: Long = 0   // 新增：EOF 回调的最小搬运字节数
     ): Future<*> {
         return threadPoolExecutor.submit {
-            Log.d(LOG_TAG, "Start forwarding from ${input.javaClass.simpleName} to ${output.javaClass.simpleName}")
+            if (DEBUG_FORWARD) Log.d(LOG_TAG, "Start forwarding from ${input.javaClass.simpleName} to ${output.javaClass.simpleName}")
             var src: java.nio.channels.ReadableByteChannel? = null
             var dst: java.nio.channels.WritableByteChannel? = null
-            try {
 
-                Log.d(LOG_TAG, "input available bytes: ${input.available()}")
+
+            try {
+                // 惰性启动 + 压力熔断：避免大量“空转转发器”占坑
+                try {
+                    var checks = 0
+                    while (checks < 5 && input.available() == 0) {
+                        checks++
+                        // 队列&线程高压：放弃该方向（另一方向仍在运行，优先保活隧道）
+                        if (threadPoolExecutor.queue.size > 180 && threadPoolExecutor.activeCount > 150) {
+                            if (DEBUG_FORWARD) Log.d(LOG_TAG, "Skip starting idle forwarder under pressure")
+                            return@submit
+                        }
+                        Thread.sleep(10)
+                    }
+                    if (DEBUG_FORWARD) Log.d(LOG_TAG, "input available bytes: ${input.available()}")
+                } catch (_: Exception) {}
+
                 src = Channels.newChannel(input)
                 dst = Channels.newChannel(output)
                 val buf = ByteBuffer.allocateDirect(bufferSize)
                 var totalBytes = 0L             // 该方向由本任务实际搬运的字节数
                 var sinceLastFlush = 0L
-                val WARMUP_LIMIT = 64 * 1024     // small-flow threshold
-                val FLUSH_THRESHOLD = 64 * 1024  // batch flush in bulk flow
+                val WARMUP_LIMIT = 128 * 1024     // small-flow threshold
+                val FLUSH_THRESHOLD = 256 * 1024  // 大流阶段 256KiB 才批量 flush，减少系统调用
 
                 while (true) {
                     val nRead = try {
@@ -196,7 +211,7 @@ class SocketServerService : Service() {
                         break
                     }
                     if (nRead == -1) {
-                        Log.d(LOG_TAG, "EOF reached after forwarding $totalBytes bytes")
+                        if (DEBUG_FORWARD) Log.d(LOG_TAG, "EOF reached after forwarding $totalBytes bytes")
                         try { (output as? BufferedOutputStream)?.flush() } catch (_: Exception) {}
                         // 只有在本任务确实搬过至少 minBytesBeforeEofCallback 才触发 onEof（半关闭）
                         if (totalBytes >= minBytesBeforeEofCallback) {
@@ -226,12 +241,9 @@ class SocketServerService : Service() {
                         sinceLastFlush += wroteThisChunk
                         val inWarmup = totalBytes <= WARMUP_LIMIT
 
-                        // 1) 小流阶段：每块都刷
-                        // 2) 大流阶段：累计到阈值再刷
-                        // 3) 尾部微小块：立即刷，防止“只差一点点”却被憋住
-                        val tinyChunk = wroteThisChunk in 1 until 32 * 1024
-
-                        if (inWarmup || sinceLastFlush >= FLUSH_THRESHOLD || tinyChunk) {
+                        // 1) 暖身（<=128KiB）：每块都刷，保护首包
+                        // 2) 大流：累计达 256KiB 再刷，降低 flush 频率
+                        if (inWarmup || sinceLastFlush >= FLUSH_THRESHOLD) {
                             try { output.flush() } catch (_: Exception) {}
                             sinceLastFlush = 0
                         }
@@ -262,7 +274,7 @@ class SocketServerService : Service() {
                 val data = Base64.decode(b64, Base64.DEFAULT)
                 val json = String(data, Charsets.UTF_8)
                 val startVPNData = Gson().fromJson(json, StartVPNData::class.java)
-                this.layerMinus = null      //LayerMinus(startVPNData)
+                this.layerMinus = LayerMinus(startVPNData)
 
             } catch (e: Exception) {
                 Log.e(LOG_TAG, "Failed to parse VPN data", e)
@@ -275,7 +287,7 @@ class SocketServerService : Service() {
     private fun startSocketServer() {
         serverThread = Thread {
             try {
-                serverSocket = ServerSocket(8888, 256)
+                serverSocket = ServerSocket(8888, 512)
                 Log.d(LOG_TAG, "Server started on port 8888")
                 while (isRunning) {
                     val client = serverSocket?.accept() ?: break
@@ -426,10 +438,10 @@ class SocketServerService : Service() {
                 }
             }
 
-            val upIn  = BufferedInputStream(upstream.getInputStream(),   128 * 1024)
-            val upOut = BufferedOutputStream(upstream.getOutputStream(), 128 * 1024)
-            val cliIn  = BufferedInputStream(client.getInputStream(),    128 * 1024)
-            val cliOut = BufferedOutputStream(client.getOutputStream(),  128 * 1024)
+            val upIn  = BufferedInputStream(upstream.getInputStream(),   256 * 1024)
+            val upOut = BufferedOutputStream(upstream.getOutputStream(), 256 * 1024)
+            val cliIn  = BufferedInputStream(client.getInputStream(),    256 * 1024)
+            val cliOut = BufferedOutputStream(client.getOutputStream(),  256 * 1024)
 
             val remaining = AtomicInteger(2)
             val onBothDone = {
@@ -490,9 +502,9 @@ class SocketServerService : Service() {
 
             try { upstream.soTimeout = 300 } catch (_: Exception) {} // 仅 CONNECT 放宽
 
-            val upIn   = BufferedInputStream(upstream.getInputStream(),   128 * 1024)
-            val upOutB = BufferedOutputStream(upstream.getOutputStream(), 128 * 1024)
-            val cliOut = BufferedOutputStream(client.getOutputStream(),   128 * 1024)
+            val upIn   = BufferedInputStream(upstream.getInputStream(),   256 * 1024)
+            val upOutB = BufferedOutputStream(upstream.getOutputStream(), 256 * 1024)
+            val cliOut = BufferedOutputStream(client.getOutputStream(),   256 * 1024)
             // DIRECT：若抓到了首包，先踢给上游
             if (layerMinus == null && firstData != null && firstData.isNotEmpty()) {
                 try { upOutB.write(firstData); upOutB.flush() } catch (_: Exception) {}
@@ -559,37 +571,42 @@ class SocketServerService : Service() {
 
             // SOCKS4a: ip=0.0.0.x 且 x!=0 时，后续还有域名（NUL 结尾）
             val isSocks4a = (ip[0].toInt() == 0 && ip[1].toInt() == 0 && ip[2].toInt() == 0 && ip[3].toInt() != 0)
-            val destHostOrIp = if (isSocks4a) {
-                val sb = StringBuilder(); var b: Int
+
+
+            // 直接使用原始host（IP或域名），不做解析
+            val destHost = if (isSocks4a) {
+                // SOCKS4a：域名
+                val sb = StringBuilder()
+                var b: Int
                 while (input.read().also { b = it } != 0 && b != -1) sb.append(b.toChar())
                 sb.toString()
             } else {
-                ip.joinToString(".") { (it.toInt() and 0xFF).toString() } // IPv4 字符串
+                // SOCKS4：IP地址字符串
+                ip.joinToString(".") { (it.toInt() and 0xFF).toString() }
             }
 
-            // —— 按 SOCKS4 规范：只允许 IPv4；强制解析到 IPv4，否则失败 8 字节 ——
-            val targetInet4: Inet4Address? = try {
-                val all = InetAddress.getAllByName(destHostOrIp)
-                all.firstOrNull { it is Inet4Address } as? Inet4Address
-            } catch (_: Exception) { null }
+            // 立即发送granted响应（使用占位符地址）
+            val granted = byteArrayOf(
+                0x00, 0x5a,  // 成功
+                0x00, 0x00,  // 端口占位
+                0x00, 0x00, 0x00, 0x00  // IP占位
+            )
 
-            Log.d(LOG_TAG, "SOCKS4 req -> host=$destHostOrIp (v4=${targetInet4?.hostAddress}) port=$port")
-
-            if (targetInet4 == null) {
-                try { output.write(byteArrayOf(0x00, 0x5b, 0,0, 0,0,0,0)); output.flush() } catch (_: Exception) {}
-                client.close(); onConnClose(connId); return
-            }
+            try {
+                output.write(granted)
+                output.flush()
+            } catch (_: Exception) {}
 
 
-            // —— 建立上游连接（先建连以获取 BNDADDR/BNDPORT） ——
-            var firstData: ByteArray? = null
-            val cliIn = if (input is BufferedInputStream) input else BufferedInputStream(input, 128 * 1024)
-            firstData = capturePrimeAdaptive(cliIn, client, stepMs = 5, maxRounds = 4, maxBytes = 16 * 1024)
+            // 捕获首包
+            val cliIn = if (input is BufferedInputStream) input else BufferedInputStream(input, 256 * 1024)
+            val firstData = capturePrimeAdaptive(cliIn, client, stepMs = 5, maxRounds = 4)
+
 
             val upstream: Socket? = if (layerMinus != null) {
-                layerMinus?.connectToLayerMinus(targetInet4.hostAddress, port.toString(), firstData)
+                layerMinus?.connectToLayerMinus(destHost, port.toString(), firstData)
             } else {
-                try { Socket(targetInet4, port) } catch (_: Exception) { null }
+                try { Socket(destHost, port) } catch (_: Exception) { null }
             }
 
 
@@ -610,28 +627,13 @@ class SocketServerService : Service() {
                     byteArrayOf(127,0,0,1)
                 }
 
-            val granted = byteArrayOf(
-                0x00, 0x5a,
-                (bndPort shr 8).toByte(), (bndPort and 0xFF).toByte(),
-                bndAddrV4[0], bndAddrV4[1], bndAddrV4[2], bndAddrV4[3]
-            )
-            try {
-                Log.d(LOG_TAG, "SOCKS4 granted -> BND=${bndAddrV4[0].toInt() and 0xFF}.${bndAddrV4[1].toInt() and 0xFF}.${bndAddrV4[2].toInt() and 0xFF}.${bndAddrV4[3].toInt() and 0xFF}:$bndPort")
-                output.write(granted)
-                output.flush()
 
-
-            } catch (_: Exception) {}
+            val cliOut = BufferedOutputStream(output, 256 * 1024)
 
 
 
-
-            val cliOut = BufferedOutputStream(output, 128 * 1024)
-
-
-
-            val upIn  = BufferedInputStream(upstream.getInputStream(),   128 * 1024)
-            val upOut = BufferedOutputStream(upstream.getOutputStream(), 128 * 1024)
+            val upIn  = BufferedInputStream(upstream.getInputStream(),   256 * 1024)
+            val upOut = BufferedOutputStream(upstream.getOutputStream(), 256 * 1024)
             // DIRECT：若抓到了首包，先踢给上游
             if (layerMinus == null && firstData != null && firstData.isNotEmpty()) {
                 try { upOut.write(firstData); upOut.flush() } catch (_: Exception) {}
@@ -792,7 +794,7 @@ class SocketServerService : Service() {
                 0x01 -> { // CONNECT
                     output.write(okResp); output.flush()
                     // 统一：分支前“微等待 prime”（5–10ms；复用握手流）
-                    val cliIn = if (input is BufferedInputStream) input else BufferedInputStream(input, 128 * 1024)
+                    val cliIn = if (input is BufferedInputStream) input else BufferedInputStream(input, 256 * 1024)
                     val firstData = capturePrimeAdaptive(cliIn, client, stepMs = 5, maxRounds = 4, maxBytes = 16 * 1024)
 
 
@@ -809,9 +811,9 @@ class SocketServerService : Service() {
                     try { upstream.soTimeout = 300 } catch (_: Exception) {} // CONNECT 首包容错
 
 
-                    val upIn  = BufferedInputStream(upstream.getInputStream(),   128 * 1024)
-                    val upOut = BufferedOutputStream(upstream.getOutputStream(), 128 * 1024)
-                    val cliOut = BufferedOutputStream(output, 128 * 1024)
+                    val upIn  = BufferedInputStream(upstream.getInputStream(),   256 * 1024)
+                    val upOut = BufferedOutputStream(upstream.getOutputStream(), 256 * 1024)
+                    val cliOut = BufferedOutputStream(output, 256 * 1024)
 
                     // DIRECT：若抓到了首包，先踢给上游
                     if (layerMinus == null && firstData != null && firstData.isNotEmpty()) {
