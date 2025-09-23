@@ -32,7 +32,7 @@ class SocketServerService : Service() {
     private val threadCounter = AtomicInteger(0)
     private val threadPoolExecutor = ThreadPoolExecutor(
         50, 500, 30L, TimeUnit.SECONDS,
-        LinkedBlockingQueue<Runnable>(100),
+        SynchronousQueue<Runnable>(),
         ThreadFactory { r ->
             Thread(r).apply {
                 name = "ProxyWorker-${threadCounter.incrementAndGet()}"
@@ -44,6 +44,94 @@ class SocketServerService : Service() {
     ).apply {
         // 核心线程也允许在空闲 keepAlive 后回收：高峰过后自动收缩
         allowCoreThreadTimeOut(true)
+        prestartAllCoreThreads() // 预热核心线程，降低冷启动抖动
+    }
+
+    // 自适应微等待 prime：每轮最多阻塞 stepMs（默认5ms），若没数据则再等一轮，最多 maxRounds 轮；合并到 maxBytes（默认16KiB）
+    private fun capturePrimeAdaptive(
+        cliIn: BufferedInputStream,
+        client: Socket,
+        stepMs: Int = 5,      // 第2轮开始的步长
+        maxRounds: Int = 3,    // 总轮数
+        maxBytes: Int = 16 * 1024
+    ): ByteArray? {
+        val buf = ByteArray(maxBytes)
+        var total = 0
+        val prev = client.soTimeout
+        val TLS_Length = 500
+
+        try {
+            // 0ms：非阻塞检查
+            val immediate = cliIn.available()
+            if (immediate > 0) {
+                total = cliIn.read(buf, 0, minOf(immediate, maxBytes))
+                if (total >= TLS_Length) {
+                    return buf.copyOf(total)
+                }
+            }
+
+            // 渐进式等待
+            for (round in 0 until maxRounds) {
+                if (total >= maxBytes) break
+
+                // 关键：第一轮10ms，后续5ms
+                val currentStepMs = if (round == 0) 10 else stepMs
+                client.soTimeout = currentStepMs
+
+                try {
+                    val n = cliIn.read(buf, total, maxBytes - total)
+                    if (n > 0) {
+                        total += n
+                        // 贪婪读取（限制次数）
+                        var attempts = 0
+                        while (attempts < 3 && cliIn.available() > 0 && total < maxBytes) {
+                            val extra = cliIn.read(buf, total,
+                                minOf(cliIn.available(), maxBytes - total, 4096))
+                            if (extra <= 0) break
+                            total += extra
+                            attempts++
+                        }
+
+                        if (total >= TLS_Length) break
+                    }
+                } catch (_: SocketTimeoutException) {
+                    if (total > TLS_Length - 100) break  // 有部分数据就返回
+                }
+            }
+        } finally {
+            client.soTimeout = prev
+            recordPrime(total)
+        }
+
+        return if (total > 0) buf.copyOf(total) else null
+    }
+
+    // 仅在给定预算内合并已到达的首包；超时立即返回；LM/DIRECT 共用
+    private fun capturePrimeWithBudget(
+        cliIn: BufferedInputStream,
+        client: Socket,
+        budgetMs: Int = 10,
+        maxBytes: Int = 16 * 1024
+    ): ByteArray? {
+        var total = 0
+        val buf = ByteArray(maxBytes)
+        val prev = client.soTimeout
+        try {
+            client.soTimeout = budgetMs
+            while (total < maxBytes) {
+                val n = try { cliIn.read(buf, total, maxBytes - total) }
+                catch (_: java.net.SocketTimeoutException) { break }
+                if (n <= 0) break
+                total += n
+                if (cliIn.available() == 0) break
+            }
+        } catch (_: Exception) {
+            // 忽略 prime 异常
+        } finally {
+            try { client.soTimeout = prev } catch (_: Exception) {}
+            try { recordPrime(total) } catch (_: Exception) {}
+        }
+        return if (total > 0) buf.copyOf(total) else null
     }
 
     // ====== Event-style metrics (print only on connection OPEN/CLOSE) ======
@@ -51,13 +139,17 @@ class SocketServerService : Service() {
     private val connSeq = AtomicLong(0)
     private fun logPoolSnapshot(event: String, connId: Long, note: String = "") {
         val q = threadPoolExecutor.queue
+        val a = primeAttempts.get()
+        val h = primeHits.get()
+        val rate = if (a > 0) (h * 100 / a) else 0
+        val avgB = if (h > 0) (primeBytesSum.get() / h) else 0
         Log.i(
             LOG_TAG,
             "[$event] conn#$connId " +
                     "activeConns=${activeConns.get()} " +
                     "pool={active:${threadPoolExecutor.activeCount}, size:${threadPoolExecutor.poolSize}/${threadPoolExecutor.maximumPoolSize}, largest:${threadPoolExecutor.largestPoolSize}} " +
                     "tasks={submitted:${threadPoolExecutor.taskCount}, completed:${threadPoolExecutor.completedTaskCount}} " +
-                    "queue.size=${q.size} $note"
+                    "queue.size=${q.size} prime={hit:$h/att:$a, rate:${rate}%, avgB:$avgB} $note"
         )
     }
     private fun onConnOpen(connId: Long)  { activeConns.incrementAndGet(); logPoolSnapshot("OPEN",  connId) }
@@ -150,7 +242,6 @@ class SocketServerService : Service() {
             } finally {
                 // Half-close friendly: close read side; flush write side; let peer direction finish
                 try { src?.close() } catch (_: Exception) {}
-                try { input.close() } catch (_: Exception) {}
                 try { (output as? BufferedOutputStream)?.flush() } catch (_: Exception) {}
                 try { onDone?.invoke() } catch (_: Exception) {}
             }
@@ -351,7 +442,12 @@ class SocketServerService : Service() {
                 }
             }
             forwardTrafficAsync(upIn,  cliOut, onDone = onBothDone) // upstream -> client
-            forwardTrafficAsync(cliIn, upOut,  onDone = onBothDone) // client   -> upstream
+            forwardTrafficAsync(
+                cliIn, upOut,
+                onDone = onBothDone,
+                onEof  = { try { upstream.shutdownOutput() } catch (_: Exception) {} },
+                minBytesBeforeEofCallback = 1
+            )
         } catch (e: Exception) {
             Log.e(LOG_TAG, "HTTP proxy error", e)
             try { client.close() } catch (_: Exception) {}
@@ -373,68 +469,37 @@ class SocketServerService : Service() {
                 flush()
             }
 
-            // —— 微等待 prime：最多 10ms，不阻塞更久；把“已经到达”的小碎片尽量合并到 16KiB ——
-            // 仍然复用同一个 BufferedInputStream（input）
-
-            val PRIME_BUDGET_MS = 15         // 可调：0~10ms；0=完全非阻塞
-            val PRIME_MAX_BYTES = 16 * 1024  // 合并上限
-
-
-            val firstData: ByteArray? = run {
-                val prev = client.soTimeout
-                var total = 0
-                val buf = ByteArray(PRIME_MAX_BYTES)
-                try {
-                    client.soTimeout = PRIME_BUDGET_MS
-                    while (total < PRIME_MAX_BYTES) {
-                        val n = try {
-                            input.read(buf, total, PRIME_MAX_BYTES - total)
-                        } catch (_: java.net.SocketTimeoutException) {
-                            // 超过预算就退出，不再等待
-                            break
-                        }
-                        if (n <= 0) break
-                        total += n
-                        // 若当前可读窗口已清空，就不再多读，避免额外等待
-                        if (input.available() == 0) break
-                    }
-                } catch (_: Exception) {
-                    // 忽略 prime 异常
-                } finally {
-                    try { client.soTimeout = prev } catch (_: Exception) {}
-                }
-                if (total > 0) buf.copyOf(total) else null
-            }
-
-
-
-
-            Log.d(LOG_TAG, "CONNECT firstData length = ${firstData?.size ?: 0}")
-
+            // 统一：在分支前“微等待 prime”（≤10ms；复用同一个 BufferedInputStream）
+            val cliIn = input
+            val firstData = capturePrimeAdaptive(cliIn, client, stepMs = 5, maxRounds = 4, maxBytes = 16 * 1024)
 
             val upstream: Socket? = if (layerMinus != null) {
                 layerMinus?.connectToLayerMinus(host, port.toString(), firstData)
             } else {
                 try { Socket(host, port) } catch (_: Exception) { null }
             }
+
+
             if (upstream == null) {
                 try { client.close() } catch (_: Exception) {}
                 onConnClose(connId); return
             }
             setSocketPerfOptions(client, upstream)
+
+
+
             try { upstream.soTimeout = 300 } catch (_: Exception) {} // 仅 CONNECT 放宽
 
             val upIn   = BufferedInputStream(upstream.getInputStream(),   128 * 1024)
             val upOutB = BufferedOutputStream(upstream.getOutputStream(), 128 * 1024)
             val cliOut = BufferedOutputStream(client.getOutputStream(),   128 * 1024)
-            val cliIn  = input // ✅ 继续复用同一个 BufferedInputStream，避免预读丢失
-
-            // DIRECT：如果 prime 抓到了首包，先送一脚
+            // DIRECT：若抓到了首包，先踢给上游
             if (layerMinus == null && firstData != null && firstData.isNotEmpty()) {
                 try { upOutB.write(firstData); upOutB.flush() } catch (_: Exception) {}
             }
 
-            // 启动双泵（维持你已有的半关闭保护）
+
+            // 双泵复用同一个 cliIn；cli->up 方向保持 minBytesBeforeEofCallback=1
             val remaining = java.util.concurrent.atomic.AtomicInteger(2)
             val onBothDone = {
                 if (remaining.decrementAndGet() == 0) {
@@ -515,12 +580,19 @@ class SocketServerService : Service() {
                 client.close(); onConnClose(connId); return
             }
 
-            // —— 建立上游连接：直连用 IPv4 地址；LayerMinus 也传 IPv4 字符串 ——
+
+            // —— 建立上游连接（先建连以获取 BNDADDR/BNDPORT） ——
+            var firstData: ByteArray? = null
+            val cliIn = if (input is BufferedInputStream) input else BufferedInputStream(input, 128 * 1024)
+            firstData = capturePrimeAdaptive(cliIn, client, stepMs = 5, maxRounds = 4, maxBytes = 16 * 1024)
+
             val upstream: Socket? = if (layerMinus != null) {
-                layerMinus?.connectToLayerMinus(targetInet4.hostAddress, port.toString(), null)
+                layerMinus?.connectToLayerMinus(targetInet4.hostAddress, port.toString(), firstData)
             } else {
                 try { Socket(targetInet4, port) } catch (_: Exception) { null }
             }
+
+
             if (upstream == null) {
                 try { output.write(byteArrayOf(0x00, 0x5b, 0,0, 0,0,0,0)); output.flush() } catch (_: Exception) {}
                 client.close(); onConnClose(connId); return
@@ -547,27 +619,24 @@ class SocketServerService : Service() {
                 Log.d(LOG_TAG, "SOCKS4 granted -> BND=${bndAddrV4[0].toInt() and 0xFF}.${bndAddrV4[1].toInt() and 0xFF}.${bndAddrV4[2].toInt() and 0xFF}.${bndAddrV4[3].toInt() and 0xFF}:$bndPort")
                 output.write(granted)
                 output.flush()
+
+
             } catch (_: Exception) {}
 
-            // —— 双向转发：复用握手时的 input，避免预读首包丢失 ——
-            val upIn  = BufferedInputStream(upstream.getInputStream(),   128 * 1024)
-            val upOut = BufferedOutputStream(upstream.getOutputStream(), 128 * 1024)
-            val cliIn  = if (input is BufferedInputStream) input else BufferedInputStream(input, 128 * 1024)
+
+
+
             val cliOut = BufferedOutputStream(output, 128 * 1024)
 
-            // 新：非阻塞 prime（仅在有“已到达数据”时立刻踢一下；否则不等待）
-            try {
-                val avail = try { cliIn.available() } catch (_: Exception) { 0 }
-                if (avail > 0) {
-                    val kick = ByteArray(minOf(avail, 16 * 1024))
-                    val n = cliIn.read(kick)
-                    if (n > 0) {
-                        upOut.write(kick, 0, n)
-                        upOut.flush()
-                        Log.d(LOG_TAG, "SOCKS4 prime(non-block) kick $n bytes")
-                    }
-                }
-            } catch (_: Exception) { /* 忽略 prime 异常 */ }
+
+
+            val upIn  = BufferedInputStream(upstream.getInputStream(),   128 * 1024)
+            val upOut = BufferedOutputStream(upstream.getOutputStream(), 128 * 1024)
+            // DIRECT：若抓到了首包，先踢给上游
+            if (layerMinus == null && firstData != null && firstData.isNotEmpty()) {
+                try { upOut.write(firstData); upOut.flush() } catch (_: Exception) {}
+            }
+
 
             // 之后再启动双泵（保持你现有的 onEof→shutdownOutput、onDone 收尾）
             val remaining = java.util.concurrent.atomic.AtomicInteger(2)
@@ -598,6 +667,19 @@ class SocketServerService : Service() {
             Log.e(LOG_TAG, "Error in handleSocks4", e)
             try { client.close() } catch (_: Exception) {}
             onConnClose(connId)
+        }
+    }
+
+
+    // ====== Prime metrics (shared by LM & DIRECT) ======
+    private val primeAttempts = AtomicLong(0)
+    private val primeHits     = AtomicLong(0)
+    private val primeBytesSum = AtomicLong(0)
+    private fun recordPrime(bytes: Int) {
+        primeAttempts.incrementAndGet()
+        if (bytes > 0) {
+            primeHits.incrementAndGet()
+            primeBytesSum.addAndGet(bytes.toLong())
         }
     }
 
@@ -637,6 +719,25 @@ class SocketServerService : Service() {
         } catch (e: Exception) {
             Log.e(LOG_TAG, "UDP associate failed", e)
             try { client.close() } catch (_: Exception) {}
+        }
+    }
+
+    // 统一零等待 prime（LM/DIRECT/所有协议共用）：只读“已到达”的字节；不阻塞；带统计
+    private fun capturePrimeNonBlocking(cliIn: BufferedInputStream, maxBytes: Int = 16 * 1024): ByteArray? {
+        var n = 0
+        return try {
+            val avail = try { cliIn.available() } catch (_: Exception) { 0 }
+            if (avail > 0) {
+                val toRead = minOf(avail, maxBytes)
+                val buf = ByteArray(toRead)
+                n = cliIn.read(buf)
+                if (n > 0) buf.copyOf(n) else null
+            } else null
+        } catch (_: Exception) {
+            null
+        } finally {
+            // 复用你已存在的首包统计（若未引入，可按你之前的实现添加 recordPrime）
+            try { recordPrime(n) } catch (_: Exception) {}
         }
     }
 
@@ -690,93 +791,59 @@ class SocketServerService : Service() {
             when (cmd) {
                 0x01 -> { // CONNECT
                     output.write(okResp); output.flush()
-                    if (layerMinus != null) {
-                        // Try to capture firstData quickly (short timeout) to package to LM
-                        val bufferedInput = BufferedInputStream(input)
-                        bufferedInput.mark(8192)
-                        val peekBuf = ByteArray(4096)
-                        var firstPacketSize = 0
-                        client.soTimeout = 100
-                        try { firstPacketSize = bufferedInput.read(peekBuf) }
-                        catch (_: SocketTimeoutException) { firstPacketSize = 0 }
-                        finally { client.soTimeout = 0 }
-                        if (firstPacketSize > 0) bufferedInput.reset()
-                        val firstData = if (firstPacketSize > 0) {
-                            val data = ByteArray(firstPacketSize)
-                            bufferedInput.read(data); data
-                        } else null
+                    // 统一：分支前“微等待 prime”（5–10ms；复用握手流）
+                    val cliIn = if (input is BufferedInputStream) input else BufferedInputStream(input, 128 * 1024)
+                    val firstData = capturePrimeAdaptive(cliIn, client, stepMs = 5, maxRounds = 4, maxBytes = 16 * 1024)
 
-                        val upstream = layerMinus?.connectToLayerMinus(destHost, port.toString(), firstData)
-                        if (upstream == null) {
-                            Log.e(LOG_TAG, "LayerMinus upstream failed $destHost:$port")
-                            try { client.close() } catch (_: Exception) {}
-                            onConnClose(connId); return
-                        }
 
-                        setSocketPerfOptions(client, upstream)
-
-                        val upIn  = BufferedInputStream(upstream.getInputStream(),   128 * 1024)
-                        val upOut = BufferedOutputStream(upstream.getOutputStream(), 128 * 1024)
-                        val cliIn  = bufferedInput
-                        val cliOut = BufferedOutputStream(output,                   128 * 1024)
-
-                        val remaining = AtomicInteger(2)
-                        val onBothDone = {
-                            if (remaining.decrementAndGet() == 0) {
-                                try { cliOut.flush() } catch (_: Exception) {}
-                                try { upOut.flush() }  catch (_: Exception) {}
-                                try { upstream.close() } catch (_: Exception) {}
-                                try { client.close() }   catch (_: Exception) {}
-                                onConnClose(connId)
-                            }
-                        }
-
-                        forwardTrafficAsync(
-                            upIn, cliOut,
-                            onDone = onBothDone,
-                            onEof  = { try { client.shutdownOutput() } catch (_: Exception) {} }
-                        )
-                        forwardTrafficAsync(
-                            cliIn, upOut,
-                            onDone = onBothDone,
-                            onEof  = { try { upstream.shutdownOutput() } catch (_: Exception) {} }
-                        )
-
+                    val upstream: Socket? = if (layerMinus != null) {
+                        layerMinus?.connectToLayerMinus(destHost, port.toString(), firstData)
                     } else {
-                        val target = try { Socket(destHost, port) } catch (_: Exception) { null }
-                        if (target == null) {
-                            try { client.close() } catch (_: Exception) {}
-                            onConnClose(connId); return
-                        }
-
-                        setSocketPerfOptions(client, target)
-
-                        val upIn  = BufferedInputStream(target.getInputStream(),   128 * 1024)
-                        val upOut = BufferedOutputStream(target.getOutputStream(), 128 * 1024)
-                        val cliIn  = BufferedInputStream(input,                  128 * 1024)
-                        val cliOut = BufferedOutputStream(output,                 128 * 1024)
-
-                        val remaining = AtomicInteger(2)
-                        val onBothDone = {
-                            if (remaining.decrementAndGet() == 0) {
-                                try { cliOut.flush() } catch (_: Exception) {}
-                                try { upOut.flush() }  catch (_: Exception) {}
-                                try { target.close() }  catch (_: Exception) {}
-                                try { client.close() }  catch (_: Exception) {}
-                                onConnClose(connId)
-                            }
-                        }
-                        forwardTrafficAsync(
-                            upIn, cliOut,
-                            onDone = onBothDone,
-                            onEof  = { try { client.shutdownOutput() } catch (_: Exception) {} }
-                        )
-                        forwardTrafficAsync(
-                            cliIn, upOut,
-                            onDone = onBothDone,
-                            onEof  = { try { target.shutdownOutput() } catch (_: Exception) {} }
-                        )
+                        try { Socket(destHost, port) } catch (_: Exception) { null }
                     }
+                    if (upstream == null) {
+                        try { client.close() } catch (_: Exception) {}
+                        onConnClose(connId); return
+                    }
+                    setSocketPerfOptions(client, upstream)
+                    try { upstream.soTimeout = 300 } catch (_: Exception) {} // CONNECT 首包容错
+
+
+                    val upIn  = BufferedInputStream(upstream.getInputStream(),   128 * 1024)
+                    val upOut = BufferedOutputStream(upstream.getOutputStream(), 128 * 1024)
+                    val cliOut = BufferedOutputStream(output, 128 * 1024)
+
+                    // DIRECT：若抓到了首包，先踢给上游
+                    if (layerMinus == null && firstData != null && firstData.isNotEmpty()) {
+                        try { upOut.write(firstData); upOut.flush() } catch (_: Exception) {}
+                    }
+
+                    val remaining = java.util.concurrent.atomic.AtomicInteger(2)
+                    val onBothDone = {
+                        if (remaining.decrementAndGet() == 0) {
+                            try { cliOut.flush() } catch (_: Exception) {}
+                            try { upOut.flush() }  catch (_: Exception) {}
+                            try { upstream.close() } catch (_: Exception) {}
+                            try { client.close() }   catch (_: Exception) {}
+                            onConnClose(connId)
+                        }
+                    }
+
+                    forwardTrafficAsync(
+                        upIn, cliOut,
+                        onDone = onBothDone,
+                        onEof  = { try { client.shutdownOutput() } catch (_: Exception) {} }
+                    )
+
+                    forwardTrafficAsync(
+                        cliIn, upOut,
+                        onDone = onBothDone,
+                        onEof  = { try { upstream.shutdownOutput() } catch (_: Exception) {} },
+                        minBytesBeforeEofCallback = 1   // ✅ LM 与 DIRECT 共用：防 0B EOF 误半关
+                    )
+
+
+
                 }
                 0x03 -> { // UDP ASSOCIATE
                     handleSocks5UdpAssociate(client, output)
