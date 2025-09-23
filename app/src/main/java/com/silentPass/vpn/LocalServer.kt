@@ -15,17 +15,36 @@ import java.io.*
 import java.net.*
 import java.nio.ByteBuffer
 import java.nio.channels.Channels
+import java.nio.channels.Selector
+import java.nio.channels.SelectionKey
+import java.nio.channels.SocketChannel
+import java.nio.channels.ServerSocketChannel
 import java.util.concurrent.*
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
+
+
 class SocketServerService : Service() {
+
+
+
+	private fun connectWithChannel(host: String, port: Int): Socket? {
+		return try {
+			val channel = SocketChannel.open()
+			channel.connect(InetSocketAddress(host, port))
+			channel.socket()  // 这样创建的Socket才有channel
+		} catch (e: Exception) {
+			null
+		}
+	}
+
 
     // ====== Server State ======
     private var serverThread: Thread? = null
     @Volatile private var isRunning = true
     private var layerMinus: LayerMinus? = null
-    private var serverSocket: ServerSocket? = null
+    private var serverChannel: ServerSocketChannel? = null
     private val LOG_TAG = "SocketServerService"
 
     // ====== ThreadPool (avoid per-conn thread explosion) ======
@@ -110,7 +129,7 @@ class SocketServerService : Service() {
     private fun capturePrimeWithBudget(
         cliIn: BufferedInputStream,
         client: Socket,
-        budgetMs: Int = 10,
+        budgetMs: Int = 20,
         maxBytes: Int = 16 * 1024
     ): ByteArray? {
         var total = 0
@@ -158,95 +177,286 @@ class SocketServerService : Service() {
     // ====== High-throughput forwarder (NIO Channels + Direct ByteBuffer) ======
     // - Natural backpressure: write blocks when socket send buffer is full
     // - Adaptive flush: small-flow (e.g., TLS ClientHello) flush eagerly; bulk-flow flush in batches
+
     private fun forwardTrafficAsync(
         input: InputStream,
         output: OutputStream,
         bufferSize: Int = 128 * 1024,
         onDone: (() -> Unit)? = null,
         onEof: (() -> Unit)? = null,
-        minBytesBeforeEofCallback: Long = 0   // 新增：EOF 回调的最小搬运字节数
+		minBytesBeforeEofCallback: Long = 0,
+		srcSocket: java.net.Socket? = null,
+		dstSocket: java.net.Socket? = null
     ): Future<*> {
-        return threadPoolExecutor.submit {
-            Log.d(LOG_TAG, "Start forwarding from ${input.javaClass.simpleName} to ${output.javaClass.simpleName}")
-            var src: java.nio.channels.ReadableByteChannel? = null
-            var dst: java.nio.channels.WritableByteChannel? = null
-            try {
+		return threadPoolExecutor.submit {
+			// 统一回退实现（阻塞流式），Selector 双向桥接在 bridgeWithSelector 调用处触发
+			Log.d(LOG_TAG, "Start forwarding (fallback) from ${input.javaClass.simpleName} to ${output.javaClass.simpleName}")
+			var src: java.nio.channels.ReadableByteChannel? = null
+			var dst: java.nio.channels.WritableByteChannel? = null
+			try {
 
-                Log.d(LOG_TAG, "input available bytes: ${input.available()}")
-                src = Channels.newChannel(input)
-                dst = Channels.newChannel(output)
-                val buf = ByteBuffer.allocateDirect(bufferSize)
-                var totalBytes = 0L             // 该方向由本任务实际搬运的字节数
-                var sinceLastFlush = 0L
-                val WARMUP_LIMIT = 64 * 1024     // small-flow threshold
-                val FLUSH_THRESHOLD = 64 * 1024  // batch flush in bulk flow
-
-                while (true) {
-                    val nRead = try {
-                        src.read(buf)
-                    } catch (_: SocketTimeoutException) {
-                        // 上游短暂停笔：如果手里攒着数据就冲一下，避免尾部卡住
-                        if (output is BufferedOutputStream) {
-                            try { output.flush() } catch (_: Exception) {}
-                        }
-                        continue
-                    } catch (_: java.nio.channels.ClosedByInterruptException) {
-                        break
-                    } catch (_: java.nio.channels.AsynchronousCloseException) {
-                        break
-                    }
-                    if (nRead == -1) {
-                        Log.d(LOG_TAG, "EOF reached after forwarding $totalBytes bytes")
-                        try { (output as? BufferedOutputStream)?.flush() } catch (_: Exception) {}
-                        // 只有在本任务确实搬过至少 minBytesBeforeEofCallback 才触发 onEof（半关闭）
-                        if (totalBytes >= minBytesBeforeEofCallback) {
-                            try { onEof?.invoke() } catch (_: Exception) {}
-                        } else {
-                            Log.d(LOG_TAG, "Skip half-close: forwarded=$totalBytes < $minBytesBeforeEofCallback")
-                        }
-                        break
-                    }
-                    if (nRead == 0) continue
-
-                    totalBytes += nRead
-                    buf.flip()
-                    var wroteThisChunk = 0
-                    while (buf.hasRemaining()) {
-                        val nWritten = try { dst.write(buf) }
-                        catch (_: java.nio.channels.ClosedChannelException) {
-                            Log.d(LOG_TAG, "Output channel closed after $totalBytes bytes"); return@submit
-                        }
-                        if (nWritten == 0) Thread.yield()
-                        wroteThisChunk += nWritten
-                    }
-                    buf.compact()
-
-                    // Adaptive flush: protect TLS handshakes and tiny requests from buffering
-                    if (output is BufferedOutputStream) {
-                        sinceLastFlush += wroteThisChunk
-                        val inWarmup = totalBytes <= WARMUP_LIMIT
-
-                        // 1) 小流阶段：每块都刷
-                        // 2) 大流阶段：累计到阈值再刷
-                        // 3) 尾部微小块：立即刷，防止“只差一点点”却被憋住
-                        val tinyChunk = wroteThisChunk in 1 until 32 * 1024
-
-                        if (inWarmup || sinceLastFlush >= FLUSH_THRESHOLD || tinyChunk) {
-                            try { output.flush() } catch (_: Exception) {}
-                            sinceLastFlush = 0
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(LOG_TAG, "Error forwarding traffic (NIO)", e)
-            } finally {
-                // Half-close friendly: close read side; flush write side; let peer direction finish
-                try { src?.close() } catch (_: Exception) {}
-                try { (output as? BufferedOutputStream)?.flush() } catch (_: Exception) {}
-                try { onDone?.invoke() } catch (_: Exception) {}
-            }
+				Log.d(LOG_TAG, "input available bytes: ${input.available()}")
+				src = Channels.newChannel(input)
+				dst = Channels.newChannel(output)
+				val buf = java.nio.ByteBuffer.allocateDirect(bufferSize)
+				var totalBytes = 0L
+				var sinceLastFlush = 0L
+				val WARMUP_LIMIT = 64 * 1024
+				val FLUSH_THRESHOLD = 64 * 1024
+				while (true) {
+					val nRead = try { src.read(buf) }
+					catch (_: SocketTimeoutException) {
+						if (output is BufferedOutputStream) { try { output.flush() } catch (_: Exception) {} }
+						continue
+					} catch (_: java.nio.channels.ClosedByInterruptException) { break }
+					catch (_: java.nio.channels.AsynchronousCloseException) { break }
+					if (nRead == -1) {
+						Log.d(LOG_TAG, "EOF reached after forwarding $totalBytes bytes")
+						try { (output as? BufferedOutputStream)?.flush() } catch (_: Exception) {}
+						if (totalBytes >= minBytesBeforeEofCallback) {
+							try { onEof?.invoke() } catch (_: Exception) {}
+						} else {
+							Log.d(LOG_TAG, "Skip half-close: forwarded=$totalBytes < $minBytesBeforeEofCallback")
+						}
+						break
+					}
+					if (nRead == 0) continue
+					totalBytes += nRead
+					buf.flip()
+					var wroteThisChunk = 0
+					while (buf.hasRemaining()) {
+						val nWritten = try { dst.write(buf) }
+						catch (_: java.nio.channels.ClosedChannelException) {
+							Log.d(LOG_TAG, "Output channel closed after $totalBytes bytes"); return@submit
+						}
+						if (nWritten == 0) Thread.yield()
+						wroteThisChunk += nWritten
+					}
+					buf.compact()
+					if (output is BufferedOutputStream) {
+						sinceLastFlush += wroteThisChunk
+						val inWarmup = totalBytes <= WARMUP_LIMIT
+						val tinyChunk = wroteThisChunk in 1 until 32 * 1024
+						if (inWarmup || sinceLastFlush >= FLUSH_THRESHOLD || tinyChunk) {
+							try { output.flush() } catch (_: Exception) {}
+							sinceLastFlush = 0
+						}
+					}
+				}
+			} catch (e: Exception) {
+				Log.e(LOG_TAG, "Error forwarding traffic (fallback NIO)", e)
+			} finally {
+				try { (output as? BufferedOutputStream)?.flush() } catch (_: Exception) {}
+				try { onDone?.invoke() } catch (_: Exception) {}
+			}
         }
     }
+
+
+	// ===========================
+	//  双向桥接（NIO Selector）
+	// ===========================
+	private fun bridgeWithSelector(
+		clientCh: SocketChannel,
+		upstreamCh: SocketChannel,
+		onDone: (() -> Unit)? = null,
+		onClientEof: (() -> Unit)? = null,
+		onUpstreamEof: (() -> Unit)? = null,
+		minClientBytesBeforeEof: Long = 1,
+		minUpstreamBytesBeforeEof: Long = 0,
+		firstDataToUpstream: ByteArray? = null,
+		bufSize: Int = 128 * 1024
+	): Future<*> {
+		return threadPoolExecutor.submit {
+			var selector: Selector? = null
+			try {
+				clientCh.configureBlocking(false)
+				upstreamCh.configureBlocking(false)
+				selector = Selector.open()
+				val cKey = clientCh.register(selector, SelectionKey.OP_READ)
+				val uKey = upstreamCh.register(selector, SelectionKey.OP_READ)
+
+				val c2u = java.nio.ByteBuffer.allocateDirect(bufSize)
+				val u2c = java.nio.ByteBuffer.allocateDirect(bufSize)
+				var cClosed = false
+				var uClosed = false
+				var c2uBytes = 0L
+				var u2cBytes = 0L
+
+				var clientWriteClosed = false
+				var upstreamWriteClosed = false
+
+				fun keyOpen(ch: SocketChannel?, key: SelectionKey?): Boolean =
+					(ch != null && ch.isOpen && key != null && key.isValid)
+
+				fun cancelKeyQuiet(key: SelectionKey?) {
+					try { key?.cancel() } catch (_: Exception) {}
+				}
+
+				// 直连模式：把首包先注入上游
+				if (firstDataToUpstream != null && firstDataToUpstream.isNotEmpty()) {
+					c2u.put(firstDataToUpstream)
+					c2u.flip()
+
+					// 先尝试直接写入（写不动则注册一次 OP_WRITE 并暂停 client 读）
+					try {
+						while (c2u.hasRemaining()) {
+							if (!keyOpen(upstreamCh, uKey)) break
+							val n = upstreamCh.write(c2u)
+							if (n == 0) {
+								uKey.interestOps(uKey.interestOps() or SelectionKey.OP_WRITE)
+								cKey.interestOps(cKey.interestOps() and SelectionKey.OP_READ.inv())
+								break
+							}
+							c2uBytes += n
+						}
+					} catch (_: java.nio.channels.ClosedChannelException) {
+						Log.d(LOG_TAG, "Selector: upstream closed while injecting firstData")
+						uClosed = true
+						cancelKeyQuiet(uKey)
+						c2u.clear()
+					}
+					if (!c2u.hasRemaining()) { c2u.clear() } else { c2u.compact() }
+				}
+
+				val SELECT_TIMEOUT = 500L
+				loop@ while (true) {
+					selector.select(SELECT_TIMEOUT)
+					val it = selector.selectedKeys().iterator()
+					while (it.hasNext()) {
+						val key = it.next(); it.remove()
+						when (key.channel()) {
+							clientCh -> {
+								if (key.isReadable && !cClosed) {
+									// 读 client → c2u
+									if (!c2u.hasRemaining()) { // 背压：停读
+										cKey.interestOps(cKey.interestOps() and SelectionKey.OP_READ.inv())
+									} else {
+										try {
+											val n = clientCh.read(c2u)
+											if (n == -1) {
+												cClosed = true
+												cKey.interestOps(cKey.interestOps() and SelectionKey.OP_READ.inv())
+												if (c2uBytes >= minClientBytesBeforeEof) {
+													try { onClientEof?.invoke() } catch (_: Exception) {}
+												} else {
+													Log.d(LOG_TAG, "Skip half-close (client): forwarded=$c2uBytes < $minClientBytesBeforeEof")
+												}
+											} else if (n > 0) {
+												c2uBytes += n
+												// 触发上游可写
+												uKey.interestOps(uKey.interestOps() or SelectionKey.OP_WRITE)
+											}
+										} catch (_: java.nio.channels.ClosedChannelException) {
+											Log.d(LOG_TAG, "Selector: client closed on read")
+											cClosed = true
+											cancelKeyQuiet(cKey)
+										}
+									}
+								}
+								if (key.isWritable) {
+									try {
+										if (!keyOpen(clientCh, cKey)) { clientWriteClosed = true; cancelKeyQuiet(cKey) }
+										u2c.flip()
+										while (u2c.hasRemaining()) {
+											val n = clientCh.write(u2c)
+											if (n == 0) {
+												// 保留一次 OP_WRITE，暂停上游读，等待可写
+												key.interestOps(key.interestOps() or SelectionKey.OP_WRITE)
+												uKey.interestOps(uKey.interestOps() and SelectionKey.OP_READ.inv())
+												break
+                                            }
+                                        }
+                                        u2c.compact()
+                                        if (u2c.position() == 0) {
+                                            key.interestOps(key.interestOps() and SelectionKey.OP_WRITE.inv())
+                                            // 读上游可恢复
+                                            uKey.interestOps(uKey.interestOps() or SelectionKey.OP_READ)
+                                        }
+                                    } catch (_: java.nio.channels.ClosedChannelException) {
+                                        Log.d(LOG_TAG, "Selector: client closed on write")
+                                        clientWriteClosed = true
+                                        cancelKeyQuiet(cKey)
+                                        u2c.clear()
+                                    } catch (_: java.nio.channels.CancelledKeyException) {
+                                        clientWriteClosed = true
+                                    }
+								}
+							}
+							upstreamCh -> {
+								if (key.isReadable && !uClosed) {
+									// 读 upstream → u2c
+									if (!u2c.hasRemaining()) {
+										uKey.interestOps(uKey.interestOps() and SelectionKey.OP_READ.inv())
+									} else {
+										try {
+                                            val n = upstreamCh.read(u2c)
+                                            if (n == -1) {
+                                                uClosed = true
+                                                uKey.interestOps(uKey.interestOps() and SelectionKey.OP_READ.inv())
+                                                if (u2cBytes >= minUpstreamBytesBeforeEof) {
+                                                    try { onUpstreamEof?.invoke() } catch (_: Exception) {}
+                                                } else {
+                                                    Log.d(LOG_TAG, "Skip half-close (upstream): forwarded=$u2cBytes < $minUpstreamBytesBeforeEof")
+                                                }
+                                            } else if (n > 0) {
+                                                u2cBytes += n
+                                                // 触发下游可写
+                                                cKey.interestOps(cKey.interestOps() or SelectionKey.OP_WRITE)
+                                            }
+                                        } catch (_: java.nio.channels.ClosedChannelException) {
+                                            Log.d(LOG_TAG, "Selector: upstream closed on read")
+                                            uClosed = true
+                                            cancelKeyQuiet(uKey)
+                                        }
+									}
+								}
+								if (key.isWritable) {
+									// c2u 剩余 → upstream
+									try {
+                                        if (!keyOpen(upstreamCh, uKey)) { upstreamWriteClosed = true; cancelKeyQuiet(uKey) }
+                                        c2u.flip()
+                                        while (c2u.hasRemaining()) {
+                                            val n = upstreamCh.write(c2u)
+                                            if (n == 0) {
+                                                key.interestOps(key.interestOps() or SelectionKey.OP_WRITE)
+                                                cKey.interestOps(cKey.interestOps() and SelectionKey.OP_READ.inv())
+                                                break
+                                            }
+                                        }
+                                        c2u.compact()
+                                        if (c2u.position() == 0) {
+                                            key.interestOps(key.interestOps() and SelectionKey.OP_WRITE.inv())
+                                            // 读 client 可恢复
+                                            cKey.interestOps(cKey.interestOps() or SelectionKey.OP_READ)
+                                        }
+                                    } catch (_: java.nio.channels.ClosedChannelException) {
+                                        Log.d(LOG_TAG, "Selector: upstream closed on write")
+                                        upstreamWriteClosed = true
+                                        cancelKeyQuiet(uKey)
+                                        c2u.clear()
+                                    } catch (_: java.nio.channels.CancelledKeyException) {
+                                        upstreamWriteClosed = true
+                                    }
+								}
+							}
+						}
+					}
+
+					// 退出条件：两端读都关 & 两个方向缓冲都清空（写侧也无 pending）
+                    if ((cClosed || clientWriteClosed) &&
+                        (uClosed || upstreamWriteClosed) &&
+                        c2u.position() == 0 && u2c.position() == 0) break@loop
+				}
+			} catch (e: Exception) {
+				// 剩余异常留作错误，ClosedChannel 相关已在分支内消化为 DEBUG
+                Log.e(LOG_TAG, "Selector bridge error", e)
+			} finally {
+				try { selector?.close() } catch (_: Exception) {}
+				try { onDone?.invoke() } catch (_: Exception) {}
+			}
+		}
+	}
 
     // ====== Android Service lifecycle ======
     override fun onCreate() {
@@ -262,7 +472,7 @@ class SocketServerService : Service() {
                 val data = Base64.decode(b64, Base64.DEFAULT)
                 val json = String(data, Charsets.UTF_8)
                 val startVPNData = Gson().fromJson(json, StartVPNData::class.java)
-                this.layerMinus = null      //LayerMinus(startVPNData)
+                this.layerMinus = LayerMinus(startVPNData)
 
             } catch (e: Exception) {
                 Log.e(LOG_TAG, "Failed to parse VPN data", e)
@@ -275,18 +485,27 @@ class SocketServerService : Service() {
     private fun startSocketServer() {
         serverThread = Thread {
             try {
-                serverSocket = ServerSocket(8888, 256)
-                Log.d(LOG_TAG, "Server started on port 8888")
+                	serverChannel = ServerSocketChannel.open().apply {
+						configureBlocking(true)
+						bind(InetSocketAddress(8888), 256)
+					}
+				Log.d(LOG_TAG, "Server started on port 8888 (ServerSocketChannel)")
+
                 while (isRunning) {
-                    val client = serverSocket?.accept() ?: break
-                    val connId = connSeq.incrementAndGet()
-                    onConnOpen(connId)
-                    threadPoolExecutor.execute { handleClient(client, connId) }
+					val clientCh = serverChannel?.accept() ?: break
+					val client = clientCh.socket()
+					val connId = connSeq.incrementAndGet()
+					onConnOpen(connId)
+					// 把下游的 SocketChannel 一并传入，供 Selector 桥接使用
+
+					threadPoolExecutor.execute { 
+						handleClient(client, connId, clientCh)
+					}
                 }
             } catch (e: Exception) {
                 Log.e(LOG_TAG, "Server error", e)
             } finally {
-                try { serverSocket?.close() } catch (_: Exception) {}
+                try { serverChannel?.close() } catch (_: Exception) {}
             }
         }.apply { isDaemon = true }
         serverThread?.start()
@@ -294,7 +513,7 @@ class SocketServerService : Service() {
 
     override fun onDestroy() {
         isRunning = false
-        try { serverSocket?.close() } catch (_: Exception) {}
+        try { serverChannel?.close() } catch (_: Exception) {}
         serverThread?.interrupt()
         super.onDestroy()
         Log.d(LOG_TAG, "onDestroy called")
@@ -327,8 +546,12 @@ class SocketServerService : Service() {
     }
 
     // ====== Client dispatcher ======
-    private fun handleClient(client: Socket, connId: Long) {
+    private fun handleClient(client: Socket, connId: Long, clientChOpt: SocketChannel? = null) {
         try {
+			// 统一获取下游通道：优先从 client.getChannel()，否则回退到入参
+			val clientChHere: SocketChannel? =
+				(client.channel as? SocketChannel) ?: clientChOpt
+
             val input  = BufferedInputStream(client.getInputStream())
             val output = client.getOutputStream()
             input.mark(4096)
@@ -336,16 +559,16 @@ class SocketServerService : Service() {
             input.reset()
 
             when (version) {
-                0x04 -> handleSocks4(client, input, output, connId)
-                0x05 -> handleSocks5(client, input, output, connId)
+                0x04 -> handleSocks4(client, input, output, connId, clientChHere)
+                0x05 -> handleSocks5(client, input, output, connId, clientChHere)
                 else -> {
                     val reader = BufferedReader(InputStreamReader(input))
                     val requestLine = reader.readLine()
                     Log.d(LOG_TAG, "HTTP/s forwarding $requestLine")
                     if (requestLine?.startsWith("CONNECT") == true) {
-                        handleHttpsConnect(client, input, requestLine, connId)
+                        handleHttpsConnect(client, input, requestLine, connId, clientChHere)
                     } else {
-                        handleHttpProxy(client, requestLine, reader, connId)
+                        handleHttpProxy(client, requestLine, reader, connId, clientChHere)
                     }
                 }
             }
@@ -357,7 +580,7 @@ class SocketServerService : Service() {
     }
 
     // ====== HTTP (non-CONNECT) ======
-    private fun handleHttpProxy(client: Socket, requestLine: String?, reader: BufferedReader, connId: Long) {
+    private fun handleHttpProxy(client: Socket, requestLine: String?, reader: BufferedReader, connId: Long, clientChOpt: SocketChannel? = null) {
         if (requestLine == null) {
             Log.e(LOG_TAG, "Null request line")
             try { client.close() } catch (_: Exception) {}
@@ -402,23 +625,27 @@ class SocketServerService : Service() {
             sb.append("\r\n")
             if (body != null) sb.append(String(body))
             val requestBody = sb.toString() // == firstData for HTTP
+            val isLayerMinus = (layerMinus != null)
+            Log.e(LOG_TAG, "HTTP proxy error $host:$port via LayerMinus=$isLayerMinus")
 
-            val upstream: Socket? = if (layerMinus != null) {
+
+            val upstream: Socket? = if (isLayerMinus) {
                 // LayerMinus expects firstData packaged inside
                 layerMinus?.connectToLayerMinus(host, port.toString(), requestBody.toByteArray(Charsets.UTF_8))
             } else {
-                try { Socket(host, port) } catch (e: Exception) {
-                    Log.e(LOG_TAG, "Failed to connect to $host:$port", e); null
+                try { SocketChannel.open(InetSocketAddress(host, port)).socket() } catch (e: Exception) {
+					Log.e(LOG_TAG, "Failed to connect to $host:$port", e); null
                 }
             }
-            if (upstream == null) {
-                try { client.close() } catch (_: Exception) {}
-                onConnClose(connId); return
-            }
 
+			if (upstream == null) { client.close(); onConnClose(connId); return }
             setSocketPerfOptions(client, upstream)
-            // 仅 SOCKS4/4a：上游首包可能慢半拍，放宽读超时，减少首个响应被“早判超时”带来的抖动
-            try { upstream.soTimeout = 300 } catch (_: Exception) {}
+
+            val clientChHere = clientChOpt
+			val upstreamCh = upstream.channel as? SocketChannel
+			val useSelector = (clientChHere != null && upstreamCh != null)
+
+
             // DIRECT must write firstData first, then start bidirectional pumps
             if (layerMinus == null) {
                 BufferedWriter(OutputStreamWriter(upstream.getOutputStream())).apply {
@@ -431,23 +658,41 @@ class SocketServerService : Service() {
             val cliIn  = BufferedInputStream(client.getInputStream(),    128 * 1024)
             val cliOut = BufferedOutputStream(client.getOutputStream(),  128 * 1024)
 
-            val remaining = AtomicInteger(2)
-            val onBothDone = {
+			val remaining = java.util.concurrent.atomic.AtomicInteger(2)
+			val onBothDone = {
                 if (remaining.decrementAndGet() == 0) {
                     try { cliOut.flush() } catch (_: Exception) {}
-                    try { upOut.flush() }  catch (_: Exception) {}
+                    try { upOut.flush() } catch (_: Exception) {}
                     try { upstream.close() } catch (_: Exception) {}
                     try { client.close() }   catch (_: Exception) {}
                     onConnClose(connId)
                 }
             }
-            forwardTrafficAsync(upIn,  cliOut, onDone = onBothDone) // upstream -> client
-            forwardTrafficAsync(
-                cliIn, upOut,
-                onDone = onBothDone,
-                onEof  = { try { upstream.shutdownOutput() } catch (_: Exception) {} },
-                minBytesBeforeEofCallback = 1
-            )
+
+			if (useSelector) {
+				// HTTP 直连：请求头体你已在上游写入；主体后续走 Selector 桥接
+				bridgeWithSelector(
+					clientChHere!!, upstreamCh!!,
+					onDone = {
+						try { upstream.close() } catch (_: Exception) {}
+						try { client.close() } catch (_: Exception) {}
+						onConnClose(connId)
+					},
+					onClientEof = { try { upstream.shutdownOutput() } catch (_: Exception) {} },
+					onUpstreamEof = { try { client.shutdownOutput() } catch (_: Exception) {} },
+					minClientBytesBeforeEof = 1
+				)
+			} else {
+				// 回退：保持原来的双泵
+				forwardTrafficAsync(upIn,  cliOut, onDone = onBothDone, srcSocket = upstream, dstSocket = client)
+				forwardTrafficAsync(
+					cliIn, upOut,
+					onDone = onBothDone,
+					onEof  = { try { upstream.shutdownOutput() } catch (_: Exception) {} },
+					minBytesBeforeEofCallback = 1,
+					srcSocket = client, dstSocket = upstream
+				)
+			}
         } catch (e: Exception) {
             Log.e(LOG_TAG, "HTTP proxy error", e)
             try { client.close() } catch (_: Exception) {}
@@ -456,7 +701,7 @@ class SocketServerService : Service() {
     }
 
     // ====== HTTPS (CONNECT) ======
-    private fun handleHttpsConnect(client: Socket, input: BufferedInputStream, requestLine: String, connId: Long) {
+    private fun handleHttpsConnect(client: Socket, input: BufferedInputStream, requestLine: String, connId: Long, clientChOpt: SocketChannel? = null) {
         try {
             val parts = requestLine.split(" ")
             val target = parts[1]
@@ -473,10 +718,18 @@ class SocketServerService : Service() {
             val cliIn = input
             val firstData = capturePrimeAdaptive(cliIn, client, stepMs = 5, maxRounds = 4, maxBytes = 16 * 1024)
 
-            val upstream: Socket? = if (layerMinus != null) {
+
+            val isLayerMinus = (layerMinus != null)
+            Log.e(LOG_TAG, "HTTPS proxy $host:$port via LayerMinus=$isLayerMinus")
+
+
+            val upstream: Socket? = if (isLayerMinus) {
                 layerMinus?.connectToLayerMinus(host, port.toString(), firstData)
             } else {
-                try { Socket(host, port) } catch (_: Exception) { null }
+                try { 
+					val ch = SocketChannel.open(InetSocketAddress(host, port))
+					ch.socket()
+				} catch (_: Exception) { null }
             }
 
 
@@ -484,19 +737,22 @@ class SocketServerService : Service() {
                 try { client.close() } catch (_: Exception) {}
                 onConnClose(connId); return
             }
+
             setSocketPerfOptions(client, upstream)
+			val clientChHere = clientChOpt
+			val upstreamCh = upstream.channel as? SocketChannel
+			val useSelector = (clientChHere != null && upstreamCh != null)
 
-
-
-            try { upstream.soTimeout = 300 } catch (_: Exception) {} // 仅 CONNECT 放宽
 
             val upIn   = BufferedInputStream(upstream.getInputStream(),   128 * 1024)
             val upOutB = BufferedOutputStream(upstream.getOutputStream(), 128 * 1024)
             val cliOut = BufferedOutputStream(client.getOutputStream(),   128 * 1024)
-            // DIRECT：若抓到了首包，先踢给上游
-            if (layerMinus == null && firstData != null && firstData.isNotEmpty()) {
-                try { upOutB.write(firstData); upOutB.flush() } catch (_: Exception) {}
-            }
+			
+			// Selector 模式：由桥接函数在启动前注入 firstData；否则仍走原流程
+			val directFirstData = if (layerMinus == null) firstData else null
+			if (!useSelector && directFirstData != null && directFirstData.isNotEmpty()) {
+				try { upOutB.write(directFirstData); upOutB.flush() } catch (_: Exception) {}
+			}
 
 
             // 双泵复用同一个 cliIn；cli->up 方向保持 minBytesBeforeEofCallback=1
@@ -510,19 +766,35 @@ class SocketServerService : Service() {
                     onConnClose(connId)
                 }
             }
-            forwardTrafficAsync(
-                upIn, cliOut,
-                onDone = onBothDone,
-                onEof  = { try { client.shutdownOutput() } catch (_: Exception) {} }
-            )
-            forwardTrafficAsync(
-                cliIn, upOutB,
-                onDone = onBothDone,
-                onEof  = { try { upstream.shutdownOutput() } catch (_: Exception) {} },
-                minBytesBeforeEofCallback = 1 // 防 0B EOF 误半关
-            )
-
-            Log.d(LOG_TAG, "Forwarding $host:$port via CONNECT")
+			if (useSelector) {
+				// 修正：bridgeWithSelector只需要一次调用，不需要remaining计数
+				bridgeWithSelector(
+					clientChHere!!, upstreamCh!!,
+					onDone = {
+						try { upstream.close() } catch (_: Exception) {}
+						try { client.close() } catch (_: Exception) {}
+						onConnClose(connId)
+					},
+					onClientEof = { try { upstream.shutdownOutput() } catch (_: Exception) {} },
+					onUpstreamEof = { try { client.shutdownOutput() } catch (_: Exception) {} },
+					minClientBytesBeforeEof = 1,
+					firstDataToUpstream = directFirstData
+				)
+			} else {
+				forwardTrafficAsync(
+					upIn, cliOut,
+					onDone = onBothDone,
+					onEof  = { try { client.shutdownOutput() } catch (_: Exception) {} },
+					srcSocket = upstream, dstSocket = client
+				)
+				forwardTrafficAsync(
+					cliIn, upOutB,
+					onDone = onBothDone,
+					onEof  = { try { upstream.shutdownOutput() } catch (_: Exception) {} },
+					minBytesBeforeEofCallback = 1,
+					srcSocket = client, dstSocket = upstream
+				)
+			}
         } catch (e: Exception) {
             Log.e(LOG_TAG, "HTTPS CONNECT failed", e)
             try { client.close() } catch (_: Exception) {}
@@ -530,66 +802,193 @@ class SocketServerService : Service() {
         }
     }
 
+    /**
+     * SOCKS4 错误响应码定义
+     * 参考 RFC 1928 和 SOCKS4 协议规范
+     */
+    object Socks4ReplyCode {
+        const val GRANTED = 0x5a           // 请求已批准，连接建立
+        const val REJECTED = 0x5b          // 请求被拒绝或失败（通用错误）
+        const val NO_IDENTD = 0x5c         // 请求失败，因为客户端没有运行 identd
+        const val USER_MISMATCH = 0x5d     // 请求失败，因为 identd 报告的用户ID不匹配
+    }
+
+    /**
+     * 发送 SOCKS4 拒绝响应
+     *
+     * @param output 输出流
+     * @param replyCode 错误码（使用 Socks4ReplyCode 中定义的常量）
+     * @param port 端口号（可选，用于回显）
+     * @param ip IP地址（可选，用于回显）
+     */
+    private fun sendSocks4Reject(
+        output: OutputStream,
+        replyCode: Int,
+        port: Int = 0,
+        ip: ByteArray? = null
+    ) {
+        try {
+            // SOCKS4 响应格式:
+            // +----+----+----+----+----+----+----+----+
+            // |VER | REP |  DSTPORT  |      DSTIP        |
+            // +----+----+----+----+----+----+----+----+
+            // | 0  |CODE|  2 bytes  |     4 bytes       |
+            // +----+----+----+----+----+----+----+----+
+
+            val response = ByteArray(8)
+
+            // VER: 0x00 表示响应（不是 0x04）
+            response[0] = 0x00
+
+            // REP: 响应码
+            response[1] = replyCode.toByte()
+
+            // DSTPORT: 端口（网络字节序，big-endian）
+            response[2] = (port shr 8).toByte()
+            response[3] = (port and 0xFF).toByte()
+
+            // DSTIP: IP地址（4字节）
+            if (ip != null && ip.size == 4) {
+                System.arraycopy(ip, 0, response, 4, 4)
+            } else {
+                // 默认使用 0.0.0.0
+                response[4] = 0x00
+                response[5] = 0x00
+                response[6] = 0x00
+                response[7] = 0x00
+            }
+
+            // 发送响应
+            output.write(response)
+            output.flush()
+
+            // 记录日志
+            val codeStr = when (replyCode) {
+                Socks4ReplyCode.GRANTED -> "GRANTED"
+                Socks4ReplyCode.REJECTED -> "REJECTED"
+                Socks4ReplyCode.NO_IDENTD -> "NO_IDENTD"
+                Socks4ReplyCode.USER_MISMATCH -> "USER_MISMATCH"
+                else -> "UNKNOWN($replyCode)"
+            }
+
+            Log.d(LOG_TAG, "SOCKS4 响应: $codeStr, port=$port")
+
+        } catch (e: Exception) {
+            Log.e(LOG_TAG, "发送 SOCKS4 响应失败: ${e.message}", e)
+        }
+    }
     // ====== SOCKS4 ======
     // ====== SOCKS4 / SOCKS4a ======
-    private fun handleSocks4(client: Socket, input: InputStream, output: OutputStream, connId: Long) {
+    private fun handleSocks4(client: Socket, input: InputStream, output: OutputStream, connId: Long, clientChOpt: SocketChannel? = null) {
         try {
             // VER(0x04)
             val ver = input.read()
             if (ver != 0x04) {
-                // 非 SOCKS4：按失败 8 字节返回
-                try { output.write(byteArrayOf(0x00, 0x5b, 0,0, 0,0,0,0)); output.flush() } catch (_: Exception) {}
-                client.close(); onConnClose(connId); return
+                sendSocks4Reject(output, Socks4ReplyCode.REJECTED)
+                client.close()
+                onConnClose(connId)
+                return
             }
 
             // CMD，仅支持 CONNECT(0x01)
             val cmd = input.read()
             if (cmd != 0x01) {
-                try { output.write(byteArrayOf(0x00, 0x5b, 0,0, 0,0,0,0)); output.flush() } catch (_: Exception) {}
-                client.close(); onConnClose(connId); return
+                sendSocks4Reject(output, Socks4ReplyCode.REJECTED)
+                client.close()
+                onConnClose(connId)
+                return
             }
 
             // DSTPORT (network-order)
             val port = (input.read() shl 8) or input.read()
             // DSTIP
+            if (port <= 0 || port > 65535) {
+                sendSocks4Reject(output, Socks4ReplyCode.REJECTED)
+                client.close()
+                onConnClose(connId)
+                return
+            }
             val ip = ByteArray(4); input.read(ip)
 
             // USERID (NUL terminated)
             while (input.read() != 0) { /* discard */ }
 
             // SOCKS4a: ip=0.0.0.x 且 x!=0 时，后续还有域名（NUL 结尾）
-            val isSocks4a = (ip[0].toInt() == 0 && ip[1].toInt() == 0 && ip[2].toInt() == 0 && ip[3].toInt() != 0)
-            val destHostOrIp = if (isSocks4a) {
-                val sb = StringBuilder(); var b: Int
-                while (input.read().also { b = it } != 0 && b != -1) sb.append(b.toChar())
-                sb.toString()
+            val isSocks4a = (ip[0].toInt() == 0 &&
+                    ip[1].toInt() == 0 &&
+                    ip[2].toInt() == 0 &&
+                    ip[3].toInt() != 0)
+
+            val destHost: String = if (isSocks4a) {
+                // SOCKS4a：读取域名
+                val sb = StringBuilder()
+                var b: Int
+                while (input.read().also { b = it } != 0 && b != -1) {
+                    sb.append(b.toChar())
+                }
+                val domain = sb.toString()
+
+                // 验证域名不为空
+                if (domain.isEmpty()) {
+                    Log.e(LOG_TAG, "SOCKS4a: 空域名")
+                    sendSocks4Reject(output, Socks4ReplyCode.REJECTED)
+                    client.close()
+                    onConnClose(connId)
+                    return
+                }
+
+                Log.d(LOG_TAG, "SOCKS4a 请求: $domain:$port")
+                domain
             } else {
-                ip.joinToString(".") { (it.toInt() and 0xFF).toString() } // IPv4 字符串
+                // SOCKS4：IP地址字符串
+                val ipStr = ip.joinToString(".") { (it.toInt() and 0xFF).toString() }
+
+                // 验证IP地址合法性
+                if (ipStr == "0.0.0.0" || ipStr == "255.255.255.255") {
+                    Log.e(LOG_TAG, "SOCKS4: 无效IP $ipStr")
+                    sendSocks4Reject(output, Socks4ReplyCode.REJECTED)
+                    client.close()
+                    onConnClose(connId)
+                    return
+                }
+
+                Log.d(LOG_TAG, "SOCKS4 请求: $ipStr:$port")
+                ipStr
             }
 
-            // —— 按 SOCKS4 规范：只允许 IPv4；强制解析到 IPv4，否则失败 8 字节 ——
-            val targetInet4: Inet4Address? = try {
-                val all = InetAddress.getAllByName(destHostOrIp)
-                all.firstOrNull { it is Inet4Address } as? Inet4Address
-            } catch (_: Exception) { null }
+            // 立即发送granted响应（使用占位符地址）
+            val granted = byteArrayOf(
+                0x00, 0x5a,  // 成功
+                0x00, 0x00,  // 端口占位
+                0x00, 0x00, 0x00, 0x00  // IP占位
+            )
 
-            Log.d(LOG_TAG, "SOCKS4 req -> host=$destHostOrIp (v4=${targetInet4?.hostAddress}) port=$port")
-
-            if (targetInet4 == null) {
-                try { output.write(byteArrayOf(0x00, 0x5b, 0,0, 0,0,0,0)); output.flush() } catch (_: Exception) {}
-                client.close(); onConnClose(connId); return
+            try {
+                output.write(granted)
+                output.flush()
+            } catch (e: Exception) {
+                Log.e(LOG_TAG, "发送SOCKS4响应失败", e)
+                client.close()
+                onConnClose(connId)
+                return
             }
 
 
-            // —— 建立上游连接（先建连以获取 BNDADDR/BNDPORT） ——
-            var firstData: ByteArray? = null
+            // 捕获首包
             val cliIn = if (input is BufferedInputStream) input else BufferedInputStream(input, 128 * 1024)
-            firstData = capturePrimeAdaptive(cliIn, client, stepMs = 5, maxRounds = 4, maxBytes = 16 * 1024)
+            val firstData = capturePrimeWithBudget(cliIn, client)
 
-            val upstream: Socket? = if (layerMinus != null) {
-                layerMinus?.connectToLayerMinus(targetInet4.hostAddress, port.toString(), firstData)
+
+            val isLayerMinus = (layerMinus != null)
+            Log.e(LOG_TAG, "SOCKS v4 proxy $destHost:$port via LayerMinus=$isLayerMinus")
+
+            val upstream: Socket? = if (isLayerMinus) {
+                layerMinus?.connectToLayerMinus(destHost, port.toString(), firstData)
             } else {
-                try { Socket(targetInet4, port) } catch (_: Exception) { null }
+                try { 
+					val ch = SocketChannel.open(InetSocketAddress(destHost, port))
+					ch.socket()
+				} catch (_: Exception) { null }
             }
 
 
@@ -600,42 +999,24 @@ class SocketServerService : Service() {
 
             setSocketPerfOptions(client, upstream)
 
-            // —— 0x5A 成功应答：回“代理端本地绑定的 IPv4 与端口” (BNDADDR/BNDPORT) ——
-            val bndPort = upstream.localPort
-            val bndAddrV4: ByteArray = (upstream.localAddress as? Inet4Address)?.address
-                ?: try {
-                    // 极端情形（local 为 v6），兜底给一个合法 IPv4（127.0.0.1）
-                    InetAddress.getByName("127.0.0.1").address
-                } catch (_: Exception) {
-                    byteArrayOf(127,0,0,1)
-                }
-
-            val granted = byteArrayOf(
-                0x00, 0x5a,
-                (bndPort shr 8).toByte(), (bndPort and 0xFF).toByte(),
-                bndAddrV4[0], bndAddrV4[1], bndAddrV4[2], bndAddrV4[3]
-            )
-            try {
-                Log.d(LOG_TAG, "SOCKS4 granted -> BND=${bndAddrV4[0].toInt() and 0xFF}.${bndAddrV4[1].toInt() and 0xFF}.${bndAddrV4[2].toInt() and 0xFF}.${bndAddrV4[3].toInt() and 0xFF}:$bndPort")
-                output.write(granted)
-                output.flush()
-
-
-            } catch (_: Exception) {}
 
 
 
 
             val cliOut = BufferedOutputStream(output, 128 * 1024)
 
-
+			val clientChHere = clientChOpt
+			val upstreamCh = upstream.channel as? SocketChannel
+			val useSelector = (clientChHere != null && upstreamCh != null)
 
             val upIn  = BufferedInputStream(upstream.getInputStream(),   128 * 1024)
             val upOut = BufferedOutputStream(upstream.getOutputStream(), 128 * 1024)
             // DIRECT：若抓到了首包，先踢给上游
-            if (layerMinus == null && firstData != null && firstData.isNotEmpty()) {
-                try { upOut.write(firstData); upOut.flush() } catch (_: Exception) {}
-            }
+
+			val directFirstData = if (layerMinus == null) firstData else null
+			if (!useSelector && directFirstData != null && directFirstData.isNotEmpty()) {
+				try { upOut.write(directFirstData); upOut.flush() } catch (_: Exception) {}
+			}
 
 
             // 之后再启动双泵（保持你现有的 onEof→shutdownOutput、onDone 收尾）
@@ -649,20 +1030,34 @@ class SocketServerService : Service() {
                     onConnClose(connId)
                 }
             }
-
-            // 上游 -> 客户端
-            forwardTrafficAsync(
-                upIn, cliOut,
-                onDone = onBothDone,
-                onEof  = { try { client.shutdownOutput() } catch (_: Exception) {} }
-            )
-            // 客户端 -> 上游：至少搬过 1B 才半关（防 prime-only 触发）
-            forwardTrafficAsync(
-                cliIn, upOut,
-                onDone = onBothDone,
-                onEof  = { try { upstream.shutdownOutput() } catch (_: Exception) {} },
-                minBytesBeforeEofCallback = 1
-            )
+			if (useSelector) {
+				bridgeWithSelector(
+					clientChHere!!, upstreamCh!!,
+					onDone = {
+						try { upstream.close() } catch (_: Exception) {}
+						try { client.close() } catch (_: Exception) {}
+						onConnClose(connId)
+					},
+					onClientEof = { try { upstream.shutdownOutput() } catch (_: Exception) {} },
+					onUpstreamEof = { try { client.shutdownOutput() } catch (_: Exception) {} },
+					minClientBytesBeforeEof = 1,
+					firstDataToUpstream = directFirstData
+				)
+			} else {
+				forwardTrafficAsync(
+					upIn, cliOut,
+					onDone = onBothDone,
+					onEof  = { try { client.shutdownOutput() } catch (_: Exception) {} },
+					srcSocket = upstream, dstSocket = client
+				)
+				forwardTrafficAsync(
+					cliIn, upOut,
+					onDone = onBothDone,
+					onEof  = { try { upstream.shutdownOutput() } catch (_: Exception) {} },
+					minBytesBeforeEofCallback = 1,
+					srcSocket = client, dstSocket = upstream
+				)
+			}
         } catch (e: Exception) {
             Log.e(LOG_TAG, "Error in handleSocks4", e)
             try { client.close() } catch (_: Exception) {}
@@ -765,7 +1160,7 @@ class SocketServerService : Service() {
         return header + packet.data.copyOfRange(0, packet.length)
     }
 
-    private fun handleSocks5(client: Socket, input: InputStream, output: OutputStream, connId: Long) {
+    private fun handleSocks5(client: Socket, input: InputStream, output: OutputStream, connId: Long, clientChOpt: SocketChannel? = null) {
         try {
             // Greeting
             input.read() // VER
@@ -796,27 +1191,45 @@ class SocketServerService : Service() {
                     val firstData = capturePrimeAdaptive(cliIn, client, stepMs = 5, maxRounds = 4, maxBytes = 16 * 1024)
 
 
-                    val upstream: Socket? = if (layerMinus != null) {
+                    val isLayerMinus = (layerMinus != null)
+                    Log.e(LOG_TAG, "SOCKS v5 proxy $destHost:$port via LayerMinus=$isLayerMinus")
+
+
+
+
+                    val upstream: Socket? = if (isLayerMinus) {
                         layerMinus?.connectToLayerMinus(destHost, port.toString(), firstData)
                     } else {
-                        try { Socket(destHost, port) } catch (_: Exception) { null }
+                        try { 
+							val ch = SocketChannel.open(InetSocketAddress(destHost, port))
+							ch.socket()
+						} catch (_: Exception) { null }
                     }
+
+
                     if (upstream == null) {
                         try { client.close() } catch (_: Exception) {}
                         onConnClose(connId); return
                     }
-                    setSocketPerfOptions(client, upstream)
-                    try { upstream.soTimeout = 300 } catch (_: Exception) {} // CONNECT 首包容错
+
+                    setSocketPerfOptions(client, upstream)  
+
+
+					val clientChHere = clientChOpt
+					val upstreamCh = upstream.channel as? SocketChannel
+					val useSelector = (clientChHere != null && upstreamCh != null)
 
 
                     val upIn  = BufferedInputStream(upstream.getInputStream(),   128 * 1024)
                     val upOut = BufferedOutputStream(upstream.getOutputStream(), 128 * 1024)
                     val cliOut = BufferedOutputStream(output, 128 * 1024)
 
+
                     // DIRECT：若抓到了首包，先踢给上游
-                    if (layerMinus == null && firstData != null && firstData.isNotEmpty()) {
-                        try { upOut.write(firstData); upOut.flush() } catch (_: Exception) {}
-                    }
+					val directFirstData = if (layerMinus == null) firstData else null
+					if (!useSelector && directFirstData != null && directFirstData.isNotEmpty()) {
+						try { upOut.write(directFirstData); upOut.flush() } catch (_: Exception) {}
+					}
 
                     val remaining = java.util.concurrent.atomic.AtomicInteger(2)
                     val onBothDone = {
@@ -829,18 +1242,34 @@ class SocketServerService : Service() {
                         }
                     }
 
-                    forwardTrafficAsync(
-                        upIn, cliOut,
-                        onDone = onBothDone,
-                        onEof  = { try { client.shutdownOutput() } catch (_: Exception) {} }
-                    )
-
-                    forwardTrafficAsync(
-                        cliIn, upOut,
-                        onDone = onBothDone,
-                        onEof  = { try { upstream.shutdownOutput() } catch (_: Exception) {} },
-                        minBytesBeforeEofCallback = 1   // ✅ LM 与 DIRECT 共用：防 0B EOF 误半关
-                    )
+					if (useSelector) {
+						bridgeWithSelector(
+							clientChHere!!, upstreamCh!!,
+							onDone = {
+								try { upstream.close() } catch (_: Exception) {}
+								try { client.close() } catch (_: Exception) {}
+								onConnClose(connId)
+							},
+							onClientEof = { try { upstream.shutdownOutput() } catch (_: Exception) {} },
+							onUpstreamEof = { try { client.shutdownOutput() } catch (_: Exception) {} },
+							minClientBytesBeforeEof = 1,
+							firstDataToUpstream = directFirstData
+						)
+					} else {
+						forwardTrafficAsync(
+							upIn, cliOut,
+							onDone = onBothDone,
+							onEof  = { try { client.shutdownOutput() } catch (_: Exception) {} },
+							srcSocket = upstream, dstSocket = client
+						)
+						forwardTrafficAsync(
+							cliIn, upOut,
+							onDone = onBothDone,
+							onEof  = { try { upstream.shutdownOutput() } catch (_: Exception) {} },
+							minBytesBeforeEofCallback = 1,
+							srcSocket = client, dstSocket = upstream
+						)
+					}
 
 
 

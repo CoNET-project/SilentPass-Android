@@ -28,7 +28,6 @@ import android.content.pm.PackageManager
 import androidx.lifecycle.lifecycleScope
 import com.silentPass.vpn.vpn2socks.Vpn2SocksService
 import kotlinx.coroutines.launch
-
 interface VpnStarter {
     fun onVpnStartRequested()
     fun onVpnStopRequested()
@@ -58,7 +57,6 @@ class MainActivity : ComponentActivity(), VpnStarter {
         // 启动服务器
         localWebServer = LocalWebServer(this, 3001)
         localWebServer?.prepareAndStart()
-
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
 
         // 注册相机权限请求
@@ -224,7 +222,8 @@ class MainActivity : ComponentActivity(), VpnStarter {
 
     private fun startSocksServerIfNeeded() {
         val intent = Intent(this, SocketServerService::class.java)
-        startService(intent)
+        // Android 8.0+ 后台启动要求使用前台服务形式；服务内部已在 5s 内 startForeground
+        ContextCompat.startForegroundService(this, intent)
     }
 
     private fun stopSocksServer() {

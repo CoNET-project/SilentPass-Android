@@ -17,6 +17,9 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.OutputStreamWriter
 import java.net.Socket
+import java.net.InetSocketAddress
+import java.nio.channels.SocketChannel
+import java.nio.channels.Channels
 import java.nio.charset.StandardCharsets
 import java.security.SecureRandom
 import java.util.UUID
@@ -24,12 +27,15 @@ import java.util.UUID
 
 
 class LayerMinus(startVPNData: StartVPNData) {
+
     private val credentials: Credentials = Credentials.create(
         startVPNData.privateKey.removePrefix("0x")
     )
+
     val entryNodes = startVPNData.entryNodes
     val exitNode = startVPNData.exitNode
     val jsonGson = Gson()
+
     fun getKeyIdFromArmoredPublicKey(armoredPublicKey: String): Long {
         val publicKeyRing = PGPainless.readKeyRing()
             .publicKeyRing(ByteArrayInputStream(armoredPublicKey.toByteArray(Charsets.UTF_8)))!!
@@ -39,8 +45,16 @@ class LayerMinus(startVPNData: StartVPNData) {
     }
 
     fun postEncryptedPGPMessage(host: String, pgpMessage: String): Socket {
-        val socket = Socket(host, 80)
-        val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
+		// 使用 SocketChannel 建立客户端连接；保持阻塞以兼容现有工作流
+		val ch = SocketChannel.open(InetSocketAddress(host, 80))
+		ch.configureBlocking(true)
+		val socket = ch.socket().apply {
+			try { tcpNoDelay = true } catch (_: Exception) {}
+			try { keepAlive = true } catch (_: Exception) {}
+		}
+
+		val out = Channels.newOutputStream(ch)
+		val writer = BufferedWriter(OutputStreamWriter(out, Charsets.UTF_8))
 
         val path = "/post"
         val contentLength = pgpMessage.toByteArray(Charsets.UTF_8).size
