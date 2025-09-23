@@ -64,6 +64,17 @@ class TCPConnection(
         private const val MAX_PENDING_ACKS = 2
     }
 
+    // --- Fast path: local loopback SOCKS (e.g., desktop/AVD 127.0.0.1:8888) ---
+    // 目的：回环链路极快，无需为“隧道/封装”预留额外头部，放宽 MSS 以提升吞吐。
+    private val localProxyFastPath: Boolean by lazy {
+        try {
+            val h = (socksEndpoint.host ?: "").lowercase(Locale.ROOT)
+            val isLoop =
+                h == "127.0.0.1" || h == "localhost" || h == "::1"
+            isLoop && socksEndpoint.port == 8888
+        } catch (_: Throwable) { false }
+    }
+
 	// ---- Log deduplication (noise control) ----
 	private val lastLogTs = ConcurrentHashMap<String, Long>()
 	private fun shouldLog(key: String, windowMs: Long = 3000L): Boolean {
@@ -92,18 +103,25 @@ class TCPConnection(
         // 1) 基于实际 MTU 的保守基线（IPv4 20 + TCP 20）
         val base = kotlin.math.min(MSS_STANDARD, (mtu - 40).coerceAtLeast(536))
 
-        // 2) 为隧道/封装预留余量（经验 80B），直连不预留
+        // 2) 回环本地代理快速通道：不预留额外头部，不套隧道 cap，尽量接近标准以提升吞吐
+        if (localProxyFastPath) {
+            // 回环上尽量大，但仍保留最小 1200 的保守下限以兼容 TLS/HTTP2 初始分片
+            val loopClamped = base.coerceIn(1200, MSS_STANDARD)
+            if (shouldLog("FASTPATH_MSS")) {
+                Log.i(LOG_TAG, "LocalProxyFastPath on -> MSS=$loopClamped for ${getDisplayKey()}")
+            }
+            return loopClamped
+        }
+
+        // 3) 为隧道/封装预留余量（经验 80B），直连不预留
         val headroom = if (bypassDirect) 0 else 80
         val tunneled = (base - headroom).coerceAtLeast(536)
 
-        // 3) 与经验上限取最小（SOCKS/VPN 场景更保守）
-        val cap = if (bypassDirect) MSS_STANDARD else kotlin.math.min(MSS_SOCKS, MSS_VPN + 60) // 1420 vs ~1420
+        // 4) 与经验上限取最小（SOCKS/VPN 场景更保守）
+        val cap = if (bypassDirect) MSS_STANDARD else kotlin.math.min(MSS_SOCKS, MSS_VPN + 60)
 
-        // 4) 夹在 [1200, cap] 区间内（HTTP/2/TLS 初期分片风险小）
-        val clamped = tunneled
-            .coerceAtMost(cap)
-            .coerceAtLeast(if (bypassDirect) 1200 else 1200)
-
+        // 5) 夹在 [1200, cap] 区间内（HTTP/2/TLS 初期分片风险小）
+        val clamped = tunneled.coerceIn(1200, cap)
         return clamped
     }
 
@@ -392,15 +410,22 @@ class TCPConnection(
                 val now = System.currentTimeMillis()
                 val timeSinceLastWrite = now - lastWriteTime
 
-                // 动态决定是否flush
+
+                // 动态决定是否 flush
+                // 本地代理快速通道：更倾向于合并（等待 5~10ms 或 16KB）
+                val sizeThreshold = if (localProxyFastPath) 16 * 1024 else 4096
+                val timeThresholdMs = if (localProxyFastPath) 5L else 1L
+                val burstWrites = if (localProxyFastPath) 4 else 2
+
                 val shouldFlush = when {
                     buffer.size() >= mtu - 100 -> true
-                    buffer.size() >= 4096 -> true  // Reduced from 16KB
-                    pendingWrites.size >= 2 -> true
-                    timeSinceLastWrite > 1 && buffer.size() > 0 -> true  // Reduced from 5ms
+                    buffer.size() >= sizeThreshold -> true
+                    pendingWrites.size >= burstWrites -> true
+                    timeSinceLastWrite > timeThresholdMs && buffer.size() > 0 -> true
                     data.size > 1000 -> true
                     else -> false
                 }
+
 
                 return if (shouldFlush) {
                     val merged = buffer.toByteArray()
@@ -417,6 +442,28 @@ class TCPConnection(
                     true
                 }
             }
+        }
+    }
+
+   // 轻量守护，不改变原有状态机；只在 pending 非空时触发一次写入尝试。
+    private suspend fun flushPendingBestEffort() {
+        try {
+            val toSend = mutableListOf<ByteArray>()
+            pendingLock.withLock {
+                while (pending.isNotEmpty()) {
+                    toSend.add(pending.removeFirst())
+                }
+            }
+            if (toSend.isNotEmpty()) {
+                // 直接走 coalescer 快速路径
+                writeCoalescer.flush { merged ->
+                    upstreamWriter?.write(merged)
+                    upstreamWriter?.flush()
+                    true
+                }
+            }
+        } catch (e: Throwable) {
+            Log.w(LOG_TAG, "flushPendingBestEffort error: ${e.message}")
         }
     }
 
