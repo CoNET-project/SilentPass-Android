@@ -77,7 +77,7 @@ class SocketServerService : Service() {
         val buf = ByteArray(maxBytes)
         var total = 0
         val prev = client.soTimeout
-        val TLS_Length = 500
+        val TLS_Length = 384
 
         try {
             // 0ms：非阻塞检查
@@ -189,17 +189,21 @@ class SocketServerService : Service() {
 		dstSocket: java.net.Socket? = null
     ): Future<*> {
 		return threadPoolExecutor.submit {
+
+
+            val startNs = System.nanoTime()
+
 			// 统一回退实现（阻塞流式），Selector 双向桥接在 bridgeWithSelector 调用处触发
-			Log.d(LOG_TAG, "Start forwarding (fallback) from ${input.javaClass.simpleName} to ${output.javaClass.simpleName}")
+			Log.d(LOG_TAG, "Start forwardTrafficAsync (fallback) from ${input.javaClass.simpleName} to ${output.javaClass.simpleName}")
 			var src: java.nio.channels.ReadableByteChannel? = null
 			var dst: java.nio.channels.WritableByteChannel? = null
+            var totalBytes = 0L
 			try {
 
 				Log.d(LOG_TAG, "input available bytes: ${input.available()}")
 				src = Channels.newChannel(input)
 				dst = Channels.newChannel(output)
 				val buf = java.nio.ByteBuffer.allocateDirect(bufferSize)
-				var totalBytes = 0L
 				var sinceLastFlush = 0L
 				val WARMUP_LIMIT = 64 * 1024
 				val FLUSH_THRESHOLD = 64 * 1024
@@ -246,6 +250,9 @@ class SocketServerService : Service() {
 			} catch (e: Exception) {
 				Log.e(LOG_TAG, "Error forwarding traffic (fallback NIO)", e)
 			} finally {
+                val durMs = (System.nanoTime() - startNs) / 1_000_000
+                Log.i(LOG_TAG, "FALLBACK stats bytes=$totalBytes dur=${durMs}ms")
+
 				try { (output as? BufferedOutputStream)?.flush() } catch (_: Exception) {}
 				try { onDone?.invoke() } catch (_: Exception) {}
 			}
@@ -262,13 +269,28 @@ class SocketServerService : Service() {
 		onDone: (() -> Unit)? = null,
 		onClientEof: (() -> Unit)? = null,
 		onUpstreamEof: (() -> Unit)? = null,
-		minClientBytesBeforeEof: Long = 1,
+		minClientBytesBeforeEof: Long = 32,
 		minUpstreamBytesBeforeEof: Long = 0,
 		firstDataToUpstream: ByteArray? = null,
-		bufSize: Int = 128 * 1024
+		bufSize: Int = 128 * 1024,
+        connId: Long = -1
 	): Future<*> {
 		return threadPoolExecutor.submit {
+
+            fun isBenignIo(e: java.io.IOException): Boolean {
+                val msg = e.message?.lowercase() ?: return false
+                return msg.contains("connection reset by peer") || msg.contains("broken pipe")
+            }
+
 			var selector: Selector? = null
+            var c2uBytes = 0L
+            var u2cBytes = 0L
+            var clientWriteClosed = false
+            var upstreamWriteClosed = false
+            var loggedClientWriteClosed = false
+            var loggedUpstreamWriteClosed = false
+            val startNs = System.nanoTime()
+
 			try {
 				clientCh.configureBlocking(false)
 				upstreamCh.configureBlocking(false)
@@ -280,11 +302,9 @@ class SocketServerService : Service() {
 				val u2c = java.nio.ByteBuffer.allocateDirect(bufSize)
 				var cClosed = false
 				var uClosed = false
-				var c2uBytes = 0L
-				var u2cBytes = 0L
 
-				var clientWriteClosed = false
-				var upstreamWriteClosed = false
+
+
 
 				fun keyOpen(ch: SocketChannel?, key: SelectionKey?): Boolean =
 					(ch != null && ch.isOpen && key != null && key.isValid)
@@ -333,7 +353,9 @@ class SocketServerService : Service() {
 										cKey.interestOps(cKey.interestOps() and SelectionKey.OP_READ.inv())
 									} else {
 										try {
-											val n = clientCh.read(c2u)
+                                            val n = try { clientCh.read(c2u) } catch (e: java.io.IOException) {
+                                                if (isBenignIo(e)) -1 else throw e
+                                            }
 											if (n == -1) {
 												cClosed = true
 												cKey.interestOps(cKey.interestOps() and SelectionKey.OP_READ.inv())
@@ -374,12 +396,32 @@ class SocketServerService : Service() {
                                             uKey.interestOps(uKey.interestOps() or SelectionKey.OP_READ)
                                         }
                                     } catch (_: java.nio.channels.ClosedChannelException) {
-                                        Log.d(LOG_TAG, "Selector: client closed on write")
                                         clientWriteClosed = true
+                                        try { upstreamCh.socket().shutdownOutput() } catch (_: Exception) {}
+                                        if (!loggedClientWriteClosed) {
+                                            Log.d(LOG_TAG, "Selector: client closed on write")
+                                            loggedClientWriteClosed = true
+                                        }
                                         cancelKeyQuiet(cKey)
                                         u2c.clear()
                                     } catch (_: java.nio.channels.CancelledKeyException) {
                                         clientWriteClosed = true
+                                        if (!loggedClientWriteClosed) {
+                                            Log.d(LOG_TAG, "Selector: client key cancelled on write")
+                                            loggedClientWriteClosed = true
+                                        }
+                                    } catch (e: java.io.IOException) {
+                                        if (isBenignIo(e)) {
+                                            clientWriteClosed = true
+                                            try { upstreamCh.socket().shutdownOutput() } catch (_: Exception) {}
+                                            if (!loggedClientWriteClosed) {
+                                                Log.d(LOG_TAG, "Selector: client write benign IO (${e.message})")
+                                                loggedClientWriteClosed = true
+                                            }
+                                            cancelKeyQuiet(cKey); u2c.clear()
+                                        } else {
+                                            throw e
+                                        }
                                     }
 								}
 							}
@@ -390,7 +432,10 @@ class SocketServerService : Service() {
 										uKey.interestOps(uKey.interestOps() and SelectionKey.OP_READ.inv())
 									} else {
 										try {
-                                            val n = upstreamCh.read(u2c)
+                                            val n = try { upstreamCh.read(u2c) } catch (e: java.io.IOException) {
+                                                if (isBenignIo(e)) -1 else throw e
+                                            }
+
                                             if (n == -1) {
                                                 uClosed = true
                                                 uKey.interestOps(uKey.interestOps() and SelectionKey.OP_READ.inv())
@@ -431,12 +476,32 @@ class SocketServerService : Service() {
                                             cKey.interestOps(cKey.interestOps() or SelectionKey.OP_READ)
                                         }
                                     } catch (_: java.nio.channels.ClosedChannelException) {
-                                        Log.d(LOG_TAG, "Selector: upstream closed on write")
                                         upstreamWriteClosed = true
-                                        cancelKeyQuiet(uKey)
-                                        c2u.clear()
+                                        try { clientCh.socket().shutdownOutput() } catch (_: Exception) {}
+                                        if (!loggedUpstreamWriteClosed) {
+                                            Log.d(LOG_TAG, "Selector: upstream closed on write")
+                                            loggedUpstreamWriteClosed = true
+                                        }
+                                        cancelKeyQuiet(uKey); c2u.clear()
                                     } catch (_: java.nio.channels.CancelledKeyException) {
+
                                         upstreamWriteClosed = true
+                                        if (!loggedUpstreamWriteClosed) {
+                                            Log.d(LOG_TAG, "Selector: upstream key cancelled on write")
+                                            loggedUpstreamWriteClosed = true
+                                        }
+                                    } catch (e: java.io.IOException) {
+                                        if (isBenignIo(e)) {
+                                            upstreamWriteClosed = true
+                                            try { clientCh.socket().shutdownOutput() } catch (_: Exception) {}
+                                            if (!loggedUpstreamWriteClosed) {
+                                                Log.d(LOG_TAG, "Selector: upstream write benign IO (${e.message})")
+                                                loggedUpstreamWriteClosed = true
+                                            }
+                                            cancelKeyQuiet(uKey); c2u.clear()
+                                        } else {
+                                            throw e
+                                        }
                                     }
 								}
 							}
@@ -449,9 +514,20 @@ class SocketServerService : Service() {
                         c2u.position() == 0 && u2c.position() == 0) break@loop
 				}
 			} catch (e: Exception) {
-				// 剩余异常留作错误，ClosedChannel 相关已在分支内消化为 DEBUG
-                Log.e(LOG_TAG, "Selector bridge error", e)
+                // 可预期 I/O（RST / PIPE）降级为 DEBUG；其他保留堆栈
+                if (e is java.io.IOException &&
+                    ((e.message?.lowercase()?.contains("connection reset by peer") == true) ||
+                            (e.message?.lowercase()?.contains("broken pipe") == true))) {
+                    Log.d(LOG_TAG, "Selector bridge benign IO (${e.message})")
+                } else {
+                    Log.e(LOG_TAG, "Selector bridge error", e)
+                }
 			} finally {
+                val durMs = (System.nanoTime() - startNs) / 1_000_000
+                Log.i(LOG_TAG,
+                    "Start bridgeWithSelector BRIDGE stats conn#$connId c2u=$c2uBytes u2c=$u2cBytes dur=${durMs}ms " +
+                           "halfClose(client=$clientWriteClosed, upstream=$upstreamWriteClosed)"
+                )
 				try { selector?.close() } catch (_: Exception) {}
 				try { onDone?.invoke() } catch (_: Exception) {}
 			}
@@ -493,6 +569,10 @@ class SocketServerService : Service() {
 
                 while (isRunning) {
 					val clientCh = serverChannel?.accept() ?: break
+
+                    // 调优下游通道，避免主动 close() 触发 RST、提升交互性
+                    tuneSocket(clientCh)
+
 					val client = clientCh.socket()
 					val connId = connSeq.incrementAndGet()
 					onConnOpen(connId)
@@ -562,8 +642,23 @@ class SocketServerService : Service() {
                 0x04 -> handleSocks4(client, input, output, connId, clientChHere)
                 0x05 -> handleSocks5(client, input, output, connId, clientChHere)
                 else -> {
+                    // HTTP branch guard: only parse if first byte is ASCII uppercase (method)
+                    input.mark(1)
+                    val b0 = input.read()
+                    input.reset()
+                    if (b0 !in 65..90) {
+                        Log.d(LOG_TAG, "HTTP guard: non-HTTP first byte=0x${String.format("%02x", b0)}; drop")
+                        try { client.close() } catch (_: Exception) {}
+                        onConnClose(connId); return
+                    }
+
                     val reader = BufferedReader(InputStreamReader(input))
                     val requestLine = reader.readLine()
+                    if (requestLine == null || !Regex("^[A-Z]{3,10} ").containsMatchIn(requestLine)) {
+                        Log.d(LOG_TAG, "HTTP guard: invalid request line, drop: $requestLine")
+                        try { client.close() } catch (_: Exception) {}
+                        onConnClose(connId); return
+                    }
                     Log.d(LOG_TAG, "HTTP/s forwarding $requestLine")
                     if (requestLine?.startsWith("CONNECT") == true) {
                         handleHttpsConnect(client, input, requestLine, connId, clientChHere)
@@ -626,14 +721,18 @@ class SocketServerService : Service() {
             if (body != null) sb.append(String(body))
             val requestBody = sb.toString() // == firstData for HTTP
             val isLayerMinus = (layerMinus != null)
-            Log.e(LOG_TAG, "HTTP proxy error $host:$port via LayerMinus=$isLayerMinus")
+            Log.i(LOG_TAG, "HTTP proxy connect $host:$port via LayerMinus=$isLayerMinus")
 
 
             val upstream: Socket? = if (isLayerMinus) {
                 // LayerMinus expects firstData packaged inside
                 layerMinus?.connectToLayerMinus(host, port.toString(), requestBody.toByteArray(Charsets.UTF_8))
             } else {
-                try { SocketChannel.open(InetSocketAddress(host, port)).socket() } catch (e: Exception) {
+                try {
+                    val ch = SocketChannel.open(InetSocketAddress(host, port))
+                    tuneSocket(ch)
+                    ch.socket()
+                } catch (e: Exception) {
 					Log.e(LOG_TAG, "Failed to connect to $host:$port", e); null
                 }
             }
@@ -680,7 +779,8 @@ class SocketServerService : Service() {
 					},
 					onClientEof = { try { upstream.shutdownOutput() } catch (_: Exception) {} },
 					onUpstreamEof = { try { client.shutdownOutput() } catch (_: Exception) {} },
-					minClientBytesBeforeEof = 1
+					minClientBytesBeforeEof = 32,
+                    connId = connId
 				)
 			} else {
 				// 回退：保持原来的双泵
@@ -716,20 +816,23 @@ class SocketServerService : Service() {
 
             // 统一：在分支前“微等待 prime”（≤10ms；复用同一个 BufferedInputStream）
             val cliIn = input
-            val firstData = capturePrimeAdaptive(cliIn, client, stepMs = 5, maxRounds = 4, maxBytes = 16 * 1024)
+            val firstData = capturePrimeWithBudget(cliIn, client, maxBytes = 16 * 1024)
 
 
             val isLayerMinus = (layerMinus != null)
-            Log.e(LOG_TAG, "HTTPS proxy $host:$port via LayerMinus=$isLayerMinus")
+            Log.i(LOG_TAG, "HTTPS proxy connect $host:$port via LayerMinus=$isLayerMinus")
 
 
             val upstream: Socket? = if (isLayerMinus) {
                 layerMinus?.connectToLayerMinus(host, port.toString(), firstData)
             } else {
-                try { 
-					val ch = SocketChannel.open(InetSocketAddress(host, port))
-					ch.socket()
-				} catch (_: Exception) { null }
+                try {
+                    val ch = SocketChannel.open(InetSocketAddress(host, port))
+                    tuneSocket(ch)
+                    ch.socket()
+                } catch (e: Exception) {
+                    Log.e(LOG_TAG, "Failed to connect to $host:$port", e); null
+                }
             }
 
 
@@ -777,8 +880,10 @@ class SocketServerService : Service() {
 					},
 					onClientEof = { try { upstream.shutdownOutput() } catch (_: Exception) {} },
 					onUpstreamEof = { try { client.shutdownOutput() } catch (_: Exception) {} },
-					minClientBytesBeforeEof = 1,
-					firstDataToUpstream = directFirstData
+					minClientBytesBeforeEof = 32,
+					firstDataToUpstream = directFirstData,
+                    connId = connId
+
 				)
 			} else {
 				forwardTrafficAsync(
@@ -980,15 +1085,18 @@ class SocketServerService : Service() {
 
 
             val isLayerMinus = (layerMinus != null)
-            Log.e(LOG_TAG, "SOCKS v4 proxy $destHost:$port via LayerMinus=$isLayerMinus")
+            Log.i(LOG_TAG, "SOCKS v4 proxy connect $destHost:$port via LayerMinus=$isLayerMinus")
 
             val upstream: Socket? = if (isLayerMinus) {
                 layerMinus?.connectToLayerMinus(destHost, port.toString(), firstData)
             } else {
-                try { 
-					val ch = SocketChannel.open(InetSocketAddress(destHost, port))
-					ch.socket()
-				} catch (_: Exception) { null }
+                try {
+                    val ch = SocketChannel.open(InetSocketAddress(destHost, port))
+                    tuneSocket(ch)
+                    ch.socket()
+                } catch (e: Exception) {
+                    Log.e(LOG_TAG, "Failed to connect to $destHost:$port", e); null
+                }
             }
 
 
@@ -1040,8 +1148,10 @@ class SocketServerService : Service() {
 					},
 					onClientEof = { try { upstream.shutdownOutput() } catch (_: Exception) {} },
 					onUpstreamEof = { try { client.shutdownOutput() } catch (_: Exception) {} },
-					minClientBytesBeforeEof = 1,
-					firstDataToUpstream = directFirstData
+					minClientBytesBeforeEof = 32,
+					firstDataToUpstream = directFirstData,
+                    connId = connId
+
 				)
 			} else {
 				forwardTrafficAsync(
@@ -1117,6 +1227,19 @@ class SocketServerService : Service() {
         }
     }
 
+    private fun tuneSocket(ch: java.nio.channels.SocketChannel) {
+        try {
+            ch.socket().tcpNoDelay = true
+        } catch (_: Exception) {}
+        try {
+            ch.socket().keepAlive = true
+        } catch (_: Exception) {}
+        try {
+            // 禁用 SO_LINGER，防止 close() 主动发 RST
+            ch.socket().setSoLinger(false, 0)
+        } catch (_: Exception) {}
+    }
+
     // 统一零等待 prime（LM/DIRECT/所有协议共用）：只读“已到达”的字节；不阻塞；带统计
     private fun capturePrimeNonBlocking(cliIn: BufferedInputStream, maxBytes: Int = 16 * 1024): ByteArray? {
         var n = 0
@@ -1188,11 +1311,11 @@ class SocketServerService : Service() {
                     output.write(okResp); output.flush()
                     // 统一：分支前“微等待 prime”（5–10ms；复用握手流）
                     val cliIn = if (input is BufferedInputStream) input else BufferedInputStream(input, 128 * 1024)
-                    val firstData = capturePrimeAdaptive(cliIn, client, stepMs = 5, maxRounds = 4, maxBytes = 16 * 1024)
+                    val firstData = capturePrimeAdaptive(cliIn, client, stepMs = 10, maxRounds = 5, maxBytes = 16 * 1024)
 
 
                     val isLayerMinus = (layerMinus != null)
-                    Log.e(LOG_TAG, "SOCKS v5 proxy $destHost:$port via LayerMinus=$isLayerMinus")
+                    Log.i(LOG_TAG, "SOCKS v5 proxy connect $destHost:$port via LayerMinus=$isLayerMinus")
 
 
 
@@ -1200,10 +1323,13 @@ class SocketServerService : Service() {
                     val upstream: Socket? = if (isLayerMinus) {
                         layerMinus?.connectToLayerMinus(destHost, port.toString(), firstData)
                     } else {
-                        try { 
-							val ch = SocketChannel.open(InetSocketAddress(destHost, port))
-							ch.socket()
-						} catch (_: Exception) { null }
+                        try {
+                            val ch = SocketChannel.open(InetSocketAddress(destHost, port))
+                            tuneSocket(ch)
+                            ch.socket()
+                        } catch (e: Exception) {
+                            Log.e(LOG_TAG, "Failed to connect to $destHost:$port", e); null
+                        }
                     }
 
 
@@ -1252,8 +1378,9 @@ class SocketServerService : Service() {
 							},
 							onClientEof = { try { upstream.shutdownOutput() } catch (_: Exception) {} },
 							onUpstreamEof = { try { client.shutdownOutput() } catch (_: Exception) {} },
-							minClientBytesBeforeEof = 1,
-							firstDataToUpstream = directFirstData
+							minClientBytesBeforeEof = 32,
+							firstDataToUpstream = directFirstData,
+                            connId = connId
 						)
 					} else {
 						forwardTrafficAsync(

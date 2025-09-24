@@ -806,7 +806,8 @@ class DNSInterceptor private constructor() {
 
         "taboola.com",
         "yahoo.com",
-        "publicsuffix.org"
+        "publicsuffix.org",
+        "ziffstatic.com"
     )
 
     private val bypassPatterns = listOf(
