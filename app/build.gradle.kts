@@ -75,6 +75,8 @@ android {
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
+			excludes += "/META-INF/{AL,LGPL2.1,LICENSE,NOTICE,INDEX.LIST}"
+            excludes += "/META-INF/io.netty.versions.properties"
         }
     }
 }
@@ -108,6 +110,12 @@ dependencies {
     implementation("com.google.android.material:material:1.11.0")
 
 	    // ... 其他依赖
+
+		    // Netty 的核心传输层 (已包含 NIO 实现)
+			implementation("io.netty:netty-transport:4.1.108.Final")
+			
+			// SOCKS 协议编解码器
+			implementation("io.netty:netty-codec-socks:4.1.108.Final")
 
     // OkHttp 用于网络请求
     implementation("com.squareup.okhttp3:okhttp:4.12.0")

@@ -1076,7 +1076,21 @@ class TCPConnection(
             } catch (_: Throwable) {}
 
             val port = syn.dstPort
-            val hostForDial = domain ?: ip.dst.toString()
+            // Prefer domain; if absent,再尝试一次反查；若仍无且是 Fake IP，拒绝直拨
+            val hostForDial = when {
+                domain != null -> domain
+                else -> {
+                    val d2 = dns.lookupDomain(ip.dst)
+                    if (d2 != null) d2
+                    else {
+                        if (dns.isFakeIp(ip.dst)) {
+                            Log.w(LOG_TAG, "Refuse dialing fake IP ${ip.dst} without domain mapping")
+                            throw IOException("Missing domain for fake IP ${ip.dst}")
+                        }
+                        ip.dst.toString()
+                    }
+                }
+            }
 
             Log.d(LOG_TAG, "Establishing upstream to $hostForDial:$port")
             val speedtestLike = isSpeedtestDomain(hostForDial) || port == 8080

@@ -23,10 +23,41 @@ import java.nio.channels.Channels
 import java.nio.charset.StandardCharsets
 import java.security.SecureRandom
 import java.util.UUID
+import java.nio.channels.Selector
+import java.nio.channels.SelectionKey
 
+
+data class LmPlan(
+    val entryHost: String,      // 入口节点（B）
+    val entryPort: Int,         // 一般 80/443，按你的入口配置
+    val destHost: String,       // 目标 D（仅用于日志/可选）
+    val destPort: Int,
+    val packedFirstData: ByteArray // 第一拍要发给入口 B 的完整字节（含HTTP头+PGP JSON）
+)
 
 
 class LayerMinus(startVPNData: StartVPNData) {
+	val path = "/post"
+	private fun makeHttpPost(host: String, bodyUtf8: String): ByteArray {
+		val body = bodyUtf8.toByteArray(Charsets.UTF_8)
+		val sb = StringBuilder()
+		sb.append("POST ").append(path).append(" HTTP/1.1\r\n")
+		.append("Host: ").append(host).append("\r\n")
+		.append("Content-Type: application/json\r\n")
+		.append("Content-Length: ").append(body.size).append("\r\n")
+		.append("Connection: keep-alive\r\n")
+		.append("\r\n")
+		val head = sb.toString().toByteArray(Charsets.UTF_8)
+		return head + body
+	}
+
+	// 与 SocketServerService 一致的轻量 socket 调优
+    private fun tuneSocket(ch: SocketChannel) {
+        try { ch.socket().tcpNoDelay = true } catch (_: Exception) {}
+        try { ch.socket().keepAlive = true } catch (_: Exception) {}
+        try { ch.socket().setSoLinger(false, 0) } catch (_: Exception) {} // 避免主动 close 触发 RST
+    }
+
 
     private val credentials: Credentials = Credentials.create(
         startVPNData.privateKey.removePrefix("0x")
@@ -42,33 +73,6 @@ class LayerMinus(startVPNData: StartVPNData) {
 
         val primaryKey = publicKeyRing.publicKey
         return primaryKey.keyID
-    }
-
-    fun postEncryptedPGPMessage(host: String, pgpMessage: String): Socket {
-		// 使用 SocketChannel 建立客户端连接；保持阻塞以兼容现有工作流
-		val ch = SocketChannel.open(InetSocketAddress(host, 80))
-		ch.configureBlocking(true)
-		val socket = ch.socket().apply {
-			try { tcpNoDelay = true } catch (_: Exception) {}
-			try { keepAlive = true } catch (_: Exception) {}
-		}
-
-		val out = Channels.newOutputStream(ch)
-		val writer = BufferedWriter(OutputStreamWriter(out, Charsets.UTF_8))
-
-        val path = "/post"
-        val contentLength = pgpMessage.toByteArray(Charsets.UTF_8).size
-
-        // Step 1: Write HTTP POST request
-        writer.write("POST $path HTTP/1.1\r\n")
-        writer.write("Host: $host\r\n")
-        writer.write("Content-Type: application/json;charset=UTF-8\r\n")
-        writer.write("Connection: keep-alive\r\n")
-        writer.write("Content-Length: $contentLength\r\n")
-        writer.write("\r\n") // End of headers
-        writer.write(pgpMessage) // Body
-        writer.flush()
-        return socket
     }
 
     fun encryptWithArmoredPublicKey(message: String, armoredPublicKey: String): String {
@@ -130,7 +134,7 @@ class LayerMinus(startVPNData: StartVPNData) {
 
     }
 
-    fun connectToLayerMinus(host: String, _port: String, buffer: ByteArray?): Socket? {
+    fun connectToLayerMinus(host: String, _port: String, buffer: ByteArray?): LmPlan? {
 
         val randomEntryNode = if (this.entryNodes.isNotEmpty()) {
 //            this.entryNodes[0]
@@ -145,6 +149,7 @@ class LayerMinus(startVPNData: StartVPNData) {
         } else {
             return null // or throw Exception("No entry nodes available")
         }
+
         val port = _port ?: "80"
 
         val base64String = buffer?.let {
@@ -175,8 +180,19 @@ class LayerMinus(startVPNData: StartVPNData) {
         Log.d("WebAppInterface", "connectToLayerMinus Entry Node ${randomEntryNode.ip_addr}:80 Exit Node ${randomExitNode.ip_addr}")
 
         if (_postData.isNotEmpty()) {
-            return postEncryptedPGPMessage(randomEntryNode.ip_addr, _postData)
+            val packed = makeHttpPost(randomEntryNode.ip_addr, _postData)
+			return LmPlan(
+                entryHost = randomEntryNode.ip_addr, // 入口节点B
+                entryPort = 80,                      // 你现在固定用的端口；如有配置可替换
+                destHost = host,                     // 目标D（用于日志/观测）
+                destPort = port.toInt(),
+                packedFirstData = packed             // 第一拍发给入口B的整段字节(HTTP POST+PGP JSON)
+            )
         }
+
+
         return null
     }
+
+
 }

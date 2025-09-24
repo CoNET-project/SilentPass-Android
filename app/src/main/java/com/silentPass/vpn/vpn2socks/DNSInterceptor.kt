@@ -895,6 +895,15 @@ class DNSInterceptor private constructor() {
         setOf(IPv4Address.parse("198.18.0.0")!!.raw, IPv4Address.parse("198.19.255.255")!!.raw)
     )
 
+    // --- Fake IP range guard (198.18.0.0 ~ 198.19.255.255) ---
+    private val FAKE_MIN = IPv4Address.parse("198.18.0.0")!!.raw
+    private val FAKE_MAX = IPv4Address.parse("198.19.255.255")!!.raw
+
+    fun isFakeIp(ip: IPv4Address): Boolean {
+        val v = ip.raw
+        return v >= FAKE_MIN && v <= FAKE_MAX
+    }
+
 
 
     // 自定义 SocketFactory 确保 socket 被保护
