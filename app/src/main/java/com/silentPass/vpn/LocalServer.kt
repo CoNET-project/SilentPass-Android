@@ -24,20 +24,148 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 
+// 将 IPv4 转为 Int
+fun ipv4ToInt(addr: InetAddress): Int? {
+    val bytes = addr.address
+    if (bytes.size != 4) return null
+    return ByteBuffer.wrap(bytes).int
+}
+
+// 判断 IP 是否在 CIDR 范围内
+fun ipInCidr(ip: InetAddress, cidr: String): Boolean {
+    val parts = cidr.split("/")
+    if (parts.size != 2) return false
+    val baseIp = try { InetAddress.getByName(parts[0]) } catch (_: UnknownHostException) { return false }
+    val prefix = parts[1].toIntOrNull() ?: return false
+
+    val ipInt = ipv4ToInt(ip) ?: return false
+    val baseInt = ipv4ToInt(baseIp) ?: return false
+
+    val mask = if (prefix == 0) 0 else -0x1 shl (32 - prefix)
+    return (ipInt and mask) == (baseInt and mask)
+}
+
+// 仅判断“字面量”IP，不解析 DNS（避免把可解析域名误判为 IP）
+fun isIpLiteral(host: String): Boolean {
+    val ipv4 = Regex("""^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$""")
+    val looksV6 = host.contains(':')
+    val ipv6 = Regex("""^[0-9a-fA-F:]$""")
+    return ipv4.matches(host) || (looksV6 && ipv6.matches(host))
+}
+
+
 
 class SocketServerService : Service() {
 
-
-
-	private fun connectWithChannel(host: String, port: Int): Socket? {
-		return try {
-			val channel = SocketChannel.open()
-			channel.connect(InetSocketAddress(host, port))
-			channel.socket()  // 这样创建的Socket才有channel
-		} catch (e: Exception) {
-			null
+        // 读取强制走 LayerMinus 的 IP/CIDR 白名单（如 Telegram 段）
+        private fun loadMustLayerMinus(): Set<String> {
+			return try {
+					val cls = Class.forName("com.silentPass.vpn.DNSInterceptor")
+					val any = cls.getField("mustLayerMinus").get(null)
+					(any as? Set<*>)?.filterIsInstance<String>()?.toSet() ?: emptySet()
+				} catch (_: Throwable) {
+					emptySet()
+				}
 		}
-	}
+
+    private fun shouldDirectByPolicy(host: String, port: Int): Pair<Boolean, String?> {
+        val (bypass, ads) = loadDnsInterceptorSets()
+        val mustLM = loadMustLayerMinus()
+
+        // A) 先处理“必须走 LM”的域名（后缀匹配）
+        domainMatches(host, mustLM)?.let { return Pair(false, "mustLM:$it") }
+
+        // B) 域名白名单 → DIRECT
+        domainMatches(host, bypass)?.let { return Pair(true, "bypass:$it") }
+        domainMatches(host, ads   )?.let { return Pair(true, "adBlock:$it") }
+
+        // C) IP 字面量：先查 mustLM(CIDR/IP) → 再查 DIRECT 白名单(CIDR/IP) → 否则默认 DIRECT
+        if (isIpLiteral(host)) {
+            val ip = try { InetAddress.getByName(host) } catch (_: Exception) { null }
+            if (ip != null) {
+                // C1) mustLM（CIDR/单 IP）→ 强制 LayerMinus
+                for (rule in mustLM) {
+                    if (rule.contains("/")) { if (ipInCidr(ip, rule)) return Pair(false, "mustLM:$rule") }
+                    else if (host == rule)  return Pair(false, "mustLM:$rule")
+                }
+                // C2) DIRECT 白名单（CIDR/单 IP）→ 直连
+                val allRules: Set<String> = bypass + ads
+                for (rule in allRules) {
+                    if (rule.contains("/")) { if (ipInCidr(ip, rule)) return Pair(true,  "bypass:$rule") }
+                    else if (host == rule)  return Pair(true,  "bypass:$rule")
+                }
+                // C3) 其余 IP → 默认 DIRECT
+                return Pair(true, "ip:$host")
+            }
+        }
+
+        // D) 其他情况：默认不直连（走 LM）
+        return Pair(false, null)
+    }
+
+    // ====== DIRECT 白名单：来自 DNSInterceptor.bypassDomains + adBlockDomains ======
+    private fun loadDnsInterceptorSets(): Pair<Set<String>, Set<String>> {
+        return try {
+            // 反射读取，避免编译期硬依赖
+            val cls = Class.forName("com.silentPass.vpn.DNSInterceptor")
+            val bypassAny = cls.getField("bypassDomains").get(null)
+            val adsAny    = cls.getField("adBlockDomains").get(null)
+            val bypass = (bypassAny as? Set<*>)?.filterIsInstance<String>()?.toSet() ?: emptySet()
+            val ads    = (adsAny as? Set<*>)?.filterIsInstance<String>()?.toSet() ?: emptySet()
+            Pair(bypass, ads)
+        } catch (_: Throwable) {
+            Pair(emptySet(), emptySet())
+        }
+    }
+
+    private fun domainMatches(host: String, rules: Set<String>): String? {
+        if (host.isEmpty() || rules.isEmpty()) return null
+        val h = host.lowercase()
+        // 逐个规则做后缀匹配：example.com 命中 *.example.com / example.com
+        for (raw in rules) {
+            val r = raw.trim().lowercase().removePrefix("*.").removePrefix(".")
+            if (r.isEmpty()) continue
+            if (h == r || h.endsWith(".$r")) return raw  // 返回命中的原规则，便于日志说明
+        }
+        return null
+    }
+
+    /** 依据 DNSInterceptor 的集合判断是否 DIRECT：
+     * 命中 bypassDomains 或 adBlockDomains 之一即直连（不经 LayerMinus）
+     */
+    private fun shouldDirectByDns(host: String, port: Int): Pair<Boolean, String?> {
+        val (bypass, ads) = loadDnsInterceptorSets()
+        domainMatches(host, bypass)?.let { return Pair(true, "bypass:$it") }
+        domainMatches(host, ads   )?.let { return Pair(true, "adBlock:$it") }
+        return Pair(false, null)
+    }
+
+    private fun connectWithChannel(host: String, port: Int, timeoutMs: Int = 1500): Socket? {
+        return try {
+            val ch = SocketChannel.open()
+            ch.configureBlocking(false)
+            ch.connect(InetSocketAddress(host, port))
+            val sel = Selector.open()
+            ch.register(sel, SelectionKey.OP_CONNECT)
+            val start = System.nanoTime()
+            var ok = false
+            while ((System.nanoTime() - start) / 1_000_000 < timeoutMs) {
+                sel.select(100)
+                val it = sel.selectedKeys().iterator()
+                while (it.hasNext()) {
+                    val key = it.next(); it.remove()
+                    if (key.isConnectable && ch.finishConnect()) { ok = true; break }
+                }
+                if (ok) break
+            }
+            sel.close()
+            if (!ok) { try { ch.close() } catch (_: Exception) {}; return null }
+            tuneSocket(ch)
+            ch.socket()
+        } catch (_: Exception) {
+            null
+        }
+    }
 
 
     // ====== Server State ======
@@ -342,6 +470,17 @@ class SocketServerService : Service() {
 				val SELECT_TIMEOUT = 500L
 				loop@ while (true) {
 					selector.select(SELECT_TIMEOUT)
+
+                    // —— Stall breaker：下行始终为 0 且连接已持续 >8s，则收尾，避免长占坑拖慢体感 ——
+                    val now = System.nanoTime()
+                    if (u2cBytes == 0L && (now - startNs) > 8_000_000_000L) {
+                        Log.w(LOG_TAG, "Stall breaker: no u2c > 8000ms, closing conn#$connId")
+                        try { clientCh.close() } catch (_: Exception) {}
+                        try { upstreamCh.close() } catch (_: Exception) {}
+                        break@loop
+                    }
+
+
 					val it = selector.selectedKeys().iterator()
 					while (it.hasNext()) {
 						val key = it.next(); it.remove()
@@ -548,7 +687,7 @@ class SocketServerService : Service() {
                 val data = Base64.decode(b64, Base64.DEFAULT)
                 val json = String(data, Charsets.UTF_8)
                 val startVPNData = Gson().fromJson(json, StartVPNData::class.java)
-                this.layerMinus = LayerMinus(startVPNData)
+                this.layerMinus = null//LayerMinus(startVPNData)
 
             } catch (e: Exception) {
                 Log.e(LOG_TAG, "Failed to parse VPN data", e)
@@ -720,21 +859,24 @@ class SocketServerService : Service() {
             sb.append("\r\n")
             if (body != null) sb.append(String(body))
             val requestBody = sb.toString() // == firstData for HTTP
-            val isLayerMinus = (layerMinus != null)
-            Log.i(LOG_TAG, "HTTP proxy connect $host:$port via LayerMinus=$isLayerMinus")
+
+            val (shouldDirect, ruleHit) = shouldDirectByPolicy(host, port)
+            val isLayerMinus = (layerMinus != null) && !shouldDirect
+            Log.i(
+                LOG_TAG,
+                "HTTP proxy connect $host:$port via LayerMinus=$isLayerMinus" +
+                        (if (shouldDirect) " DIRECT(by $ruleHit)" else "")
+            )
 
 
             val upstream: Socket? = if (isLayerMinus) {
                 // LayerMinus expects firstData packaged inside
                 layerMinus?.connectToLayerMinus(host, port.toString(), requestBody.toByteArray(Charsets.UTF_8))
             } else {
-                try {
-                    val ch = SocketChannel.open(InetSocketAddress(host, port))
-                    tuneSocket(ch)
-                    ch.socket()
-                } catch (e: Exception) {
-					Log.e(LOG_TAG, "Failed to connect to $host:$port", e); null
-                }
+	
+                connectWithChannel(host, port, 1500).also {
+					if (it == null) Log.e(LOG_TAG, "Failed to connect to $host:$port (DIRECT timeout)")
+				}
             }
 
 			if (upstream == null) { client.close(); onConnClose(connId); return }
@@ -818,21 +960,23 @@ class SocketServerService : Service() {
             val cliIn = input
             val firstData = capturePrimeWithBudget(cliIn, client, maxBytes = 16 * 1024)
 
-
-            val isLayerMinus = (layerMinus != null)
-            Log.i(LOG_TAG, "HTTPS proxy connect $host:$port via LayerMinus=$isLayerMinus")
+            val (shouldDirect, ruleHit) = shouldDirectByPolicy(host, port)
+            val isLayerMinus = (layerMinus != null) && !shouldDirect
+            Log.i(
+                LOG_TAG,
+                "HTTP proxy connect $host:$port via LayerMinus=$isLayerMinus" +
+                        (if (shouldDirect) " DIRECT(by $ruleHit)" else "")
+            )
 
 
             val upstream: Socket? = if (isLayerMinus) {
                 layerMinus?.connectToLayerMinus(host, port.toString(), firstData)
             } else {
-                try {
-                    val ch = SocketChannel.open(InetSocketAddress(host, port))
-                    tuneSocket(ch)
-                    ch.socket()
-                } catch (e: Exception) {
-                    Log.e(LOG_TAG, "Failed to connect to $host:$port", e); null
-                }
+
+				connectWithChannel(host, port, 1500).also {
+					if (it == null) Log.e(LOG_TAG, "Failed to connect to $host:$port (DIRECT timeout)")
+				}
+                
             }
 
 
@@ -1083,20 +1227,22 @@ class SocketServerService : Service() {
             val cliIn = if (input is BufferedInputStream) input else BufferedInputStream(input, 128 * 1024)
             val firstData = capturePrimeWithBudget(cliIn, client)
 
-
-            val isLayerMinus = (layerMinus != null)
-            Log.i(LOG_TAG, "SOCKS v4 proxy connect $destHost:$port via LayerMinus=$isLayerMinus")
+            val (shouldDirect, ruleHit) = shouldDirectByPolicy(destHost, port)
+            val isLayerMinus = (layerMinus != null) && !shouldDirect
+            Log.i(
+                LOG_TAG,
+                "HTTP proxy connect $destHost:$port via LayerMinus=$isLayerMinus" +
+                        (if (shouldDirect) " DIRECT(by $ruleHit)" else "")
+            )
 
             val upstream: Socket? = if (isLayerMinus) {
                 layerMinus?.connectToLayerMinus(destHost, port.toString(), firstData)
             } else {
-                try {
-                    val ch = SocketChannel.open(InetSocketAddress(destHost, port))
-                    tuneSocket(ch)
-                    ch.socket()
-                } catch (e: Exception) {
-                    Log.e(LOG_TAG, "Failed to connect to $destHost:$port", e); null
-                }
+
+				connectWithChannel(destHost, port, 1500).also {
+					if (it == null) Log.e(LOG_TAG, "Failed to connect to $destHost:$port (DIRECT timeout)")
+				}
+                
             }
 
 
@@ -1313,9 +1459,13 @@ class SocketServerService : Service() {
                     val cliIn = if (input is BufferedInputStream) input else BufferedInputStream(input, 128 * 1024)
                     val firstData = capturePrimeAdaptive(cliIn, client, stepMs = 10, maxRounds = 5, maxBytes = 16 * 1024)
 
-
-                    val isLayerMinus = (layerMinus != null)
-                    Log.i(LOG_TAG, "SOCKS v5 proxy connect $destHost:$port via LayerMinus=$isLayerMinus")
+                    val (shouldDirect, ruleHit) = shouldDirectByPolicy(destHost, port)
+                val isLayerMinus = (layerMinus != null) && !shouldDirect
+				Log.i(
+					LOG_TAG,
+					"HTTP proxy connect $destHost:$port via LayerMinus=$isLayerMinus" +
+							(if (shouldDirect) " DIRECT(by $ruleHit)" else "")
+				)
 
 
 
@@ -1323,13 +1473,10 @@ class SocketServerService : Service() {
                     val upstream: Socket? = if (isLayerMinus) {
                         layerMinus?.connectToLayerMinus(destHost, port.toString(), firstData)
                     } else {
-                        try {
-                            val ch = SocketChannel.open(InetSocketAddress(destHost, port))
-                            tuneSocket(ch)
-                            ch.socket()
-                        } catch (e: Exception) {
-                            Log.e(LOG_TAG, "Failed to connect to $destHost:$port", e); null
-                        }
+						connectWithChannel(destHost, port, 1500).also {
+							if (it == null) Log.e(LOG_TAG, "Failed to connect to $destHost:$port (DIRECT timeout)")
+						}
+                        
                     }
 
 

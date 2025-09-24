@@ -442,10 +442,18 @@ class DNSInterceptor private constructor() {
     private fun normalizeDomain(d: String): String =
         d.trim().trim('.').removePrefix("*.").removePrefix(".").lowercase()
 
-
+	public val mustLayerMinus = setOf(
+		"91.108.4.0/22",
+        "91.108.8.0/22",
+        "91.108.12.0/22",
+        "91.108.16.0/22",
+        "91.108.20.0/22",
+        "91.108.56.0/22",
+        "149.154.160.0/20"
+	)
 
     // 广告域名的正则模式
-    private val adBlockPatterns = listOf(
+    public val adBlockPatterns = listOf(
         Regex(""".*\.(doubleclick|googleadservices|googlesyndication|google-analytics|adsrvr|adnxs|pubmatic|criteo|casalemedia|openx|rubiconproject|taboola|outbrain|scorecardresearch|quantserve|demdex|krxd)\..*"""),
         Regex("""^ad[sxvmn]?\d*[.-].*"""),
         Regex("""^.*[.-]ad[sxvmn]?\d*[.-].*"""),
@@ -472,7 +480,7 @@ class DNSInterceptor private constructor() {
     )
 
     // 广告和跟踪域名黑名单
-    private val adBlockDomains = setOf(
+    public val adBlockDomains = setOf(
         // Google Ads
         "doubleclick.net",
         "googlesyndication.com",
@@ -717,6 +725,7 @@ class DNSInterceptor private constructor() {
 
     // 需要直连的域名（含 APNs/FCM/自管域等）
     private val bypassDomains = setOf(
+        "cdnst.net",
         "conet.network",
         "silentpass.io",
         "openpgp.online",
