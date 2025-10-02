@@ -86,7 +86,9 @@ class MainActivity : ComponentActivity(), VpnStarter {
             }
 
             addJavascriptInterface(WebAppInterface(this@MainActivity, this@MainActivity), "AndroidBridge")
-
+            lifecycleScope.launch {
+                UpdateProcess(context = applicationContext)
+            }
             webChromeClient = object : WebChromeClient() {
                 override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
                     Log.d(

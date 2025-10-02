@@ -53,7 +53,7 @@ fun isIpLiteral(host: String): Boolean {
     return ipv4.matches(host) || (looksV6 && ipv6.matches(host))
 }
 
-
+val LayerMinusTimeOUT = 5000
 
 class SocketServerService : Service() {
 
@@ -402,7 +402,8 @@ class SocketServerService : Service() {
 		firstDataToUpstream: ByteArray? = null,
 		bufSize: Int = 128 * 1024,
         connId: Long = -1,
-		info: String
+		info: String,
+		lmFirstByteTimeoutMs: Int = -1
 	): Future<*> {
 		return threadPoolExecutor.submit {
 
@@ -478,10 +479,23 @@ class SocketServerService : Service() {
 				loop@ while (true) {
 					selector.select(SELECT_TIMEOUT)
 
+
+                    // —— LM 专用“首字节快速超时”：首拍后 u2c 一直为 0，超过阈值即早退 —— 
+                    if (lmFirstByteTimeoutMs > 0) {
+                        val fastNs = lmFirstByteTimeoutMs.toLong() * 1_000_000
+                        val nowFast = System.nanoTime()
+                        if (u2cBytes == 0L && (nowFast - startNs) > fastNs) {
+                            Log.w(LOG_TAG, "$info LM fast first-byte timeout > ${lmFirstByteTimeoutMs}ms, closing conn#$connId")
+                            try { clientCh.close() } catch (_: Exception) {}
+                            try { upstreamCh.close() } catch (_: Exception) {}
+                            break@loop
+                        }
+                    }
+
                     // —— Stall breaker：下行始终为 0 且连接已持续 >8s，则收尾，避免长占坑拖慢体感 ——
                     val now = System.nanoTime()
                     if (u2cBytes == 0L && (now - startNs) > 5_000_000_000L) {
-                        Log.w(LOG_TAG, "$info Stall breaker: no u2c > 8000ms, closing conn#$connId")
+                        Log.w(LOG_TAG, "$info Stall breaker: no u2c > 5000ms, closing conn#$connId")
                         try { clientCh.close() } catch (_: Exception) {}
                         try { upstreamCh.close() } catch (_: Exception) {}
                         break@loop
@@ -490,7 +504,13 @@ class SocketServerService : Service() {
 
 					val it = selector.selectedKeys().iterator()
 					while (it.hasNext()) {
-						val key = it.next(); it.remove()
+						val key = it.next()
+						it.remove()
+
+						if (!key.isValid()) { // <-- 添加这行检查
+							continue
+						}
+
 						when (key.channel()) {
 							clientCh -> {
 								if (key.isReadable && !cClosed) {
@@ -971,7 +991,8 @@ class SocketServerService : Service() {
 					onUpstreamEof = { try { client.shutdownOutput() } catch (_: Exception) {} },
 					minClientBytesBeforeEof = 32,
                     connId = connId,
-                    info = "$targetHost:$targetPort"
+                    info = "$targetHost:$targetPort",
+					lmFirstByteTimeoutMs = if (isLayerMinus) LayerMinusTimeOUT else -1
 				)
 			} else {
 				// 回退：保持原来的双泵
@@ -1075,7 +1096,8 @@ class SocketServerService : Service() {
 					minClientBytesBeforeEof = 32,
 					firstDataToUpstream = kickFirst,
                     connId = connId,
-                    info = "$targetHost:$targetPort"
+                    info = "$targetHost:$targetPort",
+					lmFirstByteTimeoutMs = if (isLayerMinus) LayerMinusTimeOUT else -1
 
 				)
 			} else {
@@ -1099,6 +1121,8 @@ class SocketServerService : Service() {
             onConnClose(connId)
         }
     }
+
+
 
     /**
      * SOCKS4 错误响应码定义
@@ -1345,7 +1369,8 @@ class SocketServerService : Service() {
 					minClientBytesBeforeEof = 32,
 					firstDataToUpstream = kickFirst,
                     connId = connId,
-                    info = "$targetHost:$targetPort"
+                    info = "$targetHost:$targetPort",
+					lmFirstByteTimeoutMs = if (isLayerMinus) LayerMinusTimeOUT else -1
 
 				)
 			} else {
@@ -1382,6 +1407,7 @@ class SocketServerService : Service() {
             primeBytesSum.addAndGet(bytes.toLong())
         }
     }
+
 
 
     // ====== SOCKS5 (CONNECT + UDP ASSOCIATE) ======
@@ -1549,7 +1575,7 @@ class SocketServerService : Service() {
 
 
 					if (!useSelector && kickFirst != null && kickFirst.isNotEmpty()) {
-						try { cliOut.write(kickFirst); cliOut.flush() } catch (_: Exception) {}
+						try { upOut.write(kickFirst); upOut.flush() } catch (_: Exception) {}
 					}
 
 
@@ -1577,7 +1603,8 @@ class SocketServerService : Service() {
 							minClientBytesBeforeEof = 32,
 							firstDataToUpstream = kickFirst,
                             connId = connId,
-                            info = "$targetHost:$targetPort"
+                            info = "$targetHost:$targetPort",
+							lmFirstByteTimeoutMs = if (isLayerMinus) LayerMinusTimeOUT else -1
 						)
 					} else {
 						forwardTrafficAsync(

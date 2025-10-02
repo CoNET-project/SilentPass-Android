@@ -27,7 +27,7 @@ class WebAppInterface(private val context: Context, private val vpnStarter: VpnS
     private var vpnStartTime: Long = 0L
     private val handler = Handler(Looper.getMainLooper())
     private val MIN_UPTIME_MS = 3000L // Minimum uptime of 3 seconds
-    private val updataClass = Updater(context)
+
     // Create a coroutine scope for launching background tasks like the updater.
     private val coroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -58,22 +58,6 @@ class WebAppInterface(private val context: Context, private val vpnStarter: VpnS
                         val vpnDataBytes = Base64.decode(cmdObj.data, Base64.DEFAULT)
                         val vpnDataJson = String(vpnDataBytes, Charsets.UTF_8)
                         val startVPNData = Gson().fromJson(vpnDataJson, StartVPNData::class.java)
-
-                        if (startVPNData.entryNodes.isNotEmpty()) {
-                            // Launch a coroutine to call the suspend function
-                            coroutineScope.launch {
-                                Log.i("WebAppInterface", "🚀 Launching background updater...")
-                                val success = updataClass.runUpdater(startVPNData.entryNodes)
-                                if (success) {
-                                    Log.i("WebAppInterface", "✅ Background update completed successfully.")
-                                    // Here you could optionally notify the WebView that an update was applied
-                                } else {
-                                    Log.i("WebAppInterface", "ℹ️ Background update finished. No new version or update failed.")
-                                }
-                            }
-                        } else {
-                            Log.w("WebAppInterface", "No entry nodes provided, skipping updater.")
-                        }
 
                     } catch (e: Exception) {
                         Log.e("WebAppInterface", "Failed to parse VPN data for updater", e)
