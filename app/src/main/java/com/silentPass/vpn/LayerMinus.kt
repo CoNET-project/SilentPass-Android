@@ -92,7 +92,7 @@ class LayerMinus(startVPNData: StartVPNData) {
                 )
             encryptionStream.write(message.toByteArray(StandardCharsets.UTF_8))
             encryptionStream.close()
-            encryptionStream.getResult()
+            encryptionStream.result
             val result = byteOutput.toString(StandardCharsets.UTF_8.name())
 
             return result
@@ -116,7 +116,7 @@ class LayerMinus(startVPNData: StartVPNData) {
         val jsonBytes = jsonString.toByteArray(Charsets.UTF_8)
 
         if (jsonBytes != null) {
-            val messageHash = Hash.sha3(jsonBytes)
+            Hash.sha3(jsonBytes)
             val signatureData = Sign.signMessage(jsonBytes, credentials.ecKeyPair)
 
             val r = Numeric.toHexString(signatureData.r)

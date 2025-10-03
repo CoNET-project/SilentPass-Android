@@ -267,7 +267,7 @@ class SocketServerService : Service() {
             client.soTimeout = budgetMs
             while (total < maxBytes) {
                 val n = try { cliIn.read(buf, total, maxBytes - total) }
-                catch (_: java.net.SocketTimeoutException) { break }
+                catch (_: SocketTimeoutException) { break }
                 if (n <= 0) break
                 total += n
                 if (cliIn.available() == 0) break
@@ -313,8 +313,8 @@ class SocketServerService : Service() {
         onDone: (() -> Unit)? = null,
         onEof: (() -> Unit)? = null,
 		minBytesBeforeEofCallback: Long = 0,
-		srcSocket: java.net.Socket? = null,
-		dstSocket: java.net.Socket? = null
+		srcSocket: Socket? = null,
+		dstSocket: Socket? = null
     ): Future<*> {
 		return threadPoolExecutor.submit {
 
@@ -331,7 +331,7 @@ class SocketServerService : Service() {
 				Log.d(LOG_TAG, "input available bytes: ${input.available()}")
 				src = Channels.newChannel(input)
 				dst = Channels.newChannel(output)
-				val buf = java.nio.ByteBuffer.allocateDirect(bufferSize)
+				val buf = ByteBuffer.allocateDirect(bufferSize)
 				var sinceLastFlush = 0L
 				val WARMUP_LIMIT = 64 * 1024
 				val FLUSH_THRESHOLD = 64 * 1024
@@ -407,7 +407,7 @@ class SocketServerService : Service() {
 	): Future<*> {
 		return threadPoolExecutor.submit {
 
-            fun isBenignIo(e: java.io.IOException): Boolean {
+            fun isBenignIo(e: IOException): Boolean {
                 val msg = e.message?.lowercase() ?: return false
                 return msg.contains("connection reset by peer") || msg.contains("broken pipe")
             }
@@ -428,8 +428,8 @@ class SocketServerService : Service() {
 				val cKey = clientCh.register(selector, SelectionKey.OP_READ)
 				val uKey = upstreamCh.register(selector, SelectionKey.OP_READ)
 
-				val c2u = java.nio.ByteBuffer.allocateDirect(bufSize)
-				val u2c = java.nio.ByteBuffer.allocateDirect(bufSize)
+				val c2u = ByteBuffer.allocateDirect(bufSize)
+				val u2c = ByteBuffer.allocateDirect(bufSize)
 				var cClosed = false
 				var uClosed = false
 
@@ -507,7 +507,7 @@ class SocketServerService : Service() {
 						val key = it.next()
 						it.remove()
 
-						if (!key.isValid()) { // <-- 添加这行检查
+						if (!key.isValid) { // <-- 添加这行检查
 							continue
 						}
 
@@ -522,7 +522,7 @@ class SocketServerService : Service() {
 										}
 									} else {
 										try {
-                                            val n = try { clientCh.read(c2u) } catch (e: java.io.IOException) {
+                                            val n = try { clientCh.read(c2u) } catch (e: IOException) {
                                                 if (isBenignIo(e)) -1 else throw e
                                             }
 											if (n == -1) {
@@ -597,7 +597,7 @@ class SocketServerService : Service() {
                                             Log.d(LOG_TAG, "$info Selector: client key cancelled on write")
                                             loggedClientWriteClosed = true
                                         }
-                                    } catch (e: java.io.IOException) {
+                                    } catch (e: IOException) {
                                         if (isBenignIo(e)) {
                                             clientWriteClosed = true
                                             try { upstreamCh.socket().shutdownOutput() } catch (_: Exception) {}
@@ -623,7 +623,7 @@ class SocketServerService : Service() {
 										}
 									} else {
 										try {
-                                            val n = try { upstreamCh.read(u2c) } catch (e: java.io.IOException) {
+                                            val n = try { upstreamCh.read(u2c) } catch (e: IOException) {
                                                 if (isBenignIo(e)) -1 else throw e
                                             }
 
@@ -698,7 +698,7 @@ class SocketServerService : Service() {
                                             Log.d(LOG_TAG, "$info Selector: upstream key cancelled on write")
                                             loggedUpstreamWriteClosed = true
                                         }
-                                    } catch (e: java.io.IOException) {
+                                    } catch (e: IOException) {
                                         if (isBenignIo(e)) {
                                             upstreamWriteClosed = true
                                             try { clientCh.socket().shutdownOutput() } catch (_: Exception) {}
@@ -723,7 +723,7 @@ class SocketServerService : Service() {
 				}
 			} catch (e: Exception) {
                 // 可预期 I/O（RST / PIPE）降级为 DEBUG；其他保留堆栈
-                if (e is java.io.IOException &&
+                if (e is IOException &&
                     ((e.message?.lowercase()?.contains("connection reset by peer") == true) ||
                             (e.message?.lowercase()?.contains("broken pipe") == true))) {
                     Log.d(LOG_TAG, "$info Selector bridge benign IO (${e.message})")
@@ -965,7 +965,7 @@ class SocketServerService : Service() {
             val cliIn  = BufferedInputStream(client.getInputStream(),    128 * 1024)
             val cliOut = BufferedOutputStream(client.getOutputStream(),  128 * 1024)
 
-			val remaining = java.util.concurrent.atomic.AtomicInteger(2)
+			val remaining = AtomicInteger(2)
 			val onBothDone = {
                 if (remaining.decrementAndGet() == 0) {
                     try { cliOut.flush() } catch (_: Exception) {}
@@ -1072,7 +1072,7 @@ class SocketServerService : Service() {
 
 
             // 双泵复用同一个 cliIn；cli->up 方向保持 minBytesBeforeEofCallback=1
-            val remaining = java.util.concurrent.atomic.AtomicInteger(2)
+            val remaining = AtomicInteger(2)
             val onBothDone = {
                 if (remaining.decrementAndGet() == 0) {
                     try { cliOut.flush() } catch (_: Exception) {}
@@ -1346,7 +1346,7 @@ class SocketServerService : Service() {
 
 
             // 之后再启动双泵（保持你现有的 onEof→shutdownOutput、onDone 收尾）
-            val remaining = java.util.concurrent.atomic.AtomicInteger(2)
+            val remaining = AtomicInteger(2)
             val onBothDone = {
                 if (remaining.decrementAndGet() == 0) {
                     try { cliOut.flush() } catch (_: Exception) {}
@@ -1448,7 +1448,7 @@ class SocketServerService : Service() {
         }
     }
 
-    private fun tuneSocket(ch: java.nio.channels.SocketChannel) {
+    private fun tuneSocket(ch: SocketChannel) {
         try {
             ch.socket().tcpNoDelay = true
         } catch (_: Exception) {}
@@ -1579,7 +1579,7 @@ class SocketServerService : Service() {
 					}
 
 
-                    val remaining = java.util.concurrent.atomic.AtomicInteger(2)
+                    val remaining = AtomicInteger(2)
                     val onBothDone = {
                         if (remaining.decrementAndGet() == 0) {
                             try { cliOut.flush() } catch (_: Exception) {}

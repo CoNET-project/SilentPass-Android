@@ -56,7 +56,7 @@ class SocksClient(private val endpoint: SocksEndpoint) {
 
         val req: ByteArray = when {
             isIPv4Literal && !isFakeIPv4Literal(hostOrIp) -> {
-                android.util.Log.d(LOG_TAG, "Using IPv4 literal: $hostOrIp")
+                Log.d(LOG_TAG, "Using IPv4 literal: $hostOrIp")
                 val parts = hostOrIp.split('.').map { it.toInt().toByte() }.toByteArray()
                 ByteArray(10).apply {
                     this[0] = 0x05; this[1] = 0x01; this[2] = 0x00; this[3] = 0x01 // ATYP=IPv4
@@ -66,7 +66,7 @@ class SocksClient(private val endpoint: SocksEndpoint) {
                 }
             }
             isIPv6Literal -> {
-                android.util.Log.d(LOG_TAG, "Using IPv6 literal: $hostOrIp")
+                Log.d(LOG_TAG, "Using IPv6 literal: $hostOrIp")
                 val addr = java.net.InetAddress.getByName(hostOrIp).address
                 ByteArray(22).apply {
                     this[0] = 0x05; this[1] = 0x01; this[2] = 0x00; this[3] = 0x04 // ATYP=IPv6
@@ -77,7 +77,7 @@ class SocksClient(private val endpoint: SocksEndpoint) {
             }
             else -> {
                 // 默认严格使用“域名 ATYP”，避免任何本地解析（含 Fake-IP/普通域名）
-                android.util.Log.d(LOG_TAG, "Using domain name (ATYP=0x03): $hostOrIp")
+                Log.d(LOG_TAG, "Using domain name (ATYP=0x03): $hostOrIp")
                 val domainBytes = hostOrIp.encodeToByteArray()
                 require(domainBytes.size <= 255) { "Domain too long for SOCKS5" }
                 ByteArray(7 + domainBytes.size).apply {
@@ -138,7 +138,7 @@ class SocksClient(private val endpoint: SocksEndpoint) {
             read += r
         }
 
-        android.util.Log.d(LOG_TAG, "SOCKS connection established to $hostOrIp:$port")
+        Log.d(LOG_TAG, "SOCKS connection established to $hostOrIp:$port")
         return s
     }
 

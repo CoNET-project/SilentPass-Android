@@ -57,7 +57,7 @@ class WebAppInterface(private val context: Context, private val vpnStarter: VpnS
                     try {
                         val vpnDataBytes = Base64.decode(cmdObj.data, Base64.DEFAULT)
                         val vpnDataJson = String(vpnDataBytes, Charsets.UTF_8)
-                        val startVPNData = Gson().fromJson(vpnDataJson, StartVPNData::class.java)
+                        Gson().fromJson(vpnDataJson, StartVPNData::class.java)
 
                     } catch (e: Exception) {
                         Log.e("WebAppInterface", "Failed to parse VPN data for updater", e)

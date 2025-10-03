@@ -1,3 +1,5 @@
+import org.gradle.api.tasks.Exec
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -38,6 +40,7 @@ android {
     }
     namespace = "com.silentPass.vpn"
     compileSdk = 35
+	ndkVersion = "29"
 
     defaultConfig {
         applicationId = "com.silentPass.vpn"
@@ -48,6 +51,7 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 		multiDexEnabled = true
+		{ ndk { abiFilters += listOf("arm64-v8a") } }
     }
 
     buildTypes {
@@ -69,10 +73,14 @@ android {
         jvmTarget = "11"
     }
     buildFeatures {
-        compose = true
+        compose = false
     }
     // 添加对最新 Android 插件的配置
     packaging {
+		jniLibs {
+			// 让 APK / AAB 中的 native libs 不压缩
+			useLegacyPackaging = false
+		}
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
 			excludes += "/META-INF/{AL,LGPL2.1,LICENSE,NOTICE,INDEX.LIST}"
@@ -145,3 +153,5 @@ dependencies {
     debugImplementation(libs.androidx.ui.tooling)
     debugImplementation(libs.androidx.ui.test.manifest)
 }
+
+

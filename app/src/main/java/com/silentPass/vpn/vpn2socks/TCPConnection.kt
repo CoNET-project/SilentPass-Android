@@ -90,14 +90,14 @@ class TCPConnection(
 
     private fun calculateOptimalMSS(): Int {
         // 1) 基于实际 MTU 的保守基线（IPv4 20 + TCP 20）
-        val base = kotlin.math.min(MSS_STANDARD, (mtu - 40).coerceAtLeast(536))
+        val base = min(MSS_STANDARD, (mtu - 40).coerceAtLeast(536))
 
         // 2) 为隧道/封装预留余量（经验 80B），直连不预留
         val headroom = if (bypassDirect) 0 else 80
         val tunneled = (base - headroom).coerceAtLeast(536)
 
         // 3) 与经验上限取最小（SOCKS/VPN 场景更保守）
-        val cap = if (bypassDirect) MSS_STANDARD else kotlin.math.min(MSS_SOCKS, MSS_VPN + 60) // 1420 vs ~1420
+        val cap = if (bypassDirect) MSS_STANDARD else min(MSS_SOCKS, MSS_VPN + 60) // 1420 vs ~1420
 
         // 4) 夹在 [1200, cap] 区间内（HTTP/2/TLS 初期分片风险小）
         val clamped = tunneled
@@ -496,7 +496,7 @@ class TCPConnection(
 
     init {
         // Log the MSS being used for this connection
-        android.util.Log.i(LOG_TAG, "Connection initialized with MSS=$mss for ${getDisplayKey()} (bypassDirect=$bypassDirect")
+        Log.i(LOG_TAG, "Connection initialized with MSS=$mss for ${getDisplayKey()} (bypassDirect=$bypassDirect")
 
         // Start health monitoring
         scope.launch {
@@ -687,7 +687,7 @@ class TCPConnection(
         packetWriter(listOf(synAck), listOf(ConnectionManager.PROTO_IPV4))
         serverSeq = (serverSeq + 1L) and 0xFFFFFFFFL
 
-        android.util.Log.v(LOG_TAG, "Sent SYN-ACK with MSS=$mss and SACK-Permitted=$weSupportSack for ${getDisplayKey()}")
+        Log.v(LOG_TAG, "Sent SYN-ACK with MSS=$mss and SACK-Permitted=$weSupportSack for ${getDisplayKey()}")
     }
 
     private suspend fun handleHandshakeAck(ip: IPv4Packet, tcp: TCPSegment) {
@@ -697,7 +697,7 @@ class TCPConnection(
                 handshakeAcked = true
                 phase = Phase.HANDSHAKE_ACKED
             }
-            android.util.Log.i(LOG_TAG, "3-way handshake established for ${getDisplayKey()} (SACK enabled: $peerSupportsSack)")
+            Log.i(LOG_TAG, "3-way handshake established for ${getDisplayKey()} (SACK enabled: $peerSupportsSack)")
 
             // 在握手完成后的短时窗口内优先快速 ACK，帮对端更快拉大 cwnd
             quickAckUntilMs = System.currentTimeMillis() + 1500
@@ -1136,7 +1136,7 @@ class TCPConnection(
                 phase = Phase.SOCKS_PRIMED
             }
 
-            android.util.Log.i(LOG_TAG, "Upstream established for ${getDisplayKey()}")
+            Log.i(LOG_TAG, "Upstream established for ${getDisplayKey()}")
 
             tryFlushUpstream()
             tryStartDownstream(ip, syn)
@@ -1213,7 +1213,7 @@ class TCPConnection(
         val speedtestLike = isSpeedtestDomain(resolvedDomain)
 
         try {
-            android.util.Log.i(LOG_TAG, "Downstream loop started for ${getDisplayKey()}")
+            Log.i(LOG_TAG, "Downstream loop started for ${getDisplayKey()}")
 
             while (!isClosed && isSocketHealthy()) {
                 val n = try {
@@ -1278,7 +1278,7 @@ class TCPConnection(
             }
         } catch (e: CancellationException) {
             // This is expected when connection is closed
-            android.util.Log.i(LOG_TAG, "Downstream loop cancelled after $totalRead bytes for ${getDisplayKey()}")
+            Log.i(LOG_TAG, "Downstream loop cancelled after $totalRead bytes for ${getDisplayKey()}")
         } catch (e: Exception) {
             // Only log as error if it's unexpected
             if (!isClosed) {
@@ -1291,7 +1291,7 @@ class TCPConnection(
             if (totalRead == 0 && !isClosed) {
                 Log.e(LOG_TAG, "Downstream loop exiting with NO DATA for ${getDisplayKey()}")
             } else {
-                android.util.Log.i(LOG_TAG, "Downstream loop exiting after $totalRead bytes for ${getDisplayKey()}")
+                Log.i(LOG_TAG, "Downstream loop exiting after $totalRead bytes for ${getDisplayKey()}")
             }
 
             // Only close if not already closing
@@ -1303,7 +1303,7 @@ class TCPConnection(
 
     private object LogNoiseLimiter {
         private data class Entry(var lastTs: Long, var suppressed: Int, var lastMsgHash: Int)
-        private val map = java.util.concurrent.ConcurrentHashMap<String, Entry>()
+        private val map = ConcurrentHashMap<String, Entry>()
         private fun now() = android.os.SystemClock.uptimeMillis()
 
         /**
@@ -1324,11 +1324,11 @@ class TCPConnection(
             }
             val finalMsg = if (e.suppressed > 0) "$msg (suppressed ${e.suppressed} similar)" else msg
             when (level) {
-                'V' -> android.util.Log.v(tag, finalMsg)
-                'D' -> android.util.Log.d(tag, finalMsg)
-                'I' -> android.util.Log.i(tag, finalMsg)
-                'W' -> android.util.Log.w(tag, finalMsg)
-                else -> android.util.Log.e(tag, finalMsg)
+                'V' -> Log.v(tag, finalMsg)
+                'D' -> Log.d(tag, finalMsg)
+                'I' -> Log.i(tag, finalMsg)
+                'W' -> Log.w(tag, finalMsg)
+                else -> Log.e(tag, finalMsg)
             }
             e.lastTs = t
             e.lastMsgHash = h

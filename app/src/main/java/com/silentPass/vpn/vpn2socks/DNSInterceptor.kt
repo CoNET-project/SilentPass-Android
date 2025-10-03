@@ -49,7 +49,7 @@ class DNSInterceptor private constructor() {
         private var INSTANCE: DNSInterceptor? = null
         private val initGate = java.util.concurrent.CountDownLatch(1)
         private val initDone = java.util.concurrent.atomic.AtomicBoolean(false)
-        private val lastInitWarnAt = java.util.concurrent.atomic.AtomicLong(0L)
+        private val lastInitWarnAt = AtomicLong(0L)
 
         fun signalReady() {
             if (initDone.compareAndSet(false, true)) initGate.countDown()
@@ -58,7 +58,7 @@ class DNSInterceptor private constructor() {
         fun awaitReady(timeoutMs: Long): Boolean {
             if (initDone.get()) return true
             return try {
-                initGate.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+                initGate.await(timeoutMs, TimeUnit.MILLISECONDS)
             } catch (_: InterruptedException) {
                 false
             }
@@ -68,7 +68,7 @@ class DNSInterceptor private constructor() {
             val now = System.currentTimeMillis()
             val prev = lastInitWarnAt.get()
             if (now - prev >= 1000L && lastInitWarnAt.compareAndSet(prev, now)) {
-                android.util.Log.w("DNSInterceptor", msg)
+                Log.w("DNSInterceptor", msg)
             }
         }
 	}
@@ -442,7 +442,7 @@ class DNSInterceptor private constructor() {
     private fun normalizeDomain(d: String): String =
         d.trim().trim('.').removePrefix("*.").removePrefix(".").lowercase()
 
-	public val mustLayerMinus = setOf(
+	val mustLayerMinus = setOf(
 		"91.108.4.0/22",
         "91.108.8.0/22",
         "91.108.12.0/22",
@@ -453,7 +453,7 @@ class DNSInterceptor private constructor() {
 	)
 
     // 广告域名的正则模式
-    public val adBlockPatterns = listOf(
+    val adBlockPatterns = listOf(
         Regex(""".*\.(doubleclick|googleadservices|googlesyndication|google-analytics|adsrvr|adnxs|pubmatic|criteo|casalemedia|openx|rubiconproject|taboola|outbrain|scorecardresearch|quantserve|demdex|krxd)\..*"""),
         Regex("""^ad[sxvmn]?\d*[.-].*"""),
         Regex("""^.*[.-]ad[sxvmn]?\d*[.-].*"""),
@@ -480,7 +480,7 @@ class DNSInterceptor private constructor() {
     )
 
     // 广告和跟踪域名黑名单
-    public val adBlockDomains = setOf(
+    val adBlockDomains = setOf(
         // Google Ads
         "doubleclick.net",
         "googlesyndication.com",
@@ -928,7 +928,7 @@ class DNSInterceptor private constructor() {
 
                 if (!protected) {
                     SocketPool.release(socket)  // 失败时归还
-                    throw java.io.IOException("Cannot protect socket")  // 修正：添加java.io.
+                    throw IOException("Cannot protect socket")  // 修正：添加java.io.
                 }
 
                 return socket

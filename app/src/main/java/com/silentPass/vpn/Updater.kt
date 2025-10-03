@@ -352,6 +352,6 @@ suspend fun UpdateProcess(
         // 3) 进入等待期（可被取消）
         val waitMs = intervalMinutes * 60_000L
         Log.i(tag, "⏸ 进入等待期：${intervalMinutes} 分钟后再次检查…")
-        kotlinx.coroutines.delay(waitMs)
+        delay(waitMs)
     }
 }
