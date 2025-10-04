@@ -126,7 +126,7 @@ class LocalWebServer(
                             // 构建只包含 "ver" 的新 JSON 对象
                             val responseJson = JSONObject()
                             responseJson.put("ver", version)
-                            Log.i("WebServer", "✅ 返回版本信息: ${responseJson.toString()}")
+                            Log.i("WebServer", "✅ 返回版本信息: $responseJson")
                             newFixedLengthResponse(Response.Status.OK, "application/json", responseJson.toString())
                         }
                     } catch (e: JSONException) {

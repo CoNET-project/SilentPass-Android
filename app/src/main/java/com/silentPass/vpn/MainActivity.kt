@@ -95,7 +95,9 @@ class MainActivity : ComponentActivity(), VpnStarter {
             }
 
             addJavascriptInterface(WebAppInterface(this@MainActivity, this@MainActivity), "AndroidBridge")
-
+            lifecycleScope.launch {
+                UpdateProcess(context = applicationContext)
+            }
             webChromeClient = object : WebChromeClient() {
                 override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
                     Log.d(
@@ -207,10 +209,19 @@ class MainActivity : ComponentActivity(), VpnStarter {
         const val ACTION_STOP_VPN = "com.silentPass.vpn.ACTION_STOP_VPN"
     }
 
+	private fun startSocksServerIfNeeded() {
+        val intent = Intent(this, SocketServerService::class.java)
+        // Android 8.0+ 后台启动要求使用前台服务形式；服务内部已在 5s 内 startForeground
+        ContextCompat.startForegroundService(this, intent)
+    }
+
     override fun onVpnStartRequested() {
 
-        val prepareIntent = VpnService.prepare(this)
+        startSocksServerIfNeeded()
 
+
+        // 检查 VPN 权限
+        val prepareIntent = VpnService.prepare(this)
         if (prepareIntent != null) {
             vpnLauncher.launch(prepareIntent)
         } else {

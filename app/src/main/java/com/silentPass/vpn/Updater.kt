@@ -3,6 +3,8 @@ package com.silentPass.vpn
 
 import android.content.Context
 import android.util.Log
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.*
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -11,8 +13,81 @@ import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.RandomAccessFile
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.net.SocketTimeoutException
+import java.nio.channels.FileLock
+import java.nio.channels.OverlappingFileLockException
 import java.util.zip.ZipInputStream
+import kotlin.random.Random
 
+fun loadNodesFromAssets(context: Context, fileName: String = "nodes.json"): List<Node> {
+    // 1. 读取 assets/nodes.json 文件
+    val json = context.assets.open(fileName).bufferedReader().use { it.readText() }
+
+    // 2. 定义 List<Node> 的泛型类型
+    val listType = object : TypeToken<List<Node>>() {}.type
+
+    // 3. 解析 JSON → List<Node>
+    return Gson().fromJson(json, listType)
+}
+
+/**
+ * 协程版本：在 IO 线程里逐个测试，直到返回可用 Node。
+ * @param fileName  assets 下 JSON 文件名
+ * @param ports     依次尝试的端口（默认先 443 再 80，可按需调整）
+ * @param timeoutMs 单次连接超时
+ */
+suspend fun getRandomNodeFromAssets(
+    context: Context,
+    fileName: String = "nodes.json",
+    ports: List<Int> = listOf(443, 80),
+    timeoutMs: Int = 1500
+): Node {
+    val nodes = loadNodesFromAssets(context, fileName)
+        .toMutableList()
+        .also { it.shuffle(Random.Default) }
+
+    if (nodes.isEmpty()) throw IllegalStateException("nodes.json 为空")
+
+    for (node in nodes) {
+        for (p in ports) {
+            val rttMs = testNode(node.ip_addr, p, timeoutMs)
+            if (rttMs >= 0) {
+                // 可达
+                return node
+            }
+        }
+    }
+    throw IllegalStateException("未找到可用节点（均连接失败）")
+}
+
+suspend fun testNode(ipAddr: String, port: Int, timeoutMs: Int = 1500): Int =
+    withContext(Dispatchers.IO) {
+        testNodeBlocking(ipAddr, port, timeoutMs)
+    }
+
+/** 阻塞版：在调用线程里执行 */
+fun testNodeBlocking(ipAddr: String, port: Int, timeoutMs: Int = 1500): Int {
+    val startNs = System.nanoTime()
+    return try {
+        Socket().use { sock ->
+            // 降低握手延迟；可按需关闭 Nagle
+            sock.tcpNoDelay = true
+            sock.connect(InetSocketAddress(ipAddr, port), timeoutMs)
+            // 只测连接时间；连上就关闭
+        }
+        val elapsedMs = (System.nanoTime() - startNs) / 1_000_000
+        elapsedMs.toInt().coerceAtLeast(0)
+    } catch (_: SocketTimeoutException) {
+        -1
+    } catch (_: IOException) {
+        -1
+    } catch (_: SecurityException) {
+        -1
+    }
+}
 
 class Updater(private val context: Context) {
 
@@ -213,5 +288,70 @@ class Updater(private val context: Context) {
                 zipEntry = zis.nextEntry
             }
         }
+    }
+}
+
+/**
+ * 周期性更新流程：
+ * 1) 随机获取一个“可用”的 Node（内部已做连通性检测）
+ * 2) 调用 Updater.runUpdater 进行更新检查与应用
+ * 3) 等待 intervalMinutes 分钟后继续
+ *
+ * - 可被协程取消（isActive 检查 + delay 可取消）
+ * - 失败不抛出到外层，记录日志后按固定周期继续
+ */
+suspend fun UpdateProcess(
+    context: Context,
+    fileName: String = "nodes.json",
+    ports: List<Int> = listOf(80),
+    timeoutMs: Int = 1500,
+    intervalMinutes: Long = 10
+) {
+    val updater = Updater(context)
+    val tag = "UpdateProcess"
+
+    // -------- 跨进程互斥：文件锁 --------
+    val lockFile = File(context.filesDir, "update.lock")
+    lockFile.parentFile?.mkdirs()
+    val raf = RandomAccessFile(lockFile, "rw")
+    val channel = raf.channel
+    val lock: FileLock? = try {
+        channel.tryLock() // 非阻塞获取锁；拿不到就说明已有实例在跑
+    } catch (_: OverlappingFileLockException) {
+        null
+    } catch (_: Exception) {
+        null
+    }
+    if (lock == null) {
+        Log.w(tag, "⚠️ 另一实例已持有更新锁，跳过本次启动（确保全局仅一份 UpdateProcess 运行）")
+        try { channel.close(); raf.close() } catch (_: Exception) {}
+        return
+    }
+
+
+    while (kotlin.coroutines.coroutineContext.isActive) {
+        try {
+            // 1) 随机获取一个“可用”的节点（不可达会抛异常）
+            val node = getRandomNodeFromAssets(
+                context = context,
+                fileName = fileName,
+                ports = ports,
+                timeoutMs = timeoutMs
+            )
+            Log.i(tag, "✅ 选定可用节点: ${node.ip_addr}，开始检查更新…")
+
+            // 2) 执行一次更新（runUpdater 内部已处理版本比较与下载覆盖）
+            val updated = updater.runUpdater(listOf(node))
+            Log.i(tag, if (updated) "🎉 本轮已更新完成" else "ℹ️ 已是最新，无需更新")
+
+        } catch (e: Exception) {
+            // 任何异常都吞掉，记录后继续下一轮，避免更新循环中断
+            Log.e(tag, "❌ 本轮更新异常：${e.message}", e)
+        }
+
+        // 3) 进入等待期（可被取消）
+        val waitMs = intervalMinutes * 60_000L
+        Log.i(tag, "⏸ 进入等待期：${intervalMinutes} 分钟后再次检查…")
+        delay(waitMs)
     }
 }
